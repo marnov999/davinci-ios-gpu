@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,1990 @@
+@@ -0,0 +1,2093 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -676,7 +676,44 @@
 + * a bad map faults (FSR) instead of corrupting - no flash/bootloader touched.
 + * smmu = ml_io_map(0x5040000): CB0 @ +0x8000, GR1 @ +0x1000. */
 +#define Q_ADDRMASK 0x0000FFFFFFFFF000ull
-+static void
++/* Persistent GPU address space left live by gpu_stage_q (stage-1 enabled). The KGSL
++ * backend (gpu_gpumem_alloc) hands out buffers mapped into this pagetable at kernel-
++ * assigned GPU VAs - exactly the IOCTL_KGSL_GPUMEM_ALLOC model. For now all gpumem VAs
++ * live in the one L1[4]->L2[0]->L3 2MB window (0x1_0000_0000..0x1_0020_0000, 512 pages);
++ * full multi-level mapping comes with the real UAPI. */
++static vm_offset_t g_l3_nc;        /* NC CPU ptr to the live L3 table */
++static uint64_t    g_gpuva_next;   /* next free GPU VA to assign */
++
++/* KGSL GPUMEM_ALLOC backend: allocate `size` bytes, map each page into the live GPU
++ * pagetable (non-cacheable) at the next GPU VA, return the gpuaddr + CPU NC pointer. */
++static int
++gpu_gpumem_alloc(vm_size_t size, uint64_t *gpuaddr, vm_offset_t *cpu_nc)
++{
++	vm_offset_t cva = 0, nc;
++	uint64_t pa = 0, off;
++	if (!g_l3_nc || !g_gpuva_next) {
++		return -1;                 /* stage-1 pagetable not up */
++	}
++	if (gmub_alloc_phys(&cva, &pa, size) != 0) {
++		return -1;
++	}
++	if (!(nc = ml_io_map(pa, size))) {
++		return -1;
++	}
++	gpu_dcache_clean(cva, size);
++	for (off = 0; off < size; off += PAGE_SIZE) {
++		uint64_t va = g_gpuva_next + off;
++		*(volatile uint64_t *)(g_l3_nc + (vm_offset_t)(((va >> 12) & 0x1FFu) * 8u)) =
++		    ((pa + off) & Q_ADDRMASK) | 0xE43ull;   /* L3 4K page, non-cached */
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	*gpuaddr = g_gpuva_next;
++	*cpu_nc = nc;
++	g_gpuva_next += (size + (uint64_t)PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
++	return 0;
++}
++
++static unsigned
 +gpu_stage_q(vm_offset_t smmu, vm_offset_t core, volatile uint32_t *rb, unsigned kk,
 +    uint64_t res_pa, vm_offset_t res_nc)
 +{
@@ -689,11 +726,11 @@
 +	    gmub_alloc_phys(&qp_cva, &qp_pa, PAGE_SIZE) != 0 ||
 +	    gmub_alloc_phys(&ib_cva, &ib_pa, PAGE_SIZE) != 0 ||
 +	    gmub_alloc_phys(&q2_cva, &q2_pa, PAGE_SIZE) != 0) {
-+		printf("SWEET GMU: [Q] pagetable alloc failed\n"); gmub_flush(); return;
++		printf("SWEET GMU: [Q] pagetable alloc failed\n"); gmub_flush(); return kk;
 +	}
 +	if (!(pt_nc = ml_io_map(pt_pa, 0x8000u)) || !(qp_nc = ml_io_map(qp_pa, PAGE_SIZE)) ||
 +	    !(ib_nc = ml_io_map(ib_pa, PAGE_SIZE)) || !(q2_nc = ml_io_map(q2_pa, PAGE_SIZE))) {
-+		printf("SWEET GMU: [Q] pagetable NC map failed\n"); gmub_flush(); return;
++		printf("SWEET GMU: [Q] pagetable NC map failed\n"); gmub_flush(); return kk;
 +	}
 +	gpu_dcache_clean(pt_cva, 0x8000u);   /* drop KMA_ZERO dirty lines before NC use */
 +	gpu_dcache_clean(qp_cva, PAGE_SIZE);
@@ -725,6 +762,11 @@
 +	Q_D(0x3000 + 2 * 8, (q2_pa & Q_ADDRMASK) | 0xE43ull);        /* L3[2] VA 0x100002000 = IB2 result */
 +#undef Q_D
 +	__asm__ volatile("dsb sy" ::: "memory");
++	/* publish the live pagetable for the KGSL backend (gpu_gpumem_alloc): L3 is at
++	 * pool offset 0x3000; VAs 0,1,2 (0x100000000/1000/2000) are used by Q, so gpumem
++	 * starts at 0x100003000. */
++	g_l3_nc = pt_nc + 0x3000u;
++	g_gpuva_next = 0x100003000ull;
 +	/* ---- flip CB0 passthrough -> stage-1 (keep S2CR0/SMR0 routing from Stage J) ---- */
 +	gpu_wr(smmu, 0x8000u + 0x000u, 0u);                 /* CB0 SCTLR = 0 (disable) */
 +	gpu_wr(smmu, 0x1000u + 0x800u, 0x1u);               /* GR1 CBA2R0 = VA64 */
@@ -793,6 +835,63 @@
 +	    (qr == 0xDEADBEEFu && (fsr & ~0x600u) == 0u) ? "direct VA ok, IB2 FAILED (CP_INDIRECT_BUFFER)" :
 +	    (fsr & 2u) ? "TRANSLATION FAULT (FSR.TF) - check pagetable" :
 +	    (polls >= 200000u) ? "TIMEOUT (CP wedged - identity map wrong)" : "FAIL");
++	gmub_flush();
++	return kk;
++}
++
++/* ---- Stage S: KGSL BACKEND (in-kernel exercise of the UAPI core). Uses the live
++ * stage-1 pagetable from Stage Q. Allocates two gpumem buffers at kernel-assigned GPU
++ * VAs (the GPUMEM_ALLOC path), writes a mini command-IB into one that stores a magic to
++ * the other's GPU VA, submits it via CP_INDIRECT_BUFFER (the GPU_COMMAND path), and
++ * verifies the store landed (the WAITTIMESTAMP completion). This is the backend the
++ * /dev/kgsl-3d0 ioctls will call; proving it in-kernel defers the userland cdev/mmap +
++ * LaunchDaemon (operator step) while validating the GPU-facing logic. ---- */
++static void
++gpu_stage_s(vm_offset_t core, volatile uint32_t *rb, unsigned kk, uint64_t res_pa,
++    vm_offset_t res_nc)
++{
++	uint64_t ib_va = 0, dst_va = 0;
++	vm_offset_t ib_nc, dst_nc;
++	unsigned polls;
++	uint32_t got;
++	if (gpu_gpumem_alloc(PAGE_SIZE, &ib_va, &ib_nc) != 0 ||
++	    gpu_gpumem_alloc(PAGE_SIZE, &dst_va, &dst_nc) != 0) {
++		printf("SWEET GMU: [S] gpumem_alloc failed (stage-1 up?)\n"); gmub_flush(); return;
++	}
++	*(volatile uint32_t *)dst_nc = 0;
++	/* command-IB in ib_va: CP_MEM_WRITE 0x5AFE600D -> dst_va (both kernel-assigned VAs) */
++	((volatile uint32_t *)ib_nc)[0] = cp_type7(0x3Du, 3u);
++	((volatile uint32_t *)ib_nc)[1] = (uint32_t)dst_va;
++	((volatile uint32_t *)ib_nc)[2] = (uint32_t)(dst_va >> 32);
++	((volatile uint32_t *)ib_nc)[3] = 0x5AFE600Du;
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* submit (GPU_COMMAND): ring CP_INDIRECT_BUFFER -> ib_va, then CACHE_FLUSH_TS */
++	rb[kk++] = cp_type7(0x3Fu, 3u);
++	rb[kk++] = (uint32_t)ib_va;
++	rb[kk++] = (uint32_t)(ib_va >> 32);
++	rb[kk++] = 4u;
++	rb[kk++] = cp_type7(0x46u, 4u);
++	rb[kk++] = 0x00000004u;
++	rb[kk++] = (uint32_t)(res_pa + 0xE0u);
++	rb[kk++] = (uint32_t)((res_pa + 0xE0u) >> 32);
++	rb[kk++] = 0x0000600Du;
++	rb[kk++] = cp_type7(38u, 0u);
++	*(volatile uint32_t *)(res_nc + 0xE0u) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	gmub_flush();
++	gpu_wr(core, 0x807u << 2, kk);              /* CP_RB_WPTR doorbell */
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (polls = 0; polls < 200000u; ++polls) {
++		if (*(volatile uint32_t *)(res_nc + 0xE0u) == 0x0000600Du) {
++			break;
++		}
++		gmub_udelay(10);
++	}
++	got = *(volatile uint32_t *)dst_nc;
++	printf("SWEET GMU: [S] KGSL BACKEND: gpumem ib_va=%#llx dst_va=%#llx submit-IB readback=%#x"
++	    "(exp 5afe600d) polls=%u -> %s\n", (unsigned long long)ib_va,
++	    (unsigned long long)dst_va, got, polls,
++	    (got == 0x5AFE600Du) ? "GPUMEM ALLOC + IB SUBMIT BACKEND OK" : "FAIL");
 +	gmub_flush();
 +}
 +
@@ -1766,7 +1865,11 @@
 +			/* ---- Stage Q: flip the GPU SMMU to stage-1 page tables and prove GPU
 +			 * virtual addressing (runs AFTER the L-P ring is consumed; appends its
 +			 * own CP_MEM_WRITE-to-a-VA + re-doorbells the same ring). ---- */
-+			gpu_stage_q(smmu, core, rb, kk, res_pa, res_nc);
++			kk = gpu_stage_q(smmu, core, rb, kk, res_pa, res_nc);
++			/* ---- Stage S: exercise the KGSL backend (gpumem alloc + IB submit)
++			 * on the live stage-1 pagetable Stage Q left up; appends after Q's
++			 * packets (kk updated) so it doesn't clobber them / rewind WPTR. ---- */
++			gpu_stage_s(core, rb, kk, res_pa, res_nc);
 +		}
 +	}
 +

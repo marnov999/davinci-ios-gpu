@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2529 @@
+@@ -0,0 +1,2830 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2313,6 +2313,304 @@
 +	gpu_stage_u();              /* exercise create+alloc+submit+timestamp through the handlers */
 +}
 +
++/* ===================== /dev/dri/renderD128 MSM-DRM UAPI =====================
++ * Second GPU front-end: the upstream-Linux MSM DRM render-node ioctls that Mesa's
++ * gallium **freedreno** OpenGL-ES driver speaks (contract in gpu/userland/mesa/
++ * MSM-DRM-IOCTL-SURFACE.md). This is the collaborator's path (gallium-freedreno
++ * GLES injected into backboardd; no zink/turnip/Metal). It wraps the SAME proven
++ * ring/iova/submit core (kgsl_submit_ibs + gpu_gpumem_alloc + the g_bo table) as
++ * the KGSL front-end; only the ioctl envelope differs: BOs are GEM handles, iova
++ * comes from GEM_INFO(GET_IOVA), and the retire token is a per-queue fence seqno.
++ * DRM ioctls use type 'd'=0x64. All structs arm64/LP64. An in-kernel self-test
++ * (gpu_stage_v) exercises GEM_NEW->submit->fence through the shared core.
++ *
++ * NOTE (same _IOC gotcha as KGSL): Mesa talks through a libdrm shim we control
++ * (mesa/ios-libdrm-shim/xf86drm.h). _IOWR ioctls (VERSION/GET_PARAM/GEM_NEW/
++ * GEM_INFO/GEM_SUBMIT) copyin+out fine under XNU; the pure-_IOW ones (GEM_CLOSE,
++ * GEM_CPU_PREP, WAIT_FENCE, SUBMITQUEUE_CLOSE) are XNU-IOC_OUT-only, so the shim
++ * must encode those with IOC_IN for the kernel to receive their input. */
++#define DRM_IOC_TYPE 0x64u       /* 'd' */
++/* core DRM nrs */
++#define DRM_NR_VERSION      0x00u
++#define DRM_NR_GET_CAP      0x0cu
++#define DRM_NR_GEM_CLOSE    0x09u
++/* MSM nrs (0x40 + index) */
++#define DRM_NR_MSM_GET_PARAM       0x40u
++#define DRM_NR_MSM_GEM_NEW         0x42u
++#define DRM_NR_MSM_GEM_INFO        0x43u
++#define DRM_NR_MSM_GEM_CPU_PREP    0x44u
++#define DRM_NR_MSM_GEM_SUBMIT      0x46u
++#define DRM_NR_MSM_WAIT_FENCE      0x47u
++#define DRM_NR_MSM_GEM_MADVISE     0x48u
++#define DRM_NR_MSM_SUBMITQUEUE_NEW 0x4Au
++#define DRM_NR_MSM_SUBMITQUEUE_CLOSE 0x4Bu
++#define DRM_NR_MSM_SUBMITQUEUE_QUERY 0x4Cu
++/* MSM_PARAM_* */
++#define MSM_PARAM_GPU_ID    0x01u
++#define MSM_PARAM_GMEM_SIZE 0x02u
++#define MSM_PARAM_CHIP_ID   0x03u
++#define MSM_PARAM_MAX_FREQ  0x04u
++#define MSM_PARAM_TIMESTAMP 0x05u
++#define MSM_PARAM_GMEM_BASE 0x06u
++#define MSM_PARAM_PRIORITIES 0x07u
++#define MSM_PARAM_VA_START  0x0eu
++#define MSM_PARAM_VA_SIZE   0x0fu
++/* MSM_INFO_* */
++#define MSM_INFO_GET_OFFSET 0x00u
++#define MSM_INFO_GET_IOVA   0x01u
++#define MSM_SUBMIT_CMD_BUF  0x01u
++
++struct drm_version {                  /* size 64 */
++	int           version_major;
++	int           version_minor;
++	int           version_patchlevel;
++	unsigned long name_len;           /* @16 */
++	char         *name;               /* @24 */
++	unsigned long date_len;
++	char         *date;
++	unsigned long desc_len;
++	char         *desc;
++};
++struct drm_get_cap   { uint64_t capability; uint64_t value; };          /* 16 */
++struct drm_gem_close { uint32_t handle; uint32_t pad; };                /* 8  */
++struct drm_msm_param { uint32_t pipe; uint32_t param; uint64_t value; uint32_t len; uint32_t pad; }; /* 24 */
++struct drm_msm_gem_new  { uint64_t size; uint32_t flags; uint32_t handle; };  /* 16 */
++struct drm_msm_gem_info { uint32_t handle; uint32_t info; uint64_t value; uint32_t len; uint32_t pad; }; /* 24 */
++struct drm_msm_timespec { int64_t tv_sec; int64_t tv_nsec; };           /* 16 */
++struct drm_msm_gem_cpu_prep { uint32_t handle; uint32_t op; struct drm_msm_timespec timeout; }; /* 24 */
++struct drm_msm_gem_submit {           /* size 72 */
++	uint32_t flags; uint32_t fence; uint32_t nr_bos; uint32_t nr_cmds;
++	uint64_t bos; uint64_t cmds; int32_t fence_fd; uint32_t queueid;
++	uint64_t in_syncobjs; uint64_t out_syncobjs;
++	uint32_t nr_in_syncobjs; uint32_t nr_out_syncobjs; uint32_t syncobj_stride; uint32_t pad;
++};
++struct drm_msm_gem_submit_bo  { uint32_t flags; uint32_t handle; uint64_t presumed; };  /* 16 */
++struct drm_msm_gem_submit_cmd { uint32_t type; uint32_t submit_idx; uint32_t submit_offset;
++	uint32_t size; uint32_t pad; uint32_t nr_relocs; uint64_t relocs; };                /* 40 */
++struct drm_msm_wait_fence { uint32_t fence; uint32_t flags; struct drm_msm_timespec timeout;
++	uint32_t queueid; uint32_t pad; };                                                  /* 32 */
++struct drm_msm_submitqueue { uint32_t flags; uint32_t prio; uint32_t id; };             /* 12 */
++struct drm_msm_gem_madvise  { uint32_t handle; uint32_t madv; uint32_t retained; };     /* 12 */
++
++static uint32_t g_sq_next = 1;      /* submitqueue id counter */
++static uint32_t g_drm_fence = 0;    /* monotonic retire fence seqno */
++
++static int
++drm_do_get_param(uint32_t param, uint64_t *out)
++{
++	switch (param) {
++	case MSM_PARAM_CHIP_ID:   *out = 0x06010800ull; return 0;  /* the field freedreno derives gen from */
++	case MSM_PARAM_GPU_ID:    *out = 618u;          return 0;
++	case MSM_PARAM_GMEM_SIZE: *out = 0x100000u;     return 0;
++	case MSM_PARAM_GMEM_BASE: *out = 0x100000u;     return 0;
++	case MSM_PARAM_MAX_FREQ:  *out = 500000000u;    return 0;
++	case MSM_PARAM_TIMESTAMP: *out = 0;             return 0;
++	case MSM_PARAM_PRIORITIES:*out = 1;             return 0;
++	case MSM_PARAM_VA_START:  *out = 0x100000000ull;return 0;  /* GPU iova window (softpin) */
++	case MSM_PARAM_VA_SIZE:   *out = 0x100000000ull;return 0;
++	default: return EINVAL;    /* freedreno treats most params as optional */
++	}
++}
++
++/* GEM_SUBMIT: resolve each CMD_BUF to its BO iova and submit as CP_INDIRECT_BUFFER
++ * via the shared ring core; assign a per-device fence seqno. */
++static int
++drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
++{
++	uint64_t ibva[16];
++	uint32_t ibdw[16];
++	unsigned n = 0, i;
++	int rc;
++	if (s->nr_cmds == 0 || s->nr_cmds > 16u) {
++		return EINVAL;
++	}
++	for (i = 0; i < s->nr_cmds; i++) {
++		struct drm_msm_gem_submit_cmd c;
++		struct drm_msm_gem_submit_bo  b;
++		struct kgsl_bo_ent *bo;
++		user_addr_t ce = (user_addr_t)(s->cmds + (uint64_t)i * sizeof(c));
++		user_addr_t be;
++		if (copyin(ce, &c, sizeof(c)) != 0) { return EINVAL; }
++		if (c.type != MSM_SUBMIT_CMD_BUF) { continue; }   /* IB_TARGET/CTX_RESTORE are pinned, not dispatched */
++		if (c.submit_idx >= s->nr_bos) { return EINVAL; }
++		be = (user_addr_t)(s->bos + (uint64_t)c.submit_idx * sizeof(b));
++		if (copyin(be, &b, sizeof(b)) != 0) { return EINVAL; }
++		bo = kgsl_bo_find(b.handle);
++		if (!bo) { return EINVAL; }
++		if (n >= 16u) { return EINVAL; }
++		ibva[n] = bo->gpuaddr + c.submit_offset;
++		ibdw[n] = c.size / 4u;
++		n++;
++	}
++	if (n == 0) { return EINVAL; }
++	rc = kgsl_submit_ibs(ibva, ibdw, n);
++	if (rc != 0) { return EIO; }
++	*out_fence = ++g_drm_fence;   /* synchronous: retired on return */
++	return 0;
++}
++
++static int
++drm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	unsigned nr  = (unsigned)(cmd & 0xffu);
++	unsigned typ = (unsigned)((cmd >> 8) & 0xffu);
++	if (typ != DRM_IOC_TYPE) {
++		return ENOTTY;
++	}
++	printf("SWEET DRM: ioctl nr=%#x\n", nr);
++	switch (nr) {
++	case DRM_NR_VERSION: {
++		struct drm_version *v = (struct drm_version *)data;
++		static const char nm[] = "msm";
++		v->version_major = 1; v->version_minor = 10; v->version_patchlevel = 0;
++		if (v->name && v->name_len >= 3u) {
++			if (copyout(nm, (user_addr_t)(uintptr_t)v->name, 3) != 0) { return EFAULT; }
++		}
++		v->name_len = 3u;        /* drmGetVersion reads this, then re-calls with a buffer */
++		v->date_len = 0u;
++		v->desc_len = 0u;
++		return 0;
++	}
++	case DRM_NR_GET_CAP: {
++		struct drm_get_cap *gc = (struct drm_get_cap *)data;
++		gc->value = 0;           /* no syncobj/prime for first light */
++		return 0;
++	}
++	case DRM_NR_GEM_CLOSE: {
++		struct drm_gem_close *gc = (struct drm_gem_close *)data;
++		(void)kgsl_do_gpumem_free(gc->handle);
++		return 0;
++	}
++	case DRM_NR_MSM_GET_PARAM: {
++		struct drm_msm_param *mp = (struct drm_msm_param *)data;
++		uint64_t val = 0;
++		int e = drm_do_get_param(mp->param, &val);
++		if (e) { return e; }
++		mp->value = val;
++		return 0;
++	}
++	case DRM_NR_MSM_GEM_NEW: {
++		struct drm_msm_gem_new *gn = (struct drm_msm_gem_new *)data;
++		struct kgsl_bo_ent *bo = NULL;
++		if (kgsl_do_gpumem_alloc((vm_size_t)gn->size, gn->flags, &bo) != 0) { return ENOMEM; }
++		gn->handle = bo->id;
++		return 0;
++	}
++	case DRM_NR_MSM_GEM_INFO: {
++		struct drm_msm_gem_info *gi = (struct drm_msm_gem_info *)data;
++		struct kgsl_bo_ent *bo = kgsl_bo_find(gi->handle);
++		if (!bo) { return EINVAL; }
++		switch (gi->info) {
++		case MSM_INFO_GET_IOVA:   gi->value = bo->gpuaddr;                  return 0;
++		case MSM_INFO_GET_OFFSET: gi->value = (uint64_t)bo->id << 12;       return 0;  /* mmap token */
++		default: return EINVAL;   /* SET_NAME/METADATA optional; freedreno degrades */
++		}
++	}
++	case DRM_NR_MSM_GEM_CPU_PREP:
++		return 0;                 /* synchronous submit => GPU already idle on the BO */
++	case DRM_NR_MSM_GEM_SUBMIT: {
++		struct drm_msm_gem_submit *s = (struct drm_msm_gem_submit *)data;
++		uint32_t fence = 0;
++		int e = drm_do_gem_submit(s, &fence);
++		if (e) { return e; }
++		s->fence = fence;
++		return 0;
++	}
++	case DRM_NR_MSM_WAIT_FENCE:
++		return 0;                 /* synchronous submit => target already retired */
++	case DRM_NR_MSM_GEM_MADVISE: {
++		struct drm_msm_gem_madvise *gm = (struct drm_msm_gem_madvise *)data;
++		gm->retained = 1;
++		return 0;
++	}
++	case DRM_NR_MSM_SUBMITQUEUE_NEW: {
++		struct drm_msm_submitqueue *sq = (struct drm_msm_submitqueue *)data;
++		sq->id = g_sq_next++;
++		return 0;
++	}
++	case DRM_NR_MSM_SUBMITQUEUE_CLOSE:
++	case DRM_NR_MSM_SUBMITQUEUE_QUERY:
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw drm_cdevsw = {
++	.d_open       = kgsl_open,
++	.d_close      = kgsl_close,
++	.d_read       = kgsl_norw,
++	.d_write      = kgsl_norw,
++	.d_ioctl      = drm_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,   /* GEM GET_OFFSET mmap wired in a follow-up (d_mmap sig TBC) */
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++/* In-kernel self-test of the MSM-DRM GEM path: GET_PARAM(CHIP_ID), GEM_NEW x2,
++ * build a CP_MEM_WRITE IB in one targeting the other's iova, submit it via the
++ * shared ring core (the GEM_SUBMIT inner path), assign a fence, verify the store. */
++static void
++gpu_stage_v(void)
++{
++	uint64_t chip = 0;
++	struct kgsl_bo_ent *ib = NULL, *dst = NULL;
++	uint64_t ibva;
++	uint32_t ibdw, fence;
++	int rc;
++	uint32_t got;
++	if (!g_kgsl_ready) {
++		printf("SWEET DRM: [V] selftest skipped (submit path not published)\n");
++		return;
++	}
++	(void)drm_do_get_param(MSM_PARAM_CHIP_ID, &chip);
++	if (kgsl_do_gpumem_alloc(PAGE_SIZE, 0x20000u /*MSM_BO_WC*/, &ib) != 0 ||
++	    kgsl_do_gpumem_alloc(PAGE_SIZE, 0x20000u, &dst) != 0) {
++		printf("SWEET DRM: [V] GEM_NEW FAIL\n"); return;
++	}
++	*(volatile uint32_t *)dst->cpu_nc = 0;
++	((volatile uint32_t *)ib->cpu_nc)[0] = cp_type7(0x3Du, 3u);     /* CP_MEM_WRITE -> dst iova */
++	((volatile uint32_t *)ib->cpu_nc)[1] = (uint32_t)dst->gpuaddr;
++	((volatile uint32_t *)ib->cpu_nc)[2] = (uint32_t)(dst->gpuaddr >> 32);
++	((volatile uint32_t *)ib->cpu_nc)[3] = 0x5AFEDA7Au;
++	__asm__ volatile("dsb sy" ::: "memory");
++	ibva = ib->gpuaddr; ibdw = 4u;
++	rc = kgsl_submit_ibs(&ibva, &ibdw, 1);
++	if (rc == 0) { fence = ++g_drm_fence; } else { fence = 0; }
++	got = *(volatile uint32_t *)dst->cpu_nc;
++	printf("SWEET DRM: [V] MSM GEM SELFTEST chip_id=%#llx gem_ib=%u(iova=%#llx) gem_dst=%u(iova=%#llx) "
++	    "submit_rc=%d fence=%u readback=%#x(exp 5afeda7a) -> %s\n",
++	    (unsigned long long)chip, ib->id, (unsigned long long)ib->gpuaddr,
++	    dst->id, (unsigned long long)dst->gpuaddr, rc, fence, got,
++	    (rc == 0 && got == 0x5AFEDA7Au && chip == 0x06010800ull) ?
++	    "MSM-DRM GEM NEW+SUBMIT+FENCE OK (gallium-freedreno path)" : "FAIL");
++	gmub_flush();
++}
++
++static int g_drm_major = -1;
++static void
++gpu_drm_init(void)
++{
++	g_drm_major = cdevsw_add(-1, &drm_cdevsw);
++	if (g_drm_major < 0) {
++		printf("SWEET DRM: cdevsw_add failed\n");
++		return;
++	}
++	/* Mesa's libdrm shim opens this node (drmOpenWithType("msm",...)); drmGetVersion
++	 * must then report name="msm". If devfs rejects the subdir form, fall back to a
++	 * flat name and point the shim's IOS_DRM_RENDER_NODE at it. */
++	devfs_make_node(makedev(g_drm_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "dri/renderD128");
++	printf("SWEET DRM: /dev/dri/renderD128 registered (major=%d) name=msm -> MSM-DRM render node "
++	    "for gallium-freedreno GLES\n", g_drm_major);
++	gpu_stage_v();
++}
++
 +static void
 +gpu_probe(void)
 +{
@@ -2378,6 +2676,9 @@
 +	/* Register the /dev/kgsl-3d0 UAPI node (+ in-kernel devinfo self-test) so
 +	 * userland freedreno can bind once the root carries a client. */
 +	gpu_kgsl_init();
++	/* Register the MSM-DRM render node (/dev/dri/renderD128) for the gallium-
++	 * freedreno GLES path, over the same proven ring/iova/submit core. */
++	gpu_drm_init();
 +}
 +
 +/* Block (not busy-wait) for `secs` so the probe prints after USB + the host

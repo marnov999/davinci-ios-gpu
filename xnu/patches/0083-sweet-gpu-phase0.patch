@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,1855 @@
+@@ -0,0 +1,1967 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -663,6 +663,114 @@
 +{
 +	return 0x40000000u | (cnt & 0x7Fu) | (cp_parity(cnt) << 7)
 +	    | ((reg & 0x3FFFFu) << 8) | (cp_parity(reg) << 27);
++}
++
++/* ---- Stage Q: SMMU STAGE-1 PAGE TABLES. Flip GPU CB0 from passthrough
++ * (SCTLR.M=0, addr==phys) to stage-1 translation (ARM_64_LPAE_S1, ias=48, 4K).
++ * Build a pagetable that identity-maps [0,4GB) with 1GB blocks (so the ring/SQE/
++ * all current physical buffers keep working), plus maps a HIGH test VA
++ * 0x1_0000_0000 -> a fresh NC page. Enable M=1, then CP_MEM_WRITE to the VIRTUAL
++ * addr and confirm it lands at the physical page with CB0.FSR==0 -> proves the GPU
++ * now has its own virtual address space (the Phase-2 unlock for turnip/freedreno).
++ * Contained: only our CP's SID0 traffic is translated; iOS doesn't touch the GPU;
++ * a bad map faults (FSR) instead of corrupting - no flash/bootloader touched.
++ * smmu = ml_io_map(0x5040000): CB0 @ +0x8000, GR1 @ +0x1000. */
++#define Q_ADDRMASK 0x0000FFFFFFFFF000ull
++static void
++gpu_stage_q(vm_offset_t smmu, vm_offset_t core, volatile uint32_t *rb, unsigned kk,
++    uint64_t res_pa, vm_offset_t res_nc)
++{
++	vm_offset_t pt_cva = 0, pt_nc, qp_cva = 0, qp_nc;
++	uint64_t pt_pa = 0, qp_pa = 0, l0_pa, l1_pa, l2_pa, l3_pa;
++	unsigned j, polls;
++	uint32_t qr, fsr;
++	if (gmub_alloc_phys(&pt_cva, &pt_pa, 0x8000u) != 0 ||
++	    gmub_alloc_phys(&qp_cva, &qp_pa, PAGE_SIZE) != 0) {
++		printf("SWEET GMU: [Q] pagetable alloc failed\n"); gmub_flush(); return;
++	}
++	if (!(pt_nc = ml_io_map(pt_pa, 0x8000u)) || !(qp_nc = ml_io_map(qp_pa, PAGE_SIZE))) {
++		printf("SWEET GMU: [Q] pagetable NC map failed\n"); gmub_flush(); return;
++	}
++	gpu_dcache_clean(pt_cva, 0x8000u);   /* drop KMA_ZERO dirty lines before NC use */
++	gpu_dcache_clean(qp_cva, PAGE_SIZE);
++	for (j = 0; j < 0x8000u / 4u; ++j) {
++		((volatile uint32_t *)pt_nc)[j] = 0;         /* zero all table pages */
++	}
++	*(volatile uint32_t *)qp_nc = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* 4 table pages bump-allocated from the pool: L0@+0, L1@+0x1000, L2@+0x2000, L3@+0x3000 */
++	l0_pa = pt_pa; l1_pa = pt_pa + 0x1000u; l2_pa = pt_pa + 0x2000u; l3_pa = pt_pa + 0x3000u;
++#define Q_D(off64, val) (*(volatile uint64_t *)(pt_nc + (vm_offset_t)(off64)) = (uint64_t)(val))
++	Q_D(0x0000 + 0 * 8, (l1_pa & Q_ADDRMASK) | 0x3ull);          /* L0[0] -> L1 (table) */
++	Q_D(0x1000 + 0 * 8, (0x00000000ull) | 0xF45ull);             /* L1[0] 1GB id block 0-1G */
++	Q_D(0x1000 + 1 * 8, (0x40000000ull) | 0xF45ull);             /* L1[1] 1-2G */
++	Q_D(0x1000 + 2 * 8, (0x80000000ull) | 0xF45ull);             /* L1[2] 2-3G */
++	Q_D(0x1000 + 3 * 8, (0xC0000000ull) | 0xF45ull);             /* L1[3] 3-4G */
++	Q_D(0x1000 + 4 * 8, (l2_pa & Q_ADDRMASK) | 0x3ull);          /* L1[4] (VA 4-5G) -> L2 */
++	Q_D(0x2000 + 0 * 8, (l3_pa & Q_ADDRMASK) | 0x3ull);          /* L2[0] -> L3 */
++	Q_D(0x3000 + 0 * 8, (qp_pa & Q_ADDRMASK) | 0xE43ull);        /* L3[0] = test page (NC) */
++#undef Q_D
++	__asm__ volatile("dsb sy" ::: "memory");
++	/* ---- flip CB0 passthrough -> stage-1 (keep S2CR0/SMR0 routing from Stage J) ---- */
++	gpu_wr(smmu, 0x8000u + 0x000u, 0u);                 /* CB0 SCTLR = 0 (disable) */
++	gpu_wr(smmu, 0x1000u + 0x800u, 0x1u);               /* GR1 CBA2R0 = VA64 */
++	gpu_wr(smmu, 0x1000u + 0x000u, 0x1F300u);           /* GR1 CBAR0 = S1_TRANS_S2_BYPASS|WB|NSH */
++	gpu_wr(smmu, 0x8000u + 0x010u, 0x38012u);           /* CB0 TCR2 (PASIZE40|AS|SEP_UPSTREAM) */
++	gpu_wr(smmu, 0x8000u + 0x030u, 0x2010u);            /* CB0 TCR (ias48 T0SZ0x10 NC-walk) */
++	gpu_wr(smmu, 0x8000u + 0x020u, (uint32_t)l0_pa);    /* CB0 TTBR0 lo (pgd=L0, ASID0) */
++	gpu_wr(smmu, 0x8000u + 0x024u, (uint32_t)(l0_pa >> 32)); /* TTBR0 hi */
++	gpu_wr(smmu, 0x8000u + 0x028u, 0u);                 /* TTBR1 lo */
++	gpu_wr(smmu, 0x8000u + 0x02Cu, 0u);                 /* TTBR1 hi */
++	gpu_wr(smmu, 0x8000u + 0x038u, 0xF404FF44u);        /* CB0 MAIR0 (NC@0,WB@1,dev@2) */
++	gpu_wr(smmu, 0x8000u + 0x03Cu, 0u);                 /* CB0 MAIR1 */
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_wr(smmu, 0x8000u + 0x000u, 0x1067u);            /* CB0 SCTLR = M|TRE|AFE|CFRE|CFIE|ASIDPNE */
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_wr(smmu, 0x8000u + 0x610u, 0u);                 /* CB0 S1_TLBIASID = 0 */
++	gpu_wr(smmu, 0x8000u + 0x7F0u, 0u);                 /* CB0 TLBSYNC */
++	for (polls = 0; polls < 2000u; ++polls) {
++		if (!(gpu_rd(smmu, 0x8000u + 0x7F4u) & 1u)) {
++			break;
++		}
++		gmub_udelay(1);
++	}
++	printf("SWEET GMU: [Q] stage-1 ENABLED: l0_pa=%#llx qp_pa=%#llx sctlr=%#x tlbsync_polls=%u\n",
++	    (unsigned long long)l0_pa, (unsigned long long)qp_pa,
++	    gpu_rd(smmu, 0x8000u + 0x000u), polls);
++	gmub_flush();
++	/* ---- CP_MEM_WRITE to the VIRTUAL addr 0x100000000; CP is 64-bit (ADDR_MODE=1) ---- */
++	rb[kk++] = cp_type7(0x3Du, 3u);        /* CP_MEM_WRITE 1 dword */
++	rb[kk++] = 0x00000000u;                /* ADDR_LO (0x1_0000_0000) */
++	rb[kk++] = 0x00000001u;                /* ADDR_HI */
++	rb[kk++] = 0xDEADBEEFu;
++	rb[kk++] = cp_type7(0x46u, 4u);        /* CACHE_FLUSH_TS -> res+0xD0 seqno (phys, identity) */
++	rb[kk++] = 0x00000004u;
++	rb[kk++] = (uint32_t)(res_pa + 0xD0u);
++	rb[kk++] = (uint32_t)((res_pa + 0xD0u) >> 32);
++	rb[kk++] = 0x0000D00Du;
++	rb[kk++] = cp_type7(38u, 0u);          /* WFI */
++	*(volatile uint32_t *)(res_nc + 0xD0u) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	gmub_flush();
++	gpu_wr(core, 0x807u << 2, kk);         /* CP_RB_WPTR doorbell (resume CP under translation) */
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (polls = 0; polls < 200000u; ++polls) {
++		if (*(volatile uint32_t *)(res_nc + 0xD0u) == 0x0000D00Du) {
++			break;
++		}
++		gmub_udelay(10);
++	}
++	qr = *(volatile uint32_t *)qp_nc;
++	fsr = gpu_rd(smmu, 0x8000u + 0x058u);  /* CB0 FSR (bit1 = translation fault) */
++	printf("SWEET GMU: [Q] STAGE-1 XLATE: va=0x100000000 -> qp_pa=%#llx readback=%#x(exp deadbeef) "
++	    "fsr=%#x far=%#x_%#x rptr=%#x polls=%u -> %s\n",
++	    (unsigned long long)qp_pa, qr, fsr,
++	    gpu_rd(smmu, 0x8000u + 0x064u), gpu_rd(smmu, 0x8000u + 0x060u),
++	    gpu_rd(core, 0x806u << 2), polls,
++	    (qr == 0xDEADBEEFu && fsr == 0u) ? "GPU VIRTUAL ADDRESSING WORKS = STAGE-1 OK" :
++	    (fsr & 2u) ? "TRANSLATION FAULT (FSR.TF) - check pagetable" :
++	    (polls >= 200000u) ? "TIMEOUT (CP wedged - likely identity map wrong)" : "FAIL");
++	gmub_flush();
 +}
 +
 +/* ============================ the boot code ============================ */
@@ -1632,6 +1740,10 @@
 +					gmub_flush();
 +				}
 +			}
++			/* ---- Stage Q: flip the GPU SMMU to stage-1 page tables and prove GPU
++			 * virtual addressing (runs AFTER the L-P ring is consumed; appends its
++			 * own CP_MEM_WRITE-to-a-VA + re-doorbells the same ring). ---- */
++			gpu_stage_q(smmu, core, rb, kk, res_pa, res_nc);
 +		}
 +	}
 +

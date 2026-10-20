@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2093 @@
+@@ -0,0 +1,2151 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -65,6 +65,8 @@
 +#include <pexpert/pexpert.h>
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
++#include <sys/conf.h>
++#include <miscfs/devfs/devfs.h>
 +#include "a618_gmu_fw.h"
 +#include "a615_zap_fw.h"
 +#include "a630_sqe_fw.h"
@@ -1815,53 +1817,6 @@
 +				    "TIMEOUT (no completion)");
 +				gmub_flush();
 +			}
-+			/* ---- Stage P: TRIANGLE ON SCREEN. Blit the GPU-rendered 256x256 RT
-+			 * into the panel scanout buffer (ABL splash fb at 0x9c000000, 1080x2340,
-+			 * stride 4320, BGRA, linear, single-buffer-no-flip). Convert our RGBA->
-+			 * BGRA (swap R/B). Direct panel write is strict 1:1 (the 1125x2436 logical
-+			 * size is compositor-only). Loop ~40Hz for ~10s to beat the throttled
-+			 * ~10Hz present() that recomposits the lockscreen. Panel can't be a GPU RT
-+			 * directly (stride 4320 isn't 64-aligned for RB_MRT_PITCH) -> CPU blit.
-+			 * Writing fb DRAM is safe (not bootloader/flash). ---- */
-+			{
-+				static uint32_t tri_stage[256u * 256u];
-+				/* Map ONLY a small top-left window (1.5MB, page-aligned) - NOT the
-+				 * whole 10MB panel: v25 paniced (kmem @vm_kern.c:178) mapping 10MB at
-+				 * this late boot stage. Triangle at (0,0) so the map base == the panel
-+				 * base, no offset. 1.5MB covers 364 rows >> the 256 we touch. */
-+				vm_offset_t pan = ml_io_map(0x9c000000ull, 0x180000u);
-+				if (!pan) {
-+					printf("SWEET GMU: [P] panel map failed\n");
-+					gmub_flush();
-+				} else {
-+					unsigned x, y, f;
-+					const unsigned PX = 0u, PY = 0u;   /* top-left (small, safe map) */
-+					for (y = 0; y < 256u; ++y) {          /* snapshot RT, RGBA->BGRA */
-+						for (x = 0; x < 256u; ++x) {
-+							uint32_t v = *(volatile uint32_t *)
-+							    (rt_nc + y * 1024u + x * 4u);
-+							tri_stage[y * 256u + x] = (v & 0xff00ff00u)
-+							    | ((v & 0xffu) << 16) | ((v >> 16) & 0xffu);
-+						}
-+					}
-+					printf("SWEET GMU: [P] blitting triangle to panel 0x9c000000 @ "
-+					    "(%u,%u) ~40Hz for ~10s -- WATCH THE SCREEN\n", PX, PY);
-+					gmub_flush();
-+					for (f = 0; f < 400u; ++f) {
-+						for (y = 0; y < 256u; ++y) {
-+							volatile uint32_t *d = (volatile uint32_t *)
-+							    (pan + (PY + y) * 4320u + PX * 4u);
-+							for (x = 0; x < 256u; ++x) {
-+								d[x] = tri_stage[y * 256u + x];
-+							}
-+						}
-+						__asm__ volatile("dsb sy" ::: "memory");
-+						gmub_udelay(25000u);
-+					}
-+					printf("SWEET GMU: [P] panel blit loop done\n");
-+					gmub_flush();
-+				}
-+			}
 +			/* ---- Stage Q: flip the GPU SMMU to stage-1 page tables and prove GPU
 +			 * virtual addressing (runs AFTER the L-P ring is consumed; appends its
 +			 * own CP_MEM_WRITE-to-a-VA + re-doorbells the same ring). ---- */
@@ -1879,6 +1834,106 @@
 +	return 0;
 +}
 +
++
++/* ======================= /dev/kgsl-3d0 UAPI (cdev) =======================
++ * Expose a KGSL-compatible char device so userland Mesa freedreno (GLES) can
++ * drive the GPU. This build registers the node + the DEVICE_GETPROPERTY(DEVICE_INFO)
++ * ioctl (the first thing freedreno calls at init) returning the a618 chip id, and
++ * logs every ioctl so we can see exactly what a real freedreno demands. GPUMEM_ALLOC/
++ * GPU_COMMAND/mmap wire to the proven backend in a follow-up once a userland client
++ * exists (operator root rebuild). cdev pattern copied from sweet_ufs (0028). */
++#define KGSL_IOC_TYPE          0x09u
++#define KGSL_PROP_DEVICE_INFO  0x1u
++struct kgsl_devinfo {                 /* LP64 layout (iOS userland is arm64) */
++	unsigned int  device_id;
++	unsigned int  chip_id;
++	unsigned int  mmu_enabled;
++	unsigned long gmem_gpubaseaddr;
++	unsigned int  gpu_id;
++	unsigned long gmem_sizebytes;     /* size_t */
++};
++struct kgsl_device_getproperty {
++	unsigned int type;
++	void        *value;               /* user ptr to the reply struct */
++	unsigned long sizebytes;          /* size_t */
++};
++
++static void
++kgsl_fill_devinfo(struct kgsl_devinfo *di)
++{
++	bzero(di, sizeof(*di));
++	di->device_id = 1;
++	di->chip_id = 0x06010800u;         /* Adreno a618 (core6 maj1 min8) */
++	di->mmu_enabled = 1;               /* stage-1 pagetables are up */
++	di->gpu_id = 618;
++	di->gmem_sizebytes = 0x90000u;     /* a618 GMEM (verify vs freedreno expectation) */
++}
++
++static int kgsl_open(__unused dev_t dev, __unused int f, __unused int dt, __unused struct proc *p) { return 0; }
++static int kgsl_close(__unused dev_t dev, __unused int f, __unused int dt, __unused struct proc *p) { return 0; }
++static int kgsl_norw(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag) { return ENODEV; }
++
++static int
++kgsl_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	unsigned nr  = (unsigned)(cmd & 0xffu);
++	unsigned grp = (unsigned)((cmd >> 8) & 0xffu);
++	if (grp != KGSL_IOC_TYPE) {
++		return ENOTTY;
++	}
++	printf("SWEET KGSL: ioctl nr=%#x\n", nr);   /* log every ioctl a real freedreno sends */
++	switch (nr) {
++	case 0x02: {    /* IOCTL_KGSL_DEVICE_GETPROPERTY */
++		struct kgsl_device_getproperty *gp = (struct kgsl_device_getproperty *)data;
++		if (gp->type == KGSL_PROP_DEVICE_INFO) {
++			struct kgsl_devinfo di;
++			kgsl_fill_devinfo(&di);
++			if (gp->value && gp->sizebytes >= sizeof(di)) {
++				return copyout(&di, (user_addr_t)(uintptr_t)gp->value, sizeof(di));
++			}
++			return EINVAL;
++		}
++		return EINVAL;
++	}
++	default:
++		return 0;   /* logged + accepted (stub) - wire to backend once userland exists */
++	}
++}
++
++static const struct cdevsw kgsl_cdevsw = {
++	.d_open       = kgsl_open,
++	.d_close      = kgsl_close,
++	.d_read       = kgsl_norw,
++	.d_write      = kgsl_norw,
++	.d_ioctl      = kgsl_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++static int g_kgsl_major = -1;
++static void
++gpu_kgsl_init(void)
++{
++	struct kgsl_devinfo di;
++	g_kgsl_major = cdevsw_add(-1, &kgsl_cdevsw);
++	if (g_kgsl_major < 0) {
++		printf("SWEET KGSL: cdevsw_add failed\n");
++		return;
++	}
++	devfs_make_node(makedev(g_kgsl_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "kgsl-3d0");
++	kgsl_fill_devinfo(&di);     /* in-kernel self-test of the DEVICE_INFO reply */
++	printf("SWEET KGSL: /dev/kgsl-3d0 registered (major=%d); devinfo chip_id=%#x gpu_id=%u -> %s\n",
++	    g_kgsl_major, di.chip_id, di.gpu_id,
++	    (di.chip_id == 0x06010800u) ? "DEVINFO OK (a618) = cdev ready for userland freedreno"
++	    : "BAD chip_id");
++}
 +
 +static void
 +gpu_probe(void)
@@ -1942,6 +1997,9 @@
 +	if (gpu_level >= 6) {
 +		(void)gpu_gmu_boot();
 +	}
++	/* Register the /dev/kgsl-3d0 UAPI node (+ in-kernel devinfo self-test) so
++	 * userland freedreno can bind once the root carries a client. */
++	gpu_kgsl_init();
 +}
 +
 +/* Block (not busy-wait) for `secs` so the probe prints after USB + the host

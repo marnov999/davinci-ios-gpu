@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2151 @@
+@@ -0,0 +1,2529 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -686,24 +686,39 @@
 +static vm_offset_t g_l3_nc;        /* NC CPU ptr to the live L3 table */
 +static uint64_t    g_gpuva_next;   /* next free GPU VA to assign */
 +
-+/* KGSL GPUMEM_ALLOC backend: allocate `size` bytes, map each page into the live GPU
-+ * pagetable (non-cacheable) at the next GPU VA, return the gpuaddr + CPU NC pointer. */
++/* Submit path published by the boot code once the ring + stage-1 pagetable are
++ * live, so the KGSL GPU_COMMAND ioctl (and the in-kernel self-test) can submit
++ * IBs on the same ring the bring-up stages used. */
++static vm_offset_t        g_core;        /* GPU core MMIO base */
++static volatile uint32_t *g_rb;          /* ring NC ptr */
++static unsigned           g_wptr;        /* current ring write index (dwords) */
++static uint64_t           g_res_pa;      /* TS completion result page (phys, identity-mapped) */
++static vm_offset_t        g_res_nc;      /* its NC CPU ptr */
++static int                g_kgsl_ready;  /* submit path live */
++static volatile int       g_kgsl_lock;   /* trivial spinlock serialising submits */
++
++/* KGSL GPUMEM_ALLOC backend: allocate `size` bytes, map every 4K GPU page into
++ * the live GPU pagetable (non-cacheable) at the next GPU VA, return gpuaddr +
++ * CPU NC pointer (+ phys for mmap). The GPU MMU granule is 4K while the SoC
++ * PAGE_SIZE is 16K, so we step 0x1000 and fill all sub-pages (the prior loop
++ * stepped PAGE_SIZE and mapped only the first 4K of each 16K page). */
 +static int
-+gpu_gpumem_alloc(vm_size_t size, uint64_t *gpuaddr, vm_offset_t *cpu_nc)
++gpu_gpumem_alloc(vm_size_t size, uint64_t *gpuaddr, vm_offset_t *cpu_nc, uint64_t *out_pa)
 +{
 +	vm_offset_t cva = 0, nc;
 +	uint64_t pa = 0, off;
++	vm_size_t asize = (size + (vm_size_t)PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
 +	if (!g_l3_nc || !g_gpuva_next) {
 +		return -1;                 /* stage-1 pagetable not up */
 +	}
-+	if (gmub_alloc_phys(&cva, &pa, size) != 0) {
++	if (gmub_alloc_phys(&cva, &pa, asize) != 0) {
 +		return -1;
 +	}
-+	if (!(nc = ml_io_map(pa, size))) {
++	if (!(nc = ml_io_map(pa, asize))) {
 +		return -1;
 +	}
-+	gpu_dcache_clean(cva, size);
-+	for (off = 0; off < size; off += PAGE_SIZE) {
++	gpu_dcache_clean(cva, asize);
++	for (off = 0; off < asize; off += 0x1000ull) {
 +		uint64_t va = g_gpuva_next + off;
 +		*(volatile uint64_t *)(g_l3_nc + (vm_offset_t)(((va >> 12) & 0x1FFu) * 8u)) =
 +		    ((pa + off) & Q_ADDRMASK) | 0xE43ull;   /* L3 4K page, non-cached */
@@ -711,7 +726,10 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	*gpuaddr = g_gpuva_next;
 +	*cpu_nc = nc;
-+	g_gpuva_next += (size + (uint64_t)PAGE_SIZE - 1) & ~((uint64_t)PAGE_SIZE - 1);
++	if (out_pa) {
++		*out_pa = pa;
++	}
++	g_gpuva_next += asize;
 +	return 0;
 +}
 +
@@ -848,7 +866,7 @@
 + * verifies the store landed (the WAITTIMESTAMP completion). This is the backend the
 + * /dev/kgsl-3d0 ioctls will call; proving it in-kernel defers the userland cdev/mmap +
 + * LaunchDaemon (operator step) while validating the GPU-facing logic. ---- */
-+static void
++static unsigned
 +gpu_stage_s(vm_offset_t core, volatile uint32_t *rb, unsigned kk, uint64_t res_pa,
 +    vm_offset_t res_nc)
 +{
@@ -856,9 +874,9 @@
 +	vm_offset_t ib_nc, dst_nc;
 +	unsigned polls;
 +	uint32_t got;
-+	if (gpu_gpumem_alloc(PAGE_SIZE, &ib_va, &ib_nc) != 0 ||
-+	    gpu_gpumem_alloc(PAGE_SIZE, &dst_va, &dst_nc) != 0) {
-+		printf("SWEET GMU: [S] gpumem_alloc failed (stage-1 up?)\n"); gmub_flush(); return;
++	if (gpu_gpumem_alloc(PAGE_SIZE, &ib_va, &ib_nc, NULL) != 0 ||
++	    gpu_gpumem_alloc(PAGE_SIZE, &dst_va, &dst_nc, NULL) != 0) {
++		printf("SWEET GMU: [S] gpumem_alloc failed (stage-1 up?)\n"); gmub_flush(); return kk;
 +	}
 +	*(volatile uint32_t *)dst_nc = 0;
 +	/* command-IB in ib_va: CP_MEM_WRITE 0x5AFE600D -> dst_va (both kernel-assigned VAs) */
@@ -895,6 +913,7 @@
 +	    (unsigned long long)dst_va, got, polls,
 +	    (got == 0x5AFE600Du) ? "GPUMEM ALLOC + IB SUBMIT BACKEND OK" : "FAIL");
 +	gmub_flush();
++	return kk;
 +}
 +
 +/* ============================ the boot code ============================ */
@@ -1824,7 +1843,16 @@
 +			/* ---- Stage S: exercise the KGSL backend (gpumem alloc + IB submit)
 +			 * on the live stage-1 pagetable Stage Q left up; appends after Q's
 +			 * packets (kk updated) so it doesn't clobber them / rewind WPTR. ---- */
-+			gpu_stage_s(core, rb, kk, res_pa, res_nc);
++			kk = gpu_stage_s(core, rb, kk, res_pa, res_nc);
++			/* ---- Publish the live ring + stage-1 pagetable to the KGSL UAPI so
++			 * the /dev/kgsl-3d0 GPU_COMMAND ioctl and the in-kernel self-test can
++			 * submit on this same ring (kk is the post-Stage-S write index). ---- */
++			g_core = core;
++			g_rb = rb;
++			g_wptr = kk;
++			g_res_pa = res_pa;
++			g_res_nc = res_nc;
++			g_kgsl_ready = 1;
 +		}
 +	}
 +
@@ -1836,42 +1864,288 @@
 +
 +
 +/* ======================= /dev/kgsl-3d0 UAPI (cdev) =======================
-+ * Expose a KGSL-compatible char device so userland Mesa freedreno (GLES) can
-+ * drive the GPU. This build registers the node + the DEVICE_GETPROPERTY(DEVICE_INFO)
-+ * ioctl (the first thing freedreno calls at init) returning the a618 chip id, and
-+ * logs every ioctl so we can see exactly what a real freedreno demands. GPUMEM_ALLOC/
-+ * GPU_COMMAND/mmap wire to the proven backend in a follow-up once a userland client
-+ * exists (operator root rebuild). cdev pattern copied from sweet_ufs (0028). */
-+#define KGSL_IOC_TYPE          0x09u
-+#define KGSL_PROP_DEVICE_INFO  0x1u
-+struct kgsl_devinfo {                 /* LP64 layout (iOS userland is arm64) */
-+	unsigned int  device_id;
-+	unsigned int  chip_id;
-+	unsigned int  mmu_enabled;
-+	unsigned long gmem_gpubaseaddr;
-+	unsigned int  gpu_id;
-+	unsigned long gmem_sizebytes;     /* size_t */
++ * KGSL-compatible char device so userland Mesa freedreno/turnip (via zink) can
++ * drive the GPU. Tier-1 ioctl contract from Mesa src/freedreno/vulkan/msm_kgsl.h
++ * + tu_knl_kgsl.cc (see gpu/userland/mesa/KGSL-IOCTL-SURFACE.md). The submit path
++ * reuses the proven CP ring + CP_INDIRECT_BUFFER + CACHE_FLUSH_TS published by the
++ * boot code (g_rb/g_core/g_wptr/g_res_*). An in-kernel self-test (gpu_stage_u)
++ * drives create->alloc->submit->timestamp through the same handler helpers, so the
++ * UAPI core is verifiable over the console without a userland client. All structs
++ * are arm64/LP64. cdev pattern from sweet_ufs (0028).
++ *
++ * NOTE on _IOC direction bits: Mesa's msm_kgsl.h uses the Linux encoding, where
++ * _IOW/_IOR are INVERTED vs XNU <sys/ioccom.h> (Linux _IOWR==XNU IN|OUT works, but
++ * Linux _IOW is read by XNU as OUT-only -> the framework won't copyin). We dispatch
++ * on the nr byte and operate on the framework's kernel buffer; the few pure-_IOW
++ * ioctls (WAITTIMESTAMP 0x07, DRAWCTXT_DESTROY 0x14) need the userland side built
++ * with XNU ioccom macros (we control the Mesa build). _IOWR ioctls work as-is. */
++#define KGSL_IOC_TYPE              0x09u
++/* ioctl nrs */
++#define KGSL_IOC_GETPROPERTY       0x02u
++#define KGSL_IOC_WAITTIMESTAMP_CID 0x07u
++#define KGSL_IOC_DRAWCTXT_CREATE   0x13u
++#define KGSL_IOC_DRAWCTXT_DESTROY  0x14u
++#define KGSL_IOC_READTIMESTAMP_CID 0x16u
++#define KGSL_IOC_GPUMEM_ALLOC_ID   0x34u
++#define KGSL_IOC_GPUMEM_FREE_ID    0x35u
++#define KGSL_IOC_GPU_COMMAND       0x4Au
++/* GETPROPERTY types */
++#define KGSL_PROP_DEVICE_INFO      0x1u
++#define KGSL_PROP_DEVICE_SHADOW    0x2u
++#define KGSL_PROP_VERSION          0x8u
++#define KGSL_PROP_UCHE_GMEM_VADDR  0x13u
++#define KGSL_PROP_HIGHEST_BANK_BIT 0x17u
++#define KGSL_PROP_UBWC_MODE        0x1Bu
++#define KGSL_PROP_GPU_VA64_SIZE    0x2Cu
++#define KGSL_PROP_IS_RAYTRACING    0x2Du
++#define KGSL_PROP_UCHE_TRAP_BASE   0x2Fu
++/* cmd-object + alloc flags */
++#define KGSL_CMDLIST_IB            0x1u
++#define KGSL_MEMFLAGS_USE_CPU_MAP  (1u << 28)
++#define KGSL_MEMFLAGS_IOCOHERENT   (1u << 31)
++
++struct kgsl_devinfo {                 /* DEVICE_INFO, LP64 size 40 */
++	unsigned int   device_id;      /* @0  */
++	unsigned int   chip_id;        /* @4  */
++	unsigned int   mmu_enabled;    /* @8  (pad @12) */
++	unsigned long  gmem_gpubaseaddr;/*@16 */
++	unsigned int   gpu_id;         /* @24 (pad @28) */
++	unsigned long  gmem_sizebytes; /* @32 */
 +};
-+struct kgsl_device_getproperty {
-+	unsigned int type;
-+	void        *value;               /* user ptr to the reply struct */
-+	unsigned long sizebytes;          /* size_t */
++struct kgsl_device_getproperty {      /* size 24 */
++	unsigned int   type;           /* @0 (pad @4) */
++	void          *value;          /* @8  user ptr to the reply struct */
++	unsigned long  sizebytes;      /* @16 */
 +};
++struct kgsl_drawctxt_create  { unsigned int flags; unsigned int drawctxt_id; };      /* 8  */
++struct kgsl_drawctxt_destroy { unsigned int drawctxt_id; };                          /* 4  */
++struct kgsl_gpumem_alloc_id {         /* size 48 */
++	unsigned int   id;             /* @0  OUT */
++	unsigned int   flags;          /* @4  IN/OUT (echoed) */
++	unsigned long  size;           /* @8  IN/OUT */
++	unsigned long  mmapsize;       /* @16 OUT */
++	unsigned long  gpuaddr;        /* @24 OUT */
++	unsigned long  __pad[2];       /* @32 */
++};
++struct kgsl_gpumem_free_id { unsigned int id; unsigned int __pad; };                 /* 8  */
++struct kgsl_command_object {          /* size 32 */
++	uint64_t offset;               /* @0  */
++	uint64_t gpuaddr;              /* @8  */
++	uint64_t size;                 /* @16 bytes */
++	unsigned int flags;            /* @24 */
++	unsigned int id;               /* @28 */
++};
++struct kgsl_gpu_command {             /* size 64 */
++	uint64_t flags;                /* @0  */
++	uint64_t cmdlist;              /* @8  user ptr to kgsl_command_object[] */
++	unsigned int cmdsize;          /* @16 */
++	unsigned int numcmds;          /* @20 */
++	uint64_t objlist;              /* @24 */
++	unsigned int objsize;          /* @32 */
++	unsigned int numobjs;          /* @36 */
++	uint64_t synclist;             /* @40 */
++	unsigned int syncsize;         /* @48 */
++	unsigned int numsyncs;         /* @52 */
++	unsigned int context_id;       /* @56 */
++	unsigned int timestamp;        /* @60 IN/OUT */
++};
++struct kgsl_cmdstream_readtimestamp_ctxtid { unsigned int context_id, type, timestamp; };  /* 12 */
++struct kgsl_device_waittimestamp_ctxtid    { unsigned int context_id, timestamp, timeout; };/* 12 */
++
++/* ---- context + buffer-object tables ---- */
++#define KGSL_MAX_CTX      32u
++#define KGSL_MAX_BO       512u
++#define KGSL_RING_DWORDS  (0x8000u / 4u)
++
++struct kgsl_ctx_ent { int used; uint32_t id; uint32_t ts_issued; uint32_t ts_retired; };
++struct kgsl_bo_ent  {
++	int used; uint32_t id; uint64_t gpuaddr; uint64_t pa;
++	vm_offset_t cpu_nc; vm_size_t size; vm_size_t mmapsize; uint32_t flags;
++};
++static struct kgsl_ctx_ent g_ctx[KGSL_MAX_CTX];
++static struct kgsl_bo_ent  g_bo[KGSL_MAX_BO];
++static uint32_t g_ctx_next = 1;
++static uint32_t g_mmap_page_next = 4;   /* 4K-page units; multiple of 4 keeps id<<12 16K-aligned */
++static uint32_t g_submit_seq = 0;
++
++static void kgsl_lock(void)   { while (__atomic_exchange_n(&g_kgsl_lock, 1, __ATOMIC_ACQUIRE)) { gmub_udelay(5); } }
++static void kgsl_unlock(void) { __atomic_store_n(&g_kgsl_lock, 0, __ATOMIC_RELEASE); }
++
++static struct kgsl_ctx_ent *kgsl_ctx_find(uint32_t id)
++{
++	unsigned i;
++	for (i = 0; i < KGSL_MAX_CTX; i++) { if (g_ctx[i].used && g_ctx[i].id == id) { return &g_ctx[i]; } }
++	return NULL;
++}
++static struct kgsl_bo_ent *kgsl_bo_find(uint32_t id)
++{
++	unsigned i;
++	for (i = 0; i < KGSL_MAX_BO; i++) { if (g_bo[i].used && g_bo[i].id == id) { return &g_bo[i]; } }
++	return NULL;
++}
++
++/* Submit n IBs (each a GPU VA + dword count) on the live ring: emit n
++ * CP_INDIRECT_BUFFER packets, one CACHE_FLUSH_TS (seqno -> g_res+0xF0) and a WFI,
++ * ring the WPTR doorbell, then poll for completion. Synchronous (the CP goes idle
++ * each call), so wrapping g_wptr back to 0 when near the ring end is safe. */
++static int
++kgsl_submit_ibs(const uint64_t *ibva, const uint32_t *ibdw, unsigned n)
++{
++	volatile uint32_t *rb;
++	unsigned kk, i, polls;
++	uint32_t seq;
++	int ok;
++	if (!g_kgsl_ready || n == 0 || n > 16u) {
++		return -1;
++	}
++	kgsl_lock();
++	seq = 0x51000000u | ((++g_submit_seq) & 0x00FFFFFFu);
++	if (g_wptr + (n * 4u) + 8u >= KGSL_RING_DWORDS) {
++		g_wptr = 0;                 /* safe: prior submit idled the CP */
++	}
++	rb = g_rb;
++	kk = g_wptr;
++	for (i = 0; i < n; i++) {
++		rb[kk++] = cp_type7(0x3Fu, 3u);               /* CP_INDIRECT_BUFFER */
++		rb[kk++] = (uint32_t)ibva[i];
++		rb[kk++] = (uint32_t)(ibva[i] >> 32);
++		rb[kk++] = ibdw[i];
++	}
++	rb[kk++] = cp_type7(0x46u, 4u);                       /* CACHE_FLUSH_TS */
++	rb[kk++] = 0x00000004u;                               /* event = CACHE_FLUSH_TS */
++	rb[kk++] = (uint32_t)(g_res_pa + 0xF0u);              /* completion word (phys, identity) */
++	rb[kk++] = (uint32_t)((g_res_pa + 0xF0u) >> 32);
++	rb[kk++] = seq;
++	rb[kk++] = cp_type7(38u, 0u);                         /* CP_WAIT_FOR_IDLE */
++	*(volatile uint32_t *)(g_res_nc + 0xF0u) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	gmub_flush();
++	g_wptr = kk;
++	gpu_wr(g_core, 0x807u << 2, g_wptr);                  /* CP_RB_WPTR doorbell */
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (polls = 0; polls < 200000u; ++polls) {
++		if (*(volatile uint32_t *)(g_res_nc + 0xF0u) == seq) { break; }
++		gmub_udelay(10);
++	}
++	ok = (*(volatile uint32_t *)(g_res_nc + 0xF0u) == seq);
++	kgsl_unlock();
++	return ok ? 0 : -2;
++}
++
++/* ---- handler helpers (kernel-struct in/out; the ioctl wrapper and the self-test
++ *      both call these; the wrapper adds copyin/copyout of nested user ptrs) ---- */
++static int
++kgsl_do_drawctxt_create(uint32_t flags, uint32_t *out_id)
++{
++	unsigned i;
++	(void)flags;
++	for (i = 0; i < KGSL_MAX_CTX; i++) {
++		if (!g_ctx[i].used) {
++			g_ctx[i].used = 1;
++			g_ctx[i].id = g_ctx_next++;
++			g_ctx[i].ts_issued = 0;
++			g_ctx[i].ts_retired = 0;
++			*out_id = g_ctx[i].id;
++			return 0;
++		}
++	}
++	return -1;
++}
++static int
++kgsl_do_drawctxt_destroy(uint32_t id)
++{
++	struct kgsl_ctx_ent *c = kgsl_ctx_find(id);
++	if (!c) { return -1; }
++	c->used = 0;
++	return 0;
++}
++static int
++kgsl_do_gpumem_alloc(vm_size_t size, uint32_t flags, struct kgsl_bo_ent **out)
++{
++	unsigned i;
++	uint64_t gpuaddr = 0, pa = 0;
++	vm_offset_t nc = 0;
++	vm_size_t asize = (size + (vm_size_t)PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
++	for (i = 0; i < KGSL_MAX_BO; i++) { if (!g_bo[i].used) { break; } }
++	if (i == KGSL_MAX_BO) { return -1; }
++	if (gpu_gpumem_alloc(asize, &gpuaddr, &nc, &pa) != 0) { return -1; }
++	g_bo[i].used = 1;
++	g_bo[i].id = g_mmap_page_next;                /* id = 4K-page offset base (16K aligned) */
++	g_mmap_page_next += (uint32_t)(asize / 0x1000u);
++	g_bo[i].gpuaddr = gpuaddr;
++	g_bo[i].pa = pa;
++	g_bo[i].cpu_nc = nc;
++	g_bo[i].size = size;
++	g_bo[i].mmapsize = asize;
++	/* we honour only WRITECOMBINE (cachemode bits[27:26]=0); drop capability bits we
++	 * don't implement so turnip's (flags & requested)==requested probe degrades */
++	g_bo[i].flags = flags & ~(KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_MEMFLAGS_IOCOHERENT);
++	*out = &g_bo[i];
++	return 0;
++}
++static int
++kgsl_do_gpumem_free(uint32_t id)
++{
++	struct kgsl_bo_ent *b = kgsl_bo_find(id);
++	if (!b) { return -1; }
++	b->used = 0;
++	return 0;
++}
++
++/* GPU_COMMAND: copyin the IB list, submit the KGSL_CMDLIST_IB entries, assign the
++ * per-context timestamp (synchronous -> retired == issued on return). */
++static int
++kgsl_do_gpu_command(struct kgsl_gpu_command *gc, uint32_t *out_ts)
++{
++	struct kgsl_ctx_ent *c = kgsl_ctx_find(gc->context_id);
++	struct kgsl_command_object obj;
++	uint64_t ibva[16];
++	uint32_t ibdw[16];
++	unsigned n = 0, i;
++	int rc;
++	if (!c || gc->numcmds == 0 || gc->numcmds > 16u || gc->cmdsize < sizeof(obj)) {
++		return -1;
++	}
++	for (i = 0; i < gc->numcmds; i++) {
++		user_addr_t ea = (user_addr_t)(gc->cmdlist + (uint64_t)i * gc->cmdsize);
++		if (copyin(ea, &obj, sizeof(obj)) != 0) { return -1; }
++		if (obj.flags & KGSL_CMDLIST_IB) {
++			ibva[n] = obj.gpuaddr + obj.offset;
++			ibdw[n] = (uint32_t)(obj.size / 4u);
++			n++;
++		}
++	}
++	if (n == 0) { return -1; }
++	rc = kgsl_submit_ibs(ibva, ibdw, n);
++	if (rc != 0) { return rc; }
++	c->ts_issued++;
++	c->ts_retired = c->ts_issued;
++	*out_ts = c->ts_issued;
++	return 0;
++}
 +
 +static void
 +kgsl_fill_devinfo(struct kgsl_devinfo *di)
 +{
 +	bzero(di, sizeof(*di));
 +	di->device_id = 1;
-+	di->chip_id = 0x06010800u;         /* Adreno a618 (core6 maj1 min8) */
++	di->chip_id = 0x06010800u;         /* Adreno a618 - the field turnip derives gpu_id 618 from */
 +	di->mmu_enabled = 1;               /* stage-1 pagetables are up */
 +	di->gpu_id = 618;
-+	di->gmem_sizebytes = 0x90000u;     /* a618 GMEM (verify vs freedreno expectation) */
++	di->gmem_sizebytes = 0x100000u;    /* a618 GMEM = 1 MiB */
 +}
 +
 +static int kgsl_open(__unused dev_t dev, __unused int f, __unused int dt, __unused struct proc *p) { return 0; }
 +static int kgsl_close(__unused dev_t dev, __unused int f, __unused int dt, __unused struct proc *p) { return 0; }
 +static int kgsl_norw(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag) { return ENODEV; }
++
++/* copy a kernel scalar out to the getproperty.value user ptr */
++static int
++kgsl_prop_out(struct kgsl_device_getproperty *gp, const void *src, vm_size_t len)
++{
++	if (!gp->value || gp->sizebytes < len) { return EINVAL; }
++	return copyout(src, (user_addr_t)(uintptr_t)gp->value, len);
++}
 +
 +static int
 +kgsl_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
@@ -1883,20 +2157,77 @@
 +	}
 +	printf("SWEET KGSL: ioctl nr=%#x\n", nr);   /* log every ioctl a real freedreno sends */
 +	switch (nr) {
-+	case 0x02: {    /* IOCTL_KGSL_DEVICE_GETPROPERTY */
++	case KGSL_IOC_GETPROPERTY: {
 +		struct kgsl_device_getproperty *gp = (struct kgsl_device_getproperty *)data;
-+		if (gp->type == KGSL_PROP_DEVICE_INFO) {
-+			struct kgsl_devinfo di;
-+			kgsl_fill_devinfo(&di);
-+			if (gp->value && gp->sizebytes >= sizeof(di)) {
-+				return copyout(&di, (user_addr_t)(uintptr_t)gp->value, sizeof(di));
-+			}
-+			return EINVAL;
++		switch (gp->type) {
++		case KGSL_PROP_DEVICE_INFO: {
++			struct kgsl_devinfo di; kgsl_fill_devinfo(&di);
++			return kgsl_prop_out(gp, &di, sizeof(di));
 +		}
-+		return EINVAL;
++		case KGSL_PROP_UCHE_GMEM_VADDR: { uint64_t v = 0x100000000ull; return kgsl_prop_out(gp, &v, 8); }
++		case KGSL_PROP_HIGHEST_BANK_BIT:{ uint32_t v = 14u; return kgsl_prop_out(gp, &v, 4); }   /* a618 (VERIFY) */
++		case KGSL_PROP_UBWC_MODE:       { uint32_t v = 1u;  return kgsl_prop_out(gp, &v, 4); }   /* UBWC enabled (VERIFY) */
++		case KGSL_PROP_UCHE_TRAP_BASE:  { uint64_t v = 0x1fffffffff000ull; return kgsl_prop_out(gp, &v, 8); }
++		case KGSL_PROP_GPU_VA64_SIZE:   { uint64_t v = (1ull << 48); return kgsl_prop_out(gp, &v, 8); }
++		case KGSL_PROP_IS_RAYTRACING:   { uint32_t v = 0u; return kgsl_prop_out(gp, &v, 4); }
++		default:
++			return EINVAL;   /* turnip falls back / treats unknown props as unsupported */
++		}
++	}
++	case KGSL_IOC_DRAWCTXT_CREATE: {
++		struct kgsl_drawctxt_create *dc = (struct kgsl_drawctxt_create *)data;
++		uint32_t id = 0;
++		if (kgsl_do_drawctxt_create(dc->flags, &id) != 0) { return ENOMEM; }
++		dc->drawctxt_id = id;
++		return 0;
++	}
++	case KGSL_IOC_DRAWCTXT_DESTROY: {
++		struct kgsl_drawctxt_destroy *dd = (struct kgsl_drawctxt_destroy *)data;
++		return kgsl_do_drawctxt_destroy(dd->drawctxt_id) == 0 ? 0 : EINVAL;
++	}
++	case KGSL_IOC_GPUMEM_ALLOC_ID: {
++		struct kgsl_gpumem_alloc_id *ga = (struct kgsl_gpumem_alloc_id *)data;
++		struct kgsl_bo_ent *bo = NULL;
++		if (kgsl_do_gpumem_alloc((vm_size_t)ga->size, ga->flags, &bo) != 0) { return ENOMEM; }
++		ga->id = bo->id;
++		ga->flags = bo->flags;          /* echo honoured flags (capability probe) */
++		ga->size = bo->size;
++		ga->mmapsize = bo->mmapsize;
++		ga->gpuaddr = bo->gpuaddr;
++		return 0;
++	}
++	case KGSL_IOC_GPUMEM_FREE_ID: {
++		struct kgsl_gpumem_free_id *gf = (struct kgsl_gpumem_free_id *)data;
++		return kgsl_do_gpumem_free(gf->id) == 0 ? 0 : EINVAL;
++	}
++	case KGSL_IOC_GPU_COMMAND: {
++		struct kgsl_gpu_command *gc = (struct kgsl_gpu_command *)data;
++		uint32_t ts = 0;
++		int rc = kgsl_do_gpu_command(gc, &ts);
++		if (rc != 0) { return (rc == -1) ? EINVAL : EIO; }
++		gc->timestamp = ts;
++		return 0;
++	}
++	case KGSL_IOC_READTIMESTAMP_CID: {
++		struct kgsl_cmdstream_readtimestamp_ctxtid *rt =
++		    (struct kgsl_cmdstream_readtimestamp_ctxtid *)data;
++		struct kgsl_ctx_ent *c = kgsl_ctx_find(rt->context_id);
++		if (!c) { return EINVAL; }
++		rt->timestamp = c->ts_retired;   /* synchronous submit: retired == latest */
++		return 0;
++	}
++	case KGSL_IOC_WAITTIMESTAMP_CID: {
++		/* NOTE: pure _IOW -> under Linux ioccom XNU won't copyin (see banner); the
++		 * Mesa build must use XNU ioccom for this nr. Synchronous submit means the
++		 * target is already retired, so success is immediate when the ctx exists. */
++		struct kgsl_device_waittimestamp_ctxtid *wt =
++		    (struct kgsl_device_waittimestamp_ctxtid *)data;
++		struct kgsl_ctx_ent *c = kgsl_ctx_find(wt->context_id);
++		if (!c) { return EINVAL; }
++		return 0;
 +	}
 +	default:
-+		return 0;   /* logged + accepted (stub) - wire to backend once userland exists */
++		return 0;   /* logged + accepted (Tier-2/3 stub) */
 +	}
 +}
 +
@@ -1910,12 +2241,58 @@
 +	.d_reset      = eno_reset,
 +	.d_ttys       = NULL,
 +	.d_select     = eno_select,
-+	.d_mmap       = eno_mmap,
++	.d_mmap       = eno_mmap,   /* id<<12 mmap wired in a follow-up (d_mmap sig TBC) */
 +	.d_strategy   = eno_strat,
 +	.d_reserved_1 = eno_getc,
 +	.d_reserved_2 = eno_putc,
 +	.d_type       = 0,
 +};
++
++/* In-kernel self-test of the UAPI core: create a context, alloc two BOs via the
++ * GPUMEM_ALLOC handler, build a CP_MEM_WRITE IB in one that stores a magic to the
++ * other's GPU VA, submit it via the submit path, assign the timestamp, and verify
++ * the store landed. Runs in the boot/probe thread (same as gpu_stage_s), so it is
++ * as safe as the existing stages and needs no userland client. */
++static void
++gpu_stage_u(void)
++{
++	uint32_t cid = 0, got;
++	struct kgsl_bo_ent *ib = NULL, *dst = NULL;
++	struct kgsl_ctx_ent *c;
++	uint64_t ibva;
++	uint32_t ibdw;
++	int rc;
++	if (!g_kgsl_ready) {
++		printf("SWEET KGSL: [U] selftest skipped (submit path not published)\n");
++		return;
++	}
++	if (kgsl_do_drawctxt_create(0x13u, &cid) != 0) {
++		printf("SWEET KGSL: [U] drawctxt_create FAIL\n"); return;
++	}
++	if (kgsl_do_gpumem_alloc(PAGE_SIZE, 0, &ib) != 0 ||
++	    kgsl_do_gpumem_alloc(PAGE_SIZE, 0, &dst) != 0) {
++		printf("SWEET KGSL: [U] gpumem_alloc FAIL\n"); return;
++	}
++	*(volatile uint32_t *)dst->cpu_nc = 0;
++	((volatile uint32_t *)ib->cpu_nc)[0] = cp_type7(0x3Du, 3u);     /* CP_MEM_WRITE -> dst gpuaddr */
++	((volatile uint32_t *)ib->cpu_nc)[1] = (uint32_t)dst->gpuaddr;
++	((volatile uint32_t *)ib->cpu_nc)[2] = (uint32_t)(dst->gpuaddr >> 32);
++	((volatile uint32_t *)ib->cpu_nc)[3] = 0x5AFE600Du;
++	__asm__ volatile("dsb sy" ::: "memory");
++	ibva = ib->gpuaddr;
++	ibdw = 4u;
++	rc = kgsl_submit_ibs(&ibva, &ibdw, 1);
++	c = kgsl_ctx_find(cid);
++	if (c && rc == 0) { c->ts_issued++; c->ts_retired = c->ts_issued; }
++	got = *(volatile uint32_t *)dst->cpu_nc;
++	printf("SWEET KGSL: [U] UAPI SELFTEST ctx=%u ib_id=%u(va=%#llx) dst_id=%u(va=%#llx) "
++	    "submit_rc=%d ts=%u readback=%#x(exp 5afe600d) -> %s\n",
++	    cid, ib->id, (unsigned long long)ib->gpuaddr, dst->id, (unsigned long long)dst->gpuaddr,
++	    rc, c ? c->ts_retired : 0, got,
++	    (rc == 0 && got == 0x5AFE600Du) ?
++	    "KGSL UAPI SUBMIT OK (create+alloc+submit+ts via ioctl handlers)" : "FAIL");
++	gmub_flush();
++}
 +
 +static int g_kgsl_major = -1;
 +static void
@@ -1933,6 +2310,7 @@
 +	    g_kgsl_major, di.chip_id, di.gpu_id,
 +	    (di.chip_id == 0x06010800u) ? "DEVINFO OK (a618) = cdev ready for userland freedreno"
 +	    : "BAD chip_id");
++	gpu_stage_u();              /* exercise create+alloc+submit+timestamp through the handlers */
 +}
 +
 +static void

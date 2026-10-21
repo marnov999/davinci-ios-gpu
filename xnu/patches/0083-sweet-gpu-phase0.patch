@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3086 @@
+@@ -0,0 +1,3090 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -77,6 +77,7 @@
 +#include "a630_sqe_fw.h"
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);   /* write-combine (framebuffer) */
 +extern kern_return_t thread_terminate(thread_t);
 +void sweet_gpu_init(void);
 +
@@ -2675,7 +2676,10 @@
 +	volatile uint32_t *dst;
 +	uint32_t panel, i, n;
 +	if (!g_fb_nc) {
-+		g_fb_nc = ml_io_map((vm_offset_t)SWEET_FB_PHYS, SWEET_FB_SIZE);
++		/* write-combine, matching the kernel fbcon + the shim's Normal-NC mapping;
++		 * plain ml_io_map (Device) of this DRAM address mismatches the cacheable
++		 * physmap alias and data-aborts on write. */
++		g_fb_nc = ml_io_map_wcomb((vm_offset_t)SWEET_FB_PHYS, SWEET_FB_SIZE);
 +		if (!g_fb_nc) { printf("SWEET DRM: present fb map failed\n"); return ENOMEM; }
 +		printf("SWEET DRM: present scanout pa=%#llx -> nc=%#lx size=%#lx\n",
 +		    (unsigned long long)SWEET_FB_PHYS, (unsigned long)g_fb_nc,

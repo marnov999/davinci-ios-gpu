@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2965 @@
+@@ -0,0 +1,2980 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -703,6 +703,7 @@
 +static vm_offset_t        g_res_nc;      /* its NC CPU ptr */
 +static int                g_kgsl_ready;  /* submit path live */
 +static volatile int       g_kgsl_lock;   /* trivial spinlock serialising submits */
++static vm_offset_t        g_smmu_base;   /* GPU SMMU base (for CB0 FSR fault readback) */
 +
 +/* Return the NC-mapped L3 table for a GPU VA, allocating a new L3 page and linking
 + * it into the L2 on demand. Lets the GPU VA space grow past the initial 2 MB L3
@@ -837,6 +838,7 @@
 +	g_l2_nc = (volatile uint64_t *)(pt_nc + 0x2000u);       /* L2 table (to grow more L3s) */
 +	g_l3_tabs[0] = (volatile uint64_t *)(pt_nc + 0x3000u);  /* initial L3 = VA 0x1_0000_0000..+2MB */
 +	g_gpuva_next = 0x100003000ull;
++	g_smmu_base = smmu;                                     /* for CB0 FSR fault readback on submit */
 +	/* ---- flip CB0 passthrough -> stage-1 (keep S2CR0/SMR0 routing from Stage J) ---- */
 +	gpu_wr(smmu, 0x8000u + 0x000u, 0u);                 /* CB0 SCTLR = 0 (disable) */
 +	gpu_wr(smmu, 0x1000u + 0x800u, 0x1u);               /* GR1 CBA2R0 = VA64 */
@@ -2074,6 +2076,9 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	gmub_flush();
 +	g_wptr = kk;
++	printf("SWEET DRM: submit n=%u ib0=%#llx dw0=%u wptr=%u seq=%#x -> doorbell\n",
++	    n, (unsigned long long)ibva[0], ibdw[0], g_wptr, seq);
++	gmub_flush();
 +	gpu_wr(g_core, 0x807u << 2, g_wptr);                  /* CP_RB_WPTR doorbell */
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	for (polls = 0; polls < 200000u; ++polls) {
@@ -2081,6 +2086,13 @@
 +		gmub_udelay(10);
 +	}
 +	ok = (*(volatile uint32_t *)(g_res_nc + 0xF0u) == seq);
++	{
++		uint32_t fsr = g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x058u) : 0;
++		uint32_t rbbm = gpu_rd(g_core, 0x210u << 2);
++		printf("SWEET DRM: submit done ok=%d polls=%u fsr=%#x far=%#x rbbm=%#x\n",
++		    ok, polls, fsr, g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x060u) : 0, rbbm);
++		gmub_flush();
++	}
 +	kgsl_unlock();
 +	return ok ? 0 : -2;
 +}
@@ -2511,6 +2523,9 @@
 +		n++;
 +	}
 +	if (n == 0) { return EINVAL; }
++	printf("SWEET DRM: GEM_SUBMIT ctx=%u nr_bos=%u nr_cmds=%u -> %u IBs\n",
++	    s->context_id, s->nr_bos, s->nr_cmds, n);
++	gmub_flush();
 +	rc = kgsl_submit_ibs(ibva, ibdw, n);
 +	if (rc != 0) { return EIO; }
 +	*out_fence = ++g_drm_fence;   /* synchronous: retired on return */

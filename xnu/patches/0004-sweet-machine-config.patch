@@ -117,10 +117,15 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e5336e5..f8d0d2e 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -745,11 +745,11 @@ common_start:
+@@ -745,11 +745,16 @@ common_start:
++	/* SWEET: allow EL0 to read CTR_EL0 (SCTLR_EL1.UCT, bit15) and do EL0 cache
++	 * maintenance (SCTLR_EL1.UCI, bit26) -- turnip/Mesa CPU-detect reads CTR_EL0
++	 * (mrs x8, ctr_el0) which otherwise traps to SIGILL. */
++	orr		x0, x0, #0x8000
++	orr		x0, x0, #0x4000000
  	MSR_SCTLR_EL1_X0
  	isb		sy
- 
+
 -#if !VMAPPLE
 +#if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT

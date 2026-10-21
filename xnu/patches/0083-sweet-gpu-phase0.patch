@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3188 @@
+@@ -0,0 +1,3209 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2343,6 +2343,27 @@
 +	}
 +}
 +
++/* mmap() of a GPU object: maps a BO at file offset (bo->id<<12); BOs are physically
++ * contiguous from bo->pa. Shared by the KGSL (turnip) and DRM (freedreno) cdevs.
++ * device_pager calls this per page, off advancing by PAGE_SIZE; return 16K ppn. */
++static int
++kgsl_mmap(__unused dev_t dev, off_t off, __unused int prot)
++{
++	unsigned i;
++	uint64_t o = (uint64_t)off;
++	for (i = 0; i < KGSL_MAX_BO; i++) {
++		uint64_t base;
++		if (!g_bo[i].used) { continue; }
++		base = (uint64_t)g_bo[i].id << 12;
++		if (o >= base && o < base + (uint64_t)g_bo[i].mmapsize) {
++			uint64_t pa = g_bo[i].pa + (o - base);
++			return (int)(ppnum_t)(pa >> 14);
++		}
++	}
++	printf("SWEET KGSL: mmap miss off=%#llx\n", (unsigned long long)off);
++	return -1;
++}
++
 +static const struct cdevsw kgsl_cdevsw = {
 +	.d_open       = kgsl_open,
 +	.d_close      = kgsl_close,
@@ -2353,7 +2374,7 @@
 +	.d_reset      = eno_reset,
 +	.d_ttys       = NULL,
 +	.d_select     = eno_select,
-+	.d_mmap       = eno_mmap,   /* id<<12 mmap wired in a follow-up (d_mmap sig TBC) */
++	.d_mmap       = kgsl_mmap,   /* map GPUOBJ BOs to userland (turnip BO map) */
 +	.d_strategy   = eno_strat,
 +	.d_reserved_1 = eno_getc,
 +	.d_reserved_2 = eno_putc,
@@ -2901,7 +2922,7 @@
 +	.d_reset      = eno_reset,
 +	.d_ttys       = NULL,
 +	.d_select     = eno_select,
-+	.d_mmap       = eno_mmap,   /* GEM GET_OFFSET mmap wired in a follow-up (d_mmap sig TBC) */
++	.d_mmap       = kgsl_mmap,   /* map GEM BOs to userland (MSM_INFO_GET_OFFSET token) */
 +	.d_strategy   = eno_strat,
 +	.d_reserved_1 = eno_getc,
 +	.d_reserved_2 = eno_putc,

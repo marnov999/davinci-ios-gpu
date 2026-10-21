@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2994 @@
+@@ -0,0 +1,3001 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2105,6 +2105,13 @@
 +		uint32_t rbbm = gpu_rd(g_core, 0x210u << 2);
 +		printf("SWEET DRM: submit done ok=%d polls=%u fsr=%#x far=%#x rbbm=%#x\n",
 +		    ok, polls, fsr, g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x060u) : 0, rbbm);
++		if (!ok) {   /* dump CP state so we can localise WHERE the GPU wedged in the IB */
++			printf("SWEET DRM: HANG rptr=%#x wptr=%u ib1=%#x_%#x rem=%#x rbbm3=%#x cp_sts=%#x\n",
++			    gpu_rd(g_core, 0x806u << 2), g_wptr,
++			    gpu_rd(g_core, 0x80Cu << 2), gpu_rd(g_core, 0x80Bu << 2),
++			    gpu_rd(g_core, 0x80Du << 2), gpu_rd(g_core, 0x213u << 2),
++			    gpu_rd(g_core, 0x821u << 2));
++		}
 +		gmub_flush();
 +	}
 +	kgsl_unlock();

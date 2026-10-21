@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2830 @@
+@@ -0,0 +1,2904 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -65,6 +65,11 @@
 +#include <pexpert/pexpert.h>
 +#include <vm/pmap.h>
 +#include <vm/vm_kern.h>
++#include <mach/memory_object_types.h>   /* MAP_MEM_WCOMB, memory_object_size_t/offset_t */
++#include <mach/vm_prot.h>
++#include <mach/vm_inherit.h>
++#include <mach/vm_statistics.h>         /* VM_FLAGS_ANYWHERE */
++#include <mach/vm_types.h>
 +#include <sys/conf.h>
 +#include <miscfs/devfs/devfs.h>
 +#include "a618_gmu_fw.h"
@@ -703,7 +708,8 @@
 + * PAGE_SIZE is 16K, so we step 0x1000 and fill all sub-pages (the prior loop
 + * stepped PAGE_SIZE and mapped only the first 4K of each 16K page). */
 +static int
-+gpu_gpumem_alloc(vm_size_t size, uint64_t *gpuaddr, vm_offset_t *cpu_nc, uint64_t *out_pa)
++gpu_gpumem_alloc(vm_size_t size, uint64_t *gpuaddr, vm_offset_t *cpu_nc, uint64_t *out_pa,
++    vm_offset_t *out_cva)
 +{
 +	vm_offset_t cva = 0, nc;
 +	uint64_t pa = 0, off;
@@ -728,6 +734,9 @@
 +	*cpu_nc = nc;
 +	if (out_pa) {
 +		*out_pa = pa;
++	}
++	if (out_cva) {
++		*out_cva = cva;    /* cacheable kernel VA (object-backed) for BO CPU-map */
 +	}
 +	g_gpuva_next += asize;
 +	return 0;
@@ -874,8 +883,8 @@
 +	vm_offset_t ib_nc, dst_nc;
 +	unsigned polls;
 +	uint32_t got;
-+	if (gpu_gpumem_alloc(PAGE_SIZE, &ib_va, &ib_nc, NULL) != 0 ||
-+	    gpu_gpumem_alloc(PAGE_SIZE, &dst_va, &dst_nc, NULL) != 0) {
++	if (gpu_gpumem_alloc(PAGE_SIZE, &ib_va, &ib_nc, NULL, NULL) != 0 ||
++	    gpu_gpumem_alloc(PAGE_SIZE, &dst_va, &dst_nc, NULL, NULL) != 0) {
 +		printf("SWEET GMU: [S] gpumem_alloc failed (stage-1 up?)\n"); gmub_flush(); return kk;
 +	}
 +	*(volatile uint32_t *)dst_nc = 0;
@@ -1960,7 +1969,7 @@
 +struct kgsl_ctx_ent { int used; uint32_t id; uint32_t ts_issued; uint32_t ts_retired; };
 +struct kgsl_bo_ent  {
 +	int used; uint32_t id; uint64_t gpuaddr; uint64_t pa;
-+	vm_offset_t cpu_nc; vm_size_t size; vm_size_t mmapsize; uint32_t flags;
++	vm_offset_t cpu_nc; vm_offset_t cva; vm_size_t size; vm_size_t mmapsize; uint32_t flags;
 +};
 +static struct kgsl_ctx_ent g_ctx[KGSL_MAX_CTX];
 +static struct kgsl_bo_ent  g_bo[KGSL_MAX_BO];
@@ -2064,17 +2073,18 @@
 +{
 +	unsigned i;
 +	uint64_t gpuaddr = 0, pa = 0;
-+	vm_offset_t nc = 0;
++	vm_offset_t nc = 0, cva = 0;
 +	vm_size_t asize = (size + (vm_size_t)PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
 +	for (i = 0; i < KGSL_MAX_BO; i++) { if (!g_bo[i].used) { break; } }
 +	if (i == KGSL_MAX_BO) { return -1; }
-+	if (gpu_gpumem_alloc(asize, &gpuaddr, &nc, &pa) != 0) { return -1; }
++	if (gpu_gpumem_alloc(asize, &gpuaddr, &nc, &pa, &cva) != 0) { return -1; }
 +	g_bo[i].used = 1;
 +	g_bo[i].id = g_mmap_page_next;                /* id = 4K-page offset base (16K aligned) */
 +	g_mmap_page_next += (uint32_t)(asize / 0x1000u);
 +	g_bo[i].gpuaddr = gpuaddr;
 +	g_bo[i].pa = pa;
 +	g_bo[i].cpu_nc = nc;
++	g_bo[i].cva = cva;                            /* cacheable kernel VA for BO CPU-map */
 +	g_bo[i].size = size;
 +	g_bo[i].mmapsize = asize;
 +	/* we honour only WRITECOMBINE (cachemode bits[27:26]=0); drop capability bits we
@@ -2449,6 +2459,63 @@
 +	return 0;
 +}
 +
++/* ---- BO CPU-map (Route B): iOS has no cdev mmap() path, so instead of
++ * mmap(fd, offset) we expose a private GEM_INFO op (MSM_INFO_IOS_MMAP) that maps
++ * the BO's physically-contiguous pages into the calling (Mesa) task as write-
++ * combine (Normal-NC) and returns the user VA. WC matches the GPU's stage-1
++ * Normal-NC view, so CPU<->GPU stay coherent with only the submit path's dsb sy.
++ * See gpu/userland/mesa/BO-MMAP-DESIGN.md. Our patched msm_bo.c calls this. ---- */
++#define MSM_INFO_IOS_MMAP 0x80u    /* private, outside the real 0x00..0x07 range */
++extern vm_map_t      current_map(void);
++extern kern_return_t mach_make_memory_entry_64(vm_map_t target_map,
++                         memory_object_size_t *size, memory_object_offset_t offset,
++                         vm_prot_t permission, ipc_port_t *object_handle,
++                         ipc_port_t parent_handle);
++extern kern_return_t mach_vm_map_external(vm_map_t target_map,
++                         mach_vm_offset_t *address, mach_vm_size_t initial_size,
++                         mach_vm_offset_t mask, int flags, ipc_port_t port,
++                         vm_object_offset_t offset, boolean_t copy,
++                         vm_prot_t cur_protection, vm_prot_t max_protection,
++                         vm_inherit_t inheritance);
++extern void          mach_memory_entry_port_release(ipc_port_t port);
++
++static int
++drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr)
++{
++	kern_return_t        kr;
++	ipc_port_t           entry      = IPC_PORT_NULL;
++	memory_object_size_t entry_size = (memory_object_size_t)bo->mmapsize;
++	mach_vm_offset_t     uaddr      = 0;
++	vm_prot_t            perm;
++
++	if (!bo->cva || bo->mmapsize == 0) {
++		return EINVAL;
++	}
++	/* named entry over the BO's object-backed cacheable kernel range, forcing WC
++	 * (cache mode = bits[31:24] of permission; MAP_MEM_WCOMB<<24, outside the flag mask) */
++	perm = VM_PROT_READ | VM_PROT_WRITE | ((vm_prot_t)MAP_MEM_WCOMB << 24);
++	kr = mach_make_memory_entry_64(kernel_map, &entry_size,
++	        (memory_object_offset_t)bo->cva, perm, &entry, IPC_PORT_NULL);
++	if (kr != KERN_SUCCESS || entry == IPC_PORT_NULL) {
++		printf("SWEET DRM: gem_mmap mem_entry id=%u kr=%d\n", bo->id, kr);
++		return ENOMEM;
++	}
++	kr = mach_vm_map_external(current_map(), &uaddr,
++	        (mach_vm_size_t)entry_size, 0, VM_FLAGS_ANYWHERE, entry,
++	        0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
++	        VM_INHERIT_SHARE);
++	mach_memory_entry_port_release(entry);
++	if (kr != KERN_SUCCESS) {
++		printf("SWEET DRM: gem_mmap vm_map id=%u kr=%d\n", bo->id, kr);
++		return ENOMEM;
++	}
++	printf("SWEET DRM: gem_mmap id=%u iova=%#llx -> uva=%#llx size=%#lx (WC)\n",
++	    bo->id, (unsigned long long)bo->gpuaddr, (unsigned long long)uaddr,
++	    (unsigned long)bo->mmapsize);
++	*out_uaddr = (uint64_t)uaddr;
++	return 0;
++}
++
 +static int
 +drm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
 +{
@@ -2503,6 +2570,13 @@
 +		switch (gi->info) {
 +		case MSM_INFO_GET_IOVA:   gi->value = bo->gpuaddr;                  return 0;
 +		case MSM_INFO_GET_OFFSET: gi->value = (uint64_t)bo->id << 12;       return 0;  /* mmap token */
++		case MSM_INFO_IOS_MMAP: {     /* Route B: map the BO into this task, WC; return user VA */
++			uint64_t uva = 0;
++			int e = drm_do_gem_mmap(bo, &uva);
++			if (e) { return e; }
++			gi->value = uva;
++			return 0;
++		}
 +		default: return EINVAL;   /* SET_NAME/METADATA optional; freedreno degrades */
 +		}
 +	}

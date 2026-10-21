@@ -25,8 +25,8 @@ index 997a4ab..db26bbe 100644
 +#define FBCON_FG        0xffffffffu
 +#define FBCON_BG        0xff000000u
 +
-+static volatile uint32_t *fbcon_base;
-+static uint32_t fbcon_width, fbcon_height, fbcon_stride;
++volatile uint32_t *fbcon_base;
++uint32_t fbcon_width, fbcon_height, fbcon_stride;
 +static uint32_t fbcon_cols, fbcon_rows, fbcon_col, fbcon_row;
 +
 +static void

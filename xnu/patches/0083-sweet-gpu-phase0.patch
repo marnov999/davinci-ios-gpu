@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3091 @@
+@@ -0,0 +1,3088 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2661,31 +2661,35 @@
 +#define SWEET_FB_SIZE        ((vm_size_t)SWEET_FB_H * SWEET_FB_STRIDE)
 +#define MSM_INFO_IOS_PRESENT 0x81u   /* private GEM_INFO op, outside real 0x00..0x07 */
 +
-+static vm_offset_t g_fb_nc;              /* NC kernel mapping of the scanout (mapped once) */
++/* The kernel fbcon already maps the scanout (write-combine) at this global and
++ * draws boot/panic text to it. We reuse that exact mapping: a fresh ml_io_map of
++ * the 10MB framebuffer panics with kmem_alloc KERN_NO_SPACE (no second 10MB VA
++ * window in the constrained IO map). de-static'd in 0003-sweet-framebuffer-*. */
++extern volatile uint32_t *fbcon_base;
++extern uint32_t fbcon_width, fbcon_height, fbcon_stride;
 +
 +/* Present a SOLID colour to the whole scanout. The app passes the GPU-produced
 + * pixel as a GL_RGBA8 word (byte order R,G,B,A, i.e. u32 = A<<24|B<<16|G<<8|R);
-+ * we swizzle R<->B into the panel's a8r8g8b8 and fill every pixel. No userland
-+ * buffer / copyin: large userland heap allocations can't be backed on this port
-+ * (10MB mallocs fault mid-write), so we move the fill entirely in-kernel. This
-+ * proves GPU-render -> colour -> scanout -> glass; full-frame content comes with
-+ * the zero-copy P2 path (freedreno rendering straight into the scanout BO). */
++ * we swizzle R<->B into the panel's a8r8g8b8 and fill every pixel via the fbcon
++ * mapping. No userland buffer / copyin / new mapping. Proves GPU-render -> colour
++ * -> scanout -> glass; full-frame content comes with the zero-copy P2 path. */
 +static int
 +drm_do_present(uint32_t gl_rgba)
 +{
-+	volatile uint32_t *dst;
++	volatile uint32_t *dst = fbcon_base;
 +	uint32_t panel, i, n;
-+	/* g_fb_nc is pre-mapped once at driver init (sweet_gpu_init), while the kernel
-+	 * IO map still has a 10MB contiguous hole. Mapping it lazily here fails with
-+	 * KERN_NO_SPACE: Mesa's per-page L3 ml_io_maps fragment the IO map by now. */
-+	if (!g_fb_nc) { printf("SWEET DRM: present no scanout mapping\n"); return ENXIO; }
++	if (!dst || !fbcon_stride || !fbcon_height) {
++		printf("SWEET DRM: present no fbcon mapping (base=%p stride=%u h=%u)\n",
++		    (void *)dst, fbcon_stride, fbcon_height);
++		return ENXIO;
++	}
 +	/* (A<<24|B<<16|G<<8|R) -> (A<<24|R<<16|G<<8|B) */
 +	panel = (gl_rgba & 0xFF00FF00u) | ((gl_rgba & 0x000000FFu) << 16) | ((gl_rgba & 0x00FF0000u) >> 16);
-+	dst = (volatile uint32_t *)g_fb_nc;
-+	n = SWEET_FB_W * SWEET_FB_H;
++	n = (fbcon_stride / 4u) * fbcon_height;   /* words in the real fbcon mapping */
 +	for (i = 0; i < n; i++) { dst[i] = panel; }
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("SWEET DRM: present gl=%#x -> panel=%#x filled %u px\n", gl_rgba, panel, n);
++	printf("SWEET DRM: present gl=%#x -> panel=%#x filled %u px (%ux%u)\n",
++	    gl_rgba, panel, n, fbcon_width, fbcon_height);
 +	return 0;
 +}
 +
@@ -3105,13 +3109,6 @@
 +		return;
 +	}
 +	gpu_level = enabled;
-+	/* Pre-map the scanout NOW, early, while the kernel IO map still has a 10MB
-+	 * contiguous hole (write-combine, matching the fbcon). Doing it lazily at the
-+	 * first present fails with KERN_NO_SPACE once Mesa's per-page L3 ml_io_maps
-+	 * have fragmented the IO map. drm_do_present() just reuses g_fb_nc. */
-+	g_fb_nc = ml_io_map_wcomb((vm_offset_t)SWEET_FB_PHYS, SWEET_FB_SIZE);
-+	printf("SWEET DRM: scanout pre-map pa=%#llx -> nc=%#lx size=%#lx\n",
-+	    (unsigned long long)SWEET_FB_PHYS, (unsigned long)g_fb_nc, (unsigned long)SWEET_FB_SIZE);
 +	kern_return_t kr = kernel_thread_start(gpu_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);

@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3223 @@
+@@ -0,0 +1,3225 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -1981,6 +1981,7 @@
 +#define KGSL_PROP_UBWC_MODE        0x1Bu
 +#define KGSL_PROP_GPU_VA64_SIZE    0x2Cu
 +#define KGSL_PROP_IS_RAYTRACING    0x2Du
++#define KGSL_PROP_GPU_RESET_STAT   0x09u
 +#define KGSL_PROP_UCHE_TRAP_BASE   0x2Fu
 +/* cmd-object + alloc flags */
 +#define KGSL_CMDLIST_IB            0x1u
@@ -2283,6 +2284,7 @@
 +		case KGSL_PROP_UCHE_TRAP_BASE:  { uint64_t v = 0x1fffffffff000ull; return kgsl_prop_out(gp, &v, 8); }
 +		case KGSL_PROP_GPU_VA64_SIZE:   { uint64_t v = (1ull << 48); return kgsl_prop_out(gp, &v, 8); }
 +		case KGSL_PROP_IS_RAYTRACING:   { uint32_t v = 0u; return kgsl_prop_out(gp, &v, 4); }
++		case KGSL_PROP_GPU_RESET_STAT:  { uint32_t v = 0u; return kgsl_prop_out(gp, &v, 4); }  /* NO_ERROR: never report a GPU reset (synchronous submits) -> turnip check_status passes */
 +		default:
 +			return EINVAL;   /* turnip falls back / treats unknown props as unsupported */
 +		}

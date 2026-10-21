@@ -2523,8 +2523,8 @@
 +		n++;
 +	}
 +	if (n == 0) { return EINVAL; }
-+	printf("SWEET DRM: GEM_SUBMIT ctx=%u nr_bos=%u nr_cmds=%u -> %u IBs\n",
-+	    s->context_id, s->nr_bos, s->nr_cmds, n);
++	printf("SWEET DRM: GEM_SUBMIT queueid=%u nr_bos=%u nr_cmds=%u -> %u IBs\n",
++	    s->queueid, s->nr_bos, s->nr_cmds, n);
 +	gmub_flush();
 +	rc = kgsl_submit_ibs(ibva, ibdw, n);
 +	if (rc != 0) { return EIO; }

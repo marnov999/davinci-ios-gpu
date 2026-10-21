@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3092 @@
+@@ -0,0 +1,3094 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2660,19 +2660,19 @@
 +#define SWEET_FB_SIZE        ((vm_size_t)SWEET_FB_H * SWEET_FB_STRIDE)
 +#define MSM_INFO_IOS_PRESENT 0x81u   /* private GEM_INFO op, outside real 0x00..0x07 */
 +
-+static vm_offset_t g_fb_nc;          /* NC kernel mapping of the scanout (mapped once) */
++static vm_offset_t g_fb_nc;              /* NC kernel mapping of the scanout (mapped once) */
++static uint32_t    g_present_row[SWEET_FB_W];  /* one-scanline copyin bounce (single presenter) */
 +
++/* Present from a USER pixel pointer (GL_RGBA8, FB_W x FB_H, bottom-up). We copyin
++ * one scanline at a time (so arbitrary user heap works — no large WC BO mapping,
++ * which is unreliable for our non-contiguous BOs that span several kernel VM map
++ * entries), flip vertically, and swizzle R<->B into the panel's a8r8g8b8. */
 +static int
-+drm_do_present(struct kgsl_bo_ent *bo)
++drm_do_present(user_addr_t usrc)
 +{
 +	volatile uint32_t *dst;
-+	const uint32_t *src;
 +	uint32_t y, x;
-+	if (!bo->cva || bo->mmapsize < SWEET_FB_SIZE) {
-+		printf("SWEET DRM: present id=%u too small size=%#lx need=%#lx\n",
-+		    bo->id, (unsigned long)bo->mmapsize, (unsigned long)SWEET_FB_SIZE);
-+		return EINVAL;
-+	}
++	if (!usrc) { return EINVAL; }
 +	if (!g_fb_nc) {
 +		g_fb_nc = ml_io_map((vm_offset_t)SWEET_FB_PHYS, SWEET_FB_SIZE);
 +		if (!g_fb_nc) { printf("SWEET DRM: present fb map failed\n"); return ENOMEM; }
@@ -2680,16 +2680,16 @@
 +		    (unsigned long long)SWEET_FB_PHYS, (unsigned long)g_fb_nc,
 +		    (unsigned long)SWEET_FB_SIZE);
 +	}
-+	/* BO CPU view is cacheable; drop stale lines so we read the GPU/Mesa-written DRAM */
-+	gpu_dcache_clean(bo->cva, SWEET_FB_SIZE);
-+	__asm__ volatile("dsb sy" ::: "memory");
 +	dst = (volatile uint32_t *)g_fb_nc;
-+	src = (const uint32_t *)bo->cva;
 +	for (y = 0; y < SWEET_FB_H; y++) {
-+		const uint32_t *srow = src + (uint32_t)(SWEET_FB_H - 1u - y) * SWEET_FB_W; /* flip */
++		user_addr_t srow = usrc + (user_addr_t)(SWEET_FB_H - 1u - y) * SWEET_FB_STRIDE; /* flip */
 +		volatile uint32_t *drow = dst + (uint32_t)y * (SWEET_FB_STRIDE / 4u);
++		if (copyin(srow, (void *)g_present_row, SWEET_FB_STRIDE) != 0) {
++			printf("SWEET DRM: present copyin fault row=%u\n", y);
++			return EFAULT;
++		}
 +		for (x = 0; x < SWEET_FB_W; x++) {
-+			uint32_t g = srow[x];              /* (A<<24)|(B<<16)|(G<<8)|R  GL RGBA, LE */
++			uint32_t g = g_present_row[x];      /* (A<<24)|(B<<16)|(G<<8)|R  GL RGBA, LE */
 +			drow[x] = (g & 0xFF00FF00u)         /* keep A, G */
 +			        | ((g & 0x000000FFu) << 16) /* R -> bits[23:16] */
 +			        | ((g & 0x00FF0000u) >> 16);/* B -> bits[7:0]   */
@@ -2748,7 +2748,11 @@
 +	}
 +	case DRM_NR_MSM_GEM_INFO: {
 +		struct drm_msm_gem_info *gi = (struct drm_msm_gem_info *)data;
-+		struct kgsl_bo_ent *bo = kgsl_bo_find(gi->handle);
++		struct kgsl_bo_ent *bo;
++		if (gi->info == MSM_INFO_IOS_PRESENT) {   /* Stage P1: blit user pixels to scanout (no BO) */
++			return drm_do_present((user_addr_t)gi->value);
++		}
++		bo = kgsl_bo_find(gi->handle);
 +		if (!bo) { return EINVAL; }
 +		switch (gi->info) {
 +		case MSM_INFO_GET_IOVA:   gi->value = bo->gpuaddr;                  return 0;
@@ -2760,8 +2764,6 @@
 +			gi->value = uva;
 +			return 0;
 +		}
-+		case MSM_INFO_IOS_PRESENT:    /* Stage P1: blit this BO to the live scanout */
-+			return drm_do_present(bo);
 +		default: return EINVAL;   /* SET_NAME/METADATA optional; freedreno degrades */
 +		}
 +	}

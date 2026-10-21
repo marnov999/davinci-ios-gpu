@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2980 @@
+@@ -0,0 +1,2992 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -733,6 +733,18 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	g_l2_nc[l2i] = (t_pa & Q_ADDRMASK) | 0x3ull;            /* L2[l2i] -> new L3 (table desc) */
 +	__asm__ volatile("dsb sy" ::: "memory");
++	/* Adding a table entry to a LIVE stage-1 pagetable: the SMMU (MMU-500) caches
++	 * intermediate walks, so without a TLB/walk-cache invalidate it keeps the stale
++	 * "L2[l2i]=invalid" and the GPU translation-faults (fsr.TF) on this region. */
++	if (g_smmu_base) {
++		unsigned p;
++		gpu_wr(g_smmu_base, 0x8000u + 0x610u, 0u);         /* CB0 S1_TLBIASID (ASID 0) */
++		gpu_wr(g_smmu_base, 0x8000u + 0x7F0u, 0u);         /* CB0 TLBSYNC */
++		for (p = 0; p < 2000u; p++) {
++			if (!(gpu_rd(g_smmu_base, 0x8000u + 0x7F4u) & 1u)) { break; }
++			gmub_udelay(1);
++		}
++	}
 +	g_l3_tabs[l2i] = (volatile uint64_t *)t_nc;
 +	return g_l3_tabs[l2i];
 +}

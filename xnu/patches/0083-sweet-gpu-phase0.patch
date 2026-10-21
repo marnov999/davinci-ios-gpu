@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3014 @@
+@@ -0,0 +1,3035 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2535,6 +2535,8 @@
 +	uint32_t ibdw[16];
 +	unsigned n = 0, i;
 +	int rc;
++	struct kgsl_bo_ent *bo0 = NULL;   /* first CMD_BUF BO, for the on-hang IB dump */
++	uint32_t ib0_off = 0;
 +	if (s->nr_cmds == 0 || s->nr_cmds > 16u) {
 +		return EINVAL;
 +	}
@@ -2554,6 +2556,7 @@
 +		if (n >= 16u) { return EINVAL; }
 +		ibva[n] = bo->gpuaddr + c.submit_offset;
 +		ibdw[n] = c.size / 4u;
++		if (bo0 == NULL) { bo0 = bo; ib0_off = c.submit_offset; }
 +		n++;
 +	}
 +	if (n == 0) { return EINVAL; }
@@ -2561,7 +2564,25 @@
 +	    s->queueid, s->nr_bos, s->nr_cmds, n);
 +	gmub_flush();
 +	rc = kgsl_submit_ibs(ibva, ibdw, n);
-+	if (rc != 0) { return EIO; }
++	if (rc != 0) {
++		/* dump freedreno's IB1 head + the region around the CP stall (invalidate the
++		 * cacheable alias first so we read freedreno's WC-written cmdstream from DRAM) */
++		if (bo0 && bo0->cva) {
++			volatile uint32_t *p = (volatile uint32_t *)(bo0->cva + ib0_off);
++			uint32_t rem = gpu_rd(g_core, 0x92Au << 2);
++			unsigned total = ibdw[0];
++			unsigned stall = (rem && rem <= total) ? (total - rem) : 0;
++			unsigned s0 = (stall > 6u) ? (stall - 6u) : 0u, k;
++			gpu_dcache_clean(bo0->cva, bo0->mmapsize);
++			printf("SWEET DRM: IBDUMP total=%u rem=%#x stall~%u head %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			    total, rem, stall, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++			printf("SWEET DRM: IBDUMP @%u:", s0);
++			for (k = s0; k < s0 + 16u && k < total; k++) { printf(" %08x", p[k]); }
++			printf("\n");
++			gmub_flush();
++		}
++		return EIO;
++	}
 +	*out_fence = ++g_drm_fence;   /* synchronous: retired on return */
 +	return 0;
 +}

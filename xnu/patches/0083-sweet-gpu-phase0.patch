@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2992 @@
+@@ -0,0 +1,2994 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -727,6 +727,8 @@
 +	if (!(t_nc = ml_io_map(t_pa, PAGE_SIZE))) {
 +		return NULL;
 +	}
++	gpu_dcache_clean(t_cva, PAGE_SIZE);   /* flush the KMA_ZERO dirty cacheable lines to DRAM,
++	                                       * else they later evict and clobber the NC-written PTEs */
 +	for (j = 0; j < 512u; j++) {
 +		((volatile uint64_t *)t_nc)[j] = 0;
 +	}

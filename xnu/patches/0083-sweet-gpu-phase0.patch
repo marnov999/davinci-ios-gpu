@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,2904 @@
+@@ -0,0 +1,2965 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -688,8 +688,10 @@
 + * assigned GPU VAs - exactly the IOCTL_KGSL_GPUMEM_ALLOC model. For now all gpumem VAs
 + * live in the one L1[4]->L2[0]->L3 2MB window (0x1_0000_0000..0x1_0020_0000, 512 pages);
 + * full multi-level mapping comes with the real UAPI. */
-+static vm_offset_t g_l3_nc;        /* NC CPU ptr to the live L3 table */
-+static uint64_t    g_gpuva_next;   /* next free GPU VA to assign */
++static vm_offset_t g_l3_nc;        /* legacy: NC ptr to L3[0] (direct-VA stages) */
++static volatile uint64_t *g_l2_nc; /* NC ptr to the L2 table (grow L3 tables on demand) */
++static volatile uint64_t *g_l3_tabs[512]; /* NC ptr to each L3 table by L2 index (NULL=unmapped) */
++static uint64_t    g_gpuva_next;   /* next free GPU VA to assign (bump allocator) */
 +
 +/* Submit path published by the boot code once the ring + stage-1 pagetable are
 + * live, so the KGSL GPU_COMMAND ioctl (and the in-kernel self-test) can submit
@@ -702,41 +704,78 @@
 +static int                g_kgsl_ready;  /* submit path live */
 +static volatile int       g_kgsl_lock;   /* trivial spinlock serialising submits */
 +
-+/* KGSL GPUMEM_ALLOC backend: allocate `size` bytes, map every 4K GPU page into
-+ * the live GPU pagetable (non-cacheable) at the next GPU VA, return gpuaddr +
-+ * CPU NC pointer (+ phys for mmap). The GPU MMU granule is 4K while the SoC
-+ * PAGE_SIZE is 16K, so we step 0x1000 and fill all sub-pages (the prior loop
-+ * stepped PAGE_SIZE and mapped only the first 4K of each 16K page). */
++/* Return the NC-mapped L3 table for a GPU VA, allocating a new L3 page and linking
++ * it into the L2 on demand. Lets the GPU VA space grow past the initial 2 MB L3
++ * (each L2 entry = one L3 = 2 MB; L2 has 512 => up to 1 GB of GPU VA). */
++static volatile uint64_t *
++gpu_pt_l3_for(uint64_t va)
++{
++	unsigned l2i = (unsigned)((va >> 21) & 0x1FFu);
++	vm_offset_t t_cva = 0, t_nc;
++	uint64_t t_pa = 0;
++	unsigned j;
++	if (!g_l2_nc) {
++		return NULL;
++	}
++	if (g_l3_tabs[l2i]) {
++		return g_l3_tabs[l2i];
++	}
++	if (gmub_alloc_phys(&t_cva, &t_pa, PAGE_SIZE) != 0) {    /* one zeroed table page */
++		return NULL;
++	}
++	if (!(t_nc = ml_io_map(t_pa, PAGE_SIZE))) {
++		return NULL;
++	}
++	for (j = 0; j < 512u; j++) {
++		((volatile uint64_t *)t_nc)[j] = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	g_l2_nc[l2i] = (t_pa & Q_ADDRMASK) | 0x3ull;            /* L2[l2i] -> new L3 (table desc) */
++	__asm__ volatile("dsb sy" ::: "memory");
++	g_l3_tabs[l2i] = (volatile uint64_t *)t_nc;
++	return g_l3_tabs[l2i];
++}
++
++/* KGSL GPUMEM_ALLOC backend: allocate `size` bytes of FREEABLE, NON-contiguous,
++ * wired memory (no 4 MiB-contiguous constraint that panicked kmem_alloc) and map
++ * each 4 KB page's own phys into the GPU stage-1 pagetable (non-cacheable), growing
++ * L3 tables on demand. Returns gpuaddr + the cacheable kernel VA (cva: the kernel
++ * CPU view AND the source for the write-combine user mmap) + the first page phys.
++ * The CPU view is cacheable, so in-kernel writers gpu_dcache_clean() before the GPU
++ * reads (the self-tests do); userland uses the WC mmap, which is already coherent. */
 +static int
 +gpu_gpumem_alloc(vm_size_t size, uint64_t *gpuaddr, vm_offset_t *cpu_nc, uint64_t *out_pa,
 +    vm_offset_t *out_cva)
 +{
-+	vm_offset_t cva = 0, nc;
-+	uint64_t pa = 0, off;
++	vm_offset_t cva = 0;
++	uint64_t off;
 +	vm_size_t asize = (size + (vm_size_t)PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
-+	if (!g_l3_nc || !g_gpuva_next) {
++	if (!g_l2_nc || !g_gpuva_next) {
 +		return -1;                 /* stage-1 pagetable not up */
 +	}
-+	if (gmub_alloc_phys(&cva, &pa, asize) != 0) {
-+		return -1;
++	if (kmem_alloc(kernel_map, &cva, asize, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return -1;                 /* non-contiguous, wired, freeable (no KMA_PERMANENT) */
 +	}
-+	if (!(nc = ml_io_map(pa, asize))) {
-+		return -1;
-+	}
-+	gpu_dcache_clean(cva, asize);
 +	for (off = 0; off < asize; off += 0x1000ull) {
 +		uint64_t va = g_gpuva_next + off;
-+		*(volatile uint64_t *)(g_l3_nc + (vm_offset_t)(((va >> 12) & 0x1FFu) * 8u)) =
-+		    ((pa + off) & Q_ADDRMASK) | 0xE43ull;   /* L3 4K page, non-cached */
++		uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(cva + off)))
++		            | (off & ((uint64_t)PAGE_SIZE - 1u));   /* 4K sub-page phys within the 16K page */
++		volatile uint64_t *l3 = gpu_pt_l3_for(va);
++		if (!l3) {
++			kmem_free(kernel_map, cva, asize);
++			return -1;
++		}
++		l3[(va >> 12) & 0x1FFu] = (pa & Q_ADDRMASK) | 0xE43ull;   /* L3 4K page, non-cached */
 +	}
++	gpu_dcache_clean(cva, asize);     /* flush the zeroed state to DRAM before the GPU (NC) sees it */
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	*gpuaddr = g_gpuva_next;
-+	*cpu_nc = nc;
++	*cpu_nc = cva;
 +	if (out_pa) {
-+		*out_pa = pa;
++		*out_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)cva));
 +	}
 +	if (out_cva) {
-+		*out_cva = cva;    /* cacheable kernel VA (object-backed) for BO CPU-map */
++		*out_cva = cva;    /* object-backed cacheable kernel VA for the WC BO CPU-map */
 +	}
 +	g_gpuva_next += asize;
 +	return 0;
@@ -795,6 +834,8 @@
 +	 * pool offset 0x3000; VAs 0,1,2 (0x100000000/1000/2000) are used by Q, so gpumem
 +	 * starts at 0x100003000. */
 +	g_l3_nc = pt_nc + 0x3000u;
++	g_l2_nc = (volatile uint64_t *)(pt_nc + 0x2000u);       /* L2 table (to grow more L3s) */
++	g_l3_tabs[0] = (volatile uint64_t *)(pt_nc + 0x3000u);  /* initial L3 = VA 0x1_0000_0000..+2MB */
 +	g_gpuva_next = 0x100003000ull;
 +	/* ---- flip CB0 passthrough -> stage-1 (keep S2CR0/SMR0 routing from Stage J) ---- */
 +	gpu_wr(smmu, 0x8000u + 0x000u, 0u);                 /* CB0 SCTLR = 0 (disable) */
@@ -893,6 +934,8 @@
 +	((volatile uint32_t *)ib_nc)[1] = (uint32_t)dst_va;
 +	((volatile uint32_t *)ib_nc)[2] = (uint32_t)(dst_va >> 32);
 +	((volatile uint32_t *)ib_nc)[3] = 0x5AFE600Du;
++	gpu_dcache_clean(ib_nc, PAGE_SIZE);    /* cva is cacheable: flush IB + cleared dst to DRAM */
++	gpu_dcache_clean(dst_nc, PAGE_SIZE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	/* submit (GPU_COMMAND): ring CP_INDIRECT_BUFFER -> ib_va, then CACHE_FLUSH_TS */
 +	rb[kk++] = cp_type7(0x3Fu, 3u);
@@ -916,6 +959,7 @@
 +		}
 +		gmub_udelay(10);
 +	}
++	gpu_dcache_clean(dst_nc, PAGE_SIZE);    /* invalidate so the CPU re-reads the GPU-written DRAM */
 +	got = *(volatile uint32_t *)dst_nc;
 +	printf("SWEET GMU: [S] KGSL BACKEND: gpumem ib_va=%#llx dst_va=%#llx submit-IB readback=%#x"
 +	    "(exp 5afe600d) polls=%u -> %s\n", (unsigned long long)ib_va,
@@ -2097,7 +2141,18 @@
 +kgsl_do_gpumem_free(uint32_t id)
 +{
 +	struct kgsl_bo_ent *b = kgsl_bo_find(id);
++	uint64_t off;
 +	if (!b) { return -1; }
++	/* clear this BO's L3 PTEs (freed VA is not reused, so no TLB-invalidate needed) */
++	for (off = 0; off < b->mmapsize; off += 0x1000ull) {
++		uint64_t va = b->gpuaddr + off;
++		volatile uint64_t *l3 = g_l3_tabs[(va >> 21) & 0x1FFu];
++		if (l3) { l3[(va >> 12) & 0x1FFu] = 0; }
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (b->cva) {
++		kmem_free(kernel_map, b->cva, b->mmapsize);   /* release the wired backing (the exhaustion fix) */
++	}
 +	b->used = 0;
 +	return 0;
 +}
@@ -2288,12 +2343,15 @@
 +	((volatile uint32_t *)ib->cpu_nc)[1] = (uint32_t)dst->gpuaddr;
 +	((volatile uint32_t *)ib->cpu_nc)[2] = (uint32_t)(dst->gpuaddr >> 32);
 +	((volatile uint32_t *)ib->cpu_nc)[3] = 0x5AFE600Du;
++	gpu_dcache_clean(ib->cpu_nc, PAGE_SIZE);    /* cacheable cva: flush IB + cleared dst to DRAM */
++	gpu_dcache_clean(dst->cpu_nc, PAGE_SIZE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	ibva = ib->gpuaddr;
 +	ibdw = 4u;
 +	rc = kgsl_submit_ibs(&ibva, &ibdw, 1);
 +	c = kgsl_ctx_find(cid);
 +	if (c && rc == 0) { c->ts_issued++; c->ts_retired = c->ts_issued; }
++	gpu_dcache_clean(dst->cpu_nc, PAGE_SIZE);   /* invalidate: CPU re-reads GPU-written DRAM */
 +	got = *(volatile uint32_t *)dst->cpu_nc;
 +	printf("SWEET KGSL: [U] UAPI SELFTEST ctx=%u ib_id=%u(va=%#llx) dst_id=%u(va=%#llx) "
 +	    "submit_rc=%d ts=%u readback=%#x(exp 5afe600d) -> %s\n",
@@ -2653,10 +2711,13 @@
 +	((volatile uint32_t *)ib->cpu_nc)[1] = (uint32_t)dst->gpuaddr;
 +	((volatile uint32_t *)ib->cpu_nc)[2] = (uint32_t)(dst->gpuaddr >> 32);
 +	((volatile uint32_t *)ib->cpu_nc)[3] = 0x5AFEDA7Au;
++	gpu_dcache_clean(ib->cpu_nc, PAGE_SIZE);    /* cacheable cva: flush IB + cleared dst to DRAM */
++	gpu_dcache_clean(dst->cpu_nc, PAGE_SIZE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	ibva = ib->gpuaddr; ibdw = 4u;
 +	rc = kgsl_submit_ibs(&ibva, &ibdw, 1);
 +	if (rc == 0) { fence = ++g_drm_fence; } else { fence = 0; }
++	gpu_dcache_clean(dst->cpu_nc, PAGE_SIZE);   /* invalidate: CPU re-reads GPU-written DRAM */
 +	got = *(volatile uint32_t *)dst->cpu_nc;
 +	printf("SWEET DRM: [V] MSM GEM SELFTEST chip_id=%#llx gem_ib=%u(iova=%#llx) gem_dst=%u(iova=%#llx) "
 +	    "submit_rc=%d fence=%u readback=%#x(exp 5afeda7a) -> %s\n",

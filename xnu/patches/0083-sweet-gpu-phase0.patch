@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3090 @@
+@@ -0,0 +1,3091 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2675,16 +2675,10 @@
 +{
 +	volatile uint32_t *dst;
 +	uint32_t panel, i, n;
-+	if (!g_fb_nc) {
-+		/* write-combine, matching the kernel fbcon + the shim's Normal-NC mapping;
-+		 * plain ml_io_map (Device) of this DRAM address mismatches the cacheable
-+		 * physmap alias and data-aborts on write. */
-+		g_fb_nc = ml_io_map_wcomb((vm_offset_t)SWEET_FB_PHYS, SWEET_FB_SIZE);
-+		if (!g_fb_nc) { printf("SWEET DRM: present fb map failed\n"); return ENOMEM; }
-+		printf("SWEET DRM: present scanout pa=%#llx -> nc=%#lx size=%#lx\n",
-+		    (unsigned long long)SWEET_FB_PHYS, (unsigned long)g_fb_nc,
-+		    (unsigned long)SWEET_FB_SIZE);
-+	}
++	/* g_fb_nc is pre-mapped once at driver init (sweet_gpu_init), while the kernel
++	 * IO map still has a 10MB contiguous hole. Mapping it lazily here fails with
++	 * KERN_NO_SPACE: Mesa's per-page L3 ml_io_maps fragment the IO map by now. */
++	if (!g_fb_nc) { printf("SWEET DRM: present no scanout mapping\n"); return ENXIO; }
 +	/* (A<<24|B<<16|G<<8|R) -> (A<<24|R<<16|G<<8|B) */
 +	panel = (gl_rgba & 0xFF00FF00u) | ((gl_rgba & 0x000000FFu) << 16) | ((gl_rgba & 0x00FF0000u) >> 16);
 +	dst = (volatile uint32_t *)g_fb_nc;
@@ -3111,6 +3105,13 @@
 +		return;
 +	}
 +	gpu_level = enabled;
++	/* Pre-map the scanout NOW, early, while the kernel IO map still has a 10MB
++	 * contiguous hole (write-combine, matching the fbcon). Doing it lazily at the
++	 * first present fails with KERN_NO_SPACE once Mesa's per-page L3 ml_io_maps
++	 * have fragmented the IO map. drm_do_present() just reuses g_fb_nc. */
++	g_fb_nc = ml_io_map_wcomb((vm_offset_t)SWEET_FB_PHYS, SWEET_FB_SIZE);
++	printf("SWEET DRM: scanout pre-map pa=%#llx -> nc=%#lx size=%#lx\n",
++	    (unsigned long long)SWEET_FB_PHYS, (unsigned long)g_fb_nc, (unsigned long)SWEET_FB_SIZE);
 +	kern_return_t kr = kernel_thread_start(gpu_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);

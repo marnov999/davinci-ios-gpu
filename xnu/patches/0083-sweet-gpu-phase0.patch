@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3001 @@
+@@ -0,0 +1,3014 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -1393,7 +1393,7 @@
 +		CW(0xE09u, 0xFFFFF000u); CW(0xE0Au, 0x0001FFFFu); /* UCHE_TRAP_BASE */
 +		CW(0xE07u, 0xFFFFF000u); CW(0xE08u, 0x0001FFFFu); /* UCHE_WRITE_THRU_BASE */
 +		CW(0xE0Bu, 0x00100000u); CW(0xE0Cu, 0x0u);        /* UCHE_GMEM_RANGE_MIN */
-+		CW(0xE0Du, 0x0017FFFFu); CW(0xE0Eu, 0x0u);        /* UCHE_GMEM_RANGE_MAX */
++		CW(0xE0Du, 0x001FFFFFu); CW(0xE0Eu, 0x0u);        /* UCHE_GMEM_RANGE_MAX (full 1MiB a618 GMEM) */
 +		CW(0xE18u, 0x804u); CW(0xE17u, 0x4u);  /* UCHE_FILTER_CNTL, CACHE_WAYS */
 +		__asm__ volatile("dsb osh" ::: "memory");
 +		printf("SWEET GMU: [Ia] VBIF+UCHE ranges written\n"); gmub_flush();
@@ -1414,6 +1414,19 @@
 +		/* group d: protect + 64-bit addr mode */
 +		CW(0x84Fu, 0x3u);                  /* CP_PROTECT_CNTL */
 +		CW(0x842u, 0x1u);                  /* CP_ADDR_MODE_CNTL (64-bit) */
++		/* a6xx_enable_64bit: ALL blocks must be in 64-bit addr mode, else they drop
++		 * the hi dword of freedreno's >=4GiB stage-1 VAs -> mis-fetch/hang (the self-
++		 * tests can't hit this; their gmub_alloc_phys VAs are all <4GiB, hi=0). */
++		CW(0xC01u,  0x1u);                 /* VSC_ADDR_MODE_CNTL  */
++		CW(0x8601u, 0x1u);                 /* GRAS_ADDR_MODE_CNTL */
++		CW(0x8E05u, 0x1u);                 /* RB_ADDR_MODE_CNTL   */
++		CW(0x9E01u, 0x1u);                 /* PC_ADDR_MODE_CNTL   */
++		CW(0xBE05u, 0x1u);                 /* HLSQ_ADDR_MODE_CNTL */
++		CW(0xA601u, 0x1u);                 /* VFD_ADDR_MODE_CNTL  */
++		CW(0x9601u, 0x1u);                 /* VPC_ADDR_MODE_CNTL  */
++		CW(0xE00u,  0x1u);                 /* UCHE_ADDR_MODE_CNTL */
++		CW(0xAE01u, 0x1u);                 /* SP_ADDR_MODE_CNTL   */
++		CW(0xB601u, 0x1u);                 /* TPL1_ADDR_MODE_CNTL */
 +		__asm__ volatile("dsb osh" ::: "memory");
 +		printf("SWEET GMU: [Id] protect+addrmode written\n");
 +		gmub_flush();
@@ -2106,11 +2119,11 @@
 +		printf("SWEET DRM: submit done ok=%d polls=%u fsr=%#x far=%#x rbbm=%#x\n",
 +		    ok, polls, fsr, g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x060u) : 0, rbbm);
 +		if (!ok) {   /* dump CP state so we can localise WHERE the GPU wedged in the IB */
-+			printf("SWEET DRM: HANG rptr=%#x wptr=%u ib1=%#x_%#x rem=%#x rbbm3=%#x cp_sts=%#x\n",
++			printf("SWEET DRM: HANG rptr=%#x wptr=%u ib1=%#x_%#x ib1_rem=%#x ib2_rem=%#x protstat=%#x\n",
 +			    gpu_rd(g_core, 0x806u << 2), g_wptr,
-+			    gpu_rd(g_core, 0x80Cu << 2), gpu_rd(g_core, 0x80Bu << 2),
-+			    gpu_rd(g_core, 0x80Du << 2), gpu_rd(g_core, 0x213u << 2),
-+			    gpu_rd(g_core, 0x821u << 2));
++			    gpu_rd(g_core, 0x929u << 2), gpu_rd(g_core, 0x928u << 2),  /* CP_IB1_BASE_HI/LO */
++			    gpu_rd(g_core, 0x92Au << 2), gpu_rd(g_core, 0x92Du << 2),  /* CP_IB1/IB2_REM_SIZE */
++			    gpu_rd(g_core, 0x8CAu << 2));                              /* CP_PROTECT_STATUS */
 +		}
 +		gmub_flush();
 +	}

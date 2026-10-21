@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3140 @@
+@@ -0,0 +1,3188 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2742,6 +2742,50 @@
 +	return 0;
 +}
 +
++/* Present a GPU-RENDERED BO (freedreno rendered straight into it via the Mesa
++ * GEM-import path) by nearest-upscaling it to the scanout. The BO is one of our
++ * GEM BOs (kmem-backed, kernel-readable via cva); we invalidate the cacheable
++ * view (the GPU wrote it NC), then upscale + swizzle to the panel. No readback,
++ * no userland copy -- the GPU produced the final pixels. src = ABGR8888 linear
++ * (GL byte order R,G,B,A); stride is the BO row pitch (align(w*4,64)). */
++#define MSM_INFO_IOS_PRESENT_BO 0x83u
++static int
++drm_do_present_bo(uint32_t handle, uint32_t w, uint32_t h, uint32_t stride)
++{
++	struct kgsl_bo_ent *bo = kgsl_bo_find(handle);
++	volatile uint32_t *dst = fbcon_base;
++	uint32_t X, Y;
++	if (!dst || !fbcon_stride || !fbcon_height) { return ENXIO; }
++	if (!bo || !bo->cva) { printf("SWEET DRM: present_bo bad handle %u\n", handle); return EINVAL; }
++	if (w == 0u || h == 0u || w > 4096u || h > 8192u || stride < w * 4u) { return EINVAL; }
++	if (fbcon_width > 1080u || fbcon_height > 2340u) { return EINVAL; }
++	if (bo->mmapsize < (vm_size_t)stride * h) {
++		printf("SWEET DRM: present_bo id=%u too small %#lx < %u*%u\n",
++		    handle, (unsigned long)bo->mmapsize, stride, h);
++		return EINVAL;
++	}
++	gpu_dcache_clean(bo->cva, (vm_size_t)stride * h);   /* GPU wrote NC; drop stale cache lines */
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (w != g_pw) {
++		for (X = 0; X < fbcon_width; X++) { g_xmap[X] = (uint16_t)((uint64_t)X * w / fbcon_width); }
++		g_pw = w;
++	}
++	if (h != g_ph) {
++		for (Y = 0; Y < fbcon_height; Y++) { g_ymap[Y] = (uint16_t)((uint64_t)Y * h / fbcon_height); }
++		g_ph = h;
++	}
++	for (Y = 0; Y < fbcon_height; Y++) {
++		volatile uint32_t *drow = dst + (uint32_t)Y * (fbcon_stride / 4u);
++		const uint32_t *srow = (const uint32_t *)((const uint8_t *)bo->cva + (uint32_t)g_ymap[Y] * stride);
++		for (X = 0; X < fbcon_width; X++) {
++			uint32_t g = srow[g_xmap[X]];     /* ABGR8888 LE: A<<24|B<<16|G<<8|R */
++			drow[X] = (g & 0xFF00FF00u) | ((g & 0x000000FFu) << 16) | ((g & 0x00FF0000u) >> 16);
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
 +static int
 +drm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
 +{
@@ -2797,6 +2841,10 @@
 +		}
 +		if (gi->info == MSM_INFO_IOS_PRESENT_IMG) {  /* P2a: upscale small GPU image to scanout */
 +			return drm_do_present_img((user_addr_t)gi->value, gi->handle, gi->pad);
++		}
++		if (gi->info == MSM_INFO_IOS_PRESENT_BO) {   /* P2b: present a GPU-rendered BO (no readback) */
++			return drm_do_present_bo(gi->handle, (uint32_t)(gi->value & 0xffffu),
++			    (uint32_t)((gi->value >> 16) & 0xffffu), gi->len);
 +		}
 +		bo = kgsl_bo_find(gi->handle);
 +		if (!bo) { return EINVAL; }

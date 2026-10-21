@@ -1,6 +1,6 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -272,10 +272,54 @@
+@@ -272,10 +272,91 @@
  	return 0;
  }
  
@@ -36,6 +36,31 @@
 +	}
 +}
 +
++/*
++ * Policy "AMFI": iOS dyld4 gates DYLD_INSERT_LIBRARIES (allowEnvVarsPath) and
++ * __interpose (allowInterposing) solely on __mac_syscall("AMFI", 0x5a, arg),
++ * arg = { uint64_t input_flags; uint64_t *output_flags; }. With no policy named
++ * "AMFI" the syscall returns ENOPOLICY, dyld zeroes its AMFI flags and prunes
++ * both. Answer 0x5a with the full allow set so library injection works.
++ */
++static int
++sweet_amfi_dyld_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	if (call != 0x5a) {
++		return ENOSYS;
++	}
++	if (arg == 0) {
++		return EINVAL;
++	}
++	struct { uint64_t input_flags; user_addr_t output_flags; } a;
++	int error = copyin(arg, &a, sizeof(a));
++	if (error) {
++		return error;
++	}
++	uint64_t out = 0xFFull;   /* ALLOW_PATH_VARS 0x02 | LIBRARY_INTERPOSING 0x40 | rest */
++	return copyout(&out, a.output_flags, sizeof(out));
++}
++
  static const struct mac_policy_ops sweet_amfi_mac_ops = {
  	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
  };
@@ -52,15 +77,30 @@
 +
 +static mac_policy_handle_t sweet_sandbox_mac_handle;
 +
++static const struct mac_policy_ops sweet_dyld_amfi_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_dyld_syscall,
++};
++
++static struct mac_policy_conf sweet_dyld_amfi_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI dyld policy",
++	.mpc_ops = &sweet_dyld_amfi_mac_ops,
++};
++
++static mac_policy_handle_t sweet_dyld_amfi_mac_handle;
++
  static struct mac_policy_conf sweet_amfi_mac_conf = {
  	.mpc_name = "SWEET AMFI",
  	.mpc_fullname = "SWEET built-in Mobile File Integrity",
-@@ -293,5 +337,8 @@
+@@ -293,5 +374,11 @@
  	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
  	printf("SWEET AMFI: platform binary policy %s (%d)\n",
  	    error ? "NOT registered" : "registered", error);
 +	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
 +	printf("SWEET Sandbox: permissive policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_dyld_amfi_mac_conf, &sweet_dyld_amfi_mac_handle, NULL);
++	printf("SWEET AMFI: dyld policy %s (%d)\n",
 +	    error ? "NOT registered" : "registered", error);
  }
  #endif /* ARM64_BOARD_CONFIG_SWEET */

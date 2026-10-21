@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3225 @@
+@@ -0,0 +1,3264 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2041,11 +2041,19 @@
 +#define KGSL_MAX_BO       512u
 +#define KGSL_RING_DWORDS  (0x8000u / 4u)
 +
-+struct kgsl_ctx_ent { int used; uint32_t id; uint32_t ts_issued; uint32_t ts_retired; };
++struct kgsl_ctx_ent { int used; uint32_t id; uint32_t ts_issued; uint32_t ts_retired; int pid; };
 +struct kgsl_bo_ent  {
 +	int used; uint32_t id; uint64_t gpuaddr; uint64_t pa;
-+	vm_offset_t cpu_nc; vm_offset_t cva; vm_size_t size; vm_size_t mmapsize; uint32_t flags;
++	vm_offset_t cpu_nc; vm_offset_t cva; vm_size_t size; vm_size_t mmapsize; uint32_t flags; int pid;
 +};
++
++/* XNU process KPIs: reclaim GPU contexts/BOs whose owning process has died.
++ * (A shared cdev's d_close only fires on last-close, so per-process cleanup can't
++ * live there; instead we lazily reap dead owners at allocation time.) */
++struct proc;
++extern int          proc_selfpid(void);
++extern struct proc *proc_find(int pid);   /* ref'd proc if alive, NULL if dead */
++extern int          proc_rele(struct proc *p);
 +static struct kgsl_ctx_ent g_ctx[KGSL_MAX_CTX];
 +static struct kgsl_bo_ent  g_bo[KGSL_MAX_BO];
 +static uint32_t g_ctx_next = 1;
@@ -2135,17 +2143,57 @@
 +
 +/* ---- handler helpers (kernel-struct in/out; the ioctl wrapper and the self-test
 + *      both call these; the wrapper adds copyin/copyout of nested user ptrs) ---- */
++/* Tear down one BO entry: clear its L3 PTEs + release the wired backing. */
++static void
++kgsl_free_bo_ent(struct kgsl_bo_ent *b)
++{
++	uint64_t off;
++	if (!b || !b->used) { return; }
++	for (off = 0; off < b->mmapsize; off += 0x1000ull) {
++		uint64_t va = b->gpuaddr + off;
++		volatile uint64_t *l3 = g_l3_tabs[(va >> 21) & 0x1FFu];
++		if (l3) { l3[(va >> 12) & 0x1FFu] = 0; }
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (b->cva) { kmem_free(kernel_map, b->cva, b->mmapsize); }
++	b->used = 0;
++}
++
++/* Reclaim contexts/BOs whose owning process has exited (pid no longer resolves).
++ * Called at allocation time so leaked GPU state from dead processes (e.g. test
++ * runs, or a SIGKILLed backboardd) is freed instead of exhausting the 32-ctx table. */
++static void
++kgsl_reap_dead(void)
++{
++	unsigned i, nctx = 0, nbo = 0;
++	for (i = 0; i < KGSL_MAX_CTX; i++) {
++		if (g_ctx[i].used && g_ctx[i].pid > 0) {
++			struct proc *p = proc_find(g_ctx[i].pid);
++			if (p) { proc_rele(p); } else { g_ctx[i].used = 0; nctx++; }
++		}
++	}
++	for (i = 0; i < KGSL_MAX_BO; i++) {
++		if (g_bo[i].used && g_bo[i].pid > 0) {
++			struct proc *p = proc_find(g_bo[i].pid);
++			if (p) { proc_rele(p); } else { kgsl_free_bo_ent(&g_bo[i]); nbo++; }
++		}
++	}
++	if (nctx || nbo) { printf("SWEET DRM: reaped %u dead ctx, %u dead bo\n", nctx, nbo); }
++}
++
 +static int
 +kgsl_do_drawctxt_create(uint32_t flags, uint32_t *out_id)
 +{
 +	unsigned i;
 +	(void)flags;
++	kgsl_reap_dead();
 +	for (i = 0; i < KGSL_MAX_CTX; i++) {
 +		if (!g_ctx[i].used) {
 +			g_ctx[i].used = 1;
 +			g_ctx[i].id = g_ctx_next++;
 +			g_ctx[i].ts_issued = 0;
 +			g_ctx[i].ts_retired = 0;
++			g_ctx[i].pid = proc_selfpid();
 +			*out_id = g_ctx[i].id;
 +			return 0;
 +		}
@@ -2167,6 +2215,7 @@
 +	uint64_t gpuaddr = 0, pa = 0;
 +	vm_offset_t nc = 0, cva = 0;
 +	vm_size_t asize = (size + (vm_size_t)PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
++	kgsl_reap_dead();
 +	for (i = 0; i < KGSL_MAX_BO; i++) { if (!g_bo[i].used) { break; } }
 +	if (i == KGSL_MAX_BO) { return -1; }
 +	if (gpu_gpumem_alloc(asize, &gpuaddr, &nc, &pa, &cva) != 0) { return -1; }
@@ -2182,6 +2231,7 @@
 +	/* we honour only WRITECOMBINE (cachemode bits[27:26]=0); drop capability bits we
 +	 * don't implement so turnip's (flags & requested)==requested probe degrades */
 +	g_bo[i].flags = flags & ~(KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_MEMFLAGS_IOCOHERENT);
++	g_bo[i].pid = proc_selfpid();
 +	*out = &g_bo[i];
 +	return 0;
 +}
@@ -2189,19 +2239,8 @@
 +kgsl_do_gpumem_free(uint32_t id)
 +{
 +	struct kgsl_bo_ent *b = kgsl_bo_find(id);
-+	uint64_t off;
 +	if (!b) { return -1; }
-+	/* clear this BO's L3 PTEs (freed VA is not reused, so no TLB-invalidate needed) */
-+	for (off = 0; off < b->mmapsize; off += 0x1000ull) {
-+		uint64_t va = b->gpuaddr + off;
-+		volatile uint64_t *l3 = g_l3_tabs[(va >> 21) & 0x1FFu];
-+		if (l3) { l3[(va >> 12) & 0x1FFu] = 0; }
-+	}
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	if (b->cva) {
-+		kmem_free(kernel_map, b->cva, b->mmapsize);   /* release the wired backing (the exhaustion fix) */
-+	}
-+	b->used = 0;
++	kgsl_free_bo_ent(b);   /* clear L3 PTEs + release the wired backing */
 +	return 0;
 +}
 +

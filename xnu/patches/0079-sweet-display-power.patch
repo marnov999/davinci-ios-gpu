@@ -31,7 +31,7 @@
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -216,6 +224,24 @@
+@@ -216,6 +224,26 @@
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
@@ -42,7 +42,9 @@
 +			fb->fFadeStep = step + 1;
 +		}
 +		IOLockUnlock(fb->fLock);
-+		if (step <= 6) {
++		if (0 && step <= 6) {   /* fade/blank DISABLED: keep the last rendered frame on the panel
++		                         * when backboardd auto-dims (no backlight svc), so the rendered
++		                         * lock/home screen stays visible on this research bench. */
 +			for (uint32_t y = 0; y < fb->fHeight; y++) {
 +				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
 +				for (uint32_t x = 0; x < fb->fWidth; x++) {
@@ -56,7 +58,7 @@
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
  	uint8_t *rec = NULL;
  	if (flush) {
-@@ -506,6 +532,19 @@
+@@ -506,6 +534,19 @@
  			    args->scalarInput[0] ? "on" : "off");
  		}
  		break;

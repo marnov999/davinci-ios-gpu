@@ -48,7 +48,7 @@
  bool
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,68 @@
 +/*
 + * Built-in IOSurface for SWEET (see SweetSurface.cpp).
 + *
@@ -90,8 +90,11 @@
 +	IOOptionBits              mapCache;     /* cache mode for user mappings */
 +	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
 +	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	bool                      wrapped;      /* backing is the creator's OWN memory (IOSurfaceAddress wrap) */
++	task_t                    clientTask;   /* task whose VA clientAddress lives in (for complete()) */
++	uint64_t                  clientAddress;
 +
-+	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; clientTask = NULL; clientAddress = 0; return OSObject::init(); }
 +	void free() APPLE_KEXT_OVERRIDE;
 +
 +	/* Kernel address of the pixels (mapped on first use), or 0. */
@@ -116,7 +119,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,915 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *
@@ -201,6 +204,9 @@
 +{
 +	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
 +		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
++	}
++	if (wrapped && memory != NULL) {
++		memory->complete();   /* balance the prepare() from the IOSurfaceAddress wrap */
 +	}
 +	OSSafeReleaseNULL(kernelMap);
 +	OSSafeReleaseNULL(memory);
@@ -801,6 +807,36 @@
 +	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
 +	ret = sweet_surface_layout(s, props);
 +	if (ret == kIOReturnSuccess) {
++		OSNumber *wrapAddr = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++		if (wrapAddr != NULL) {
++			/* WRAP: the surface's pixels ARE the creator's own memory -- CoreAnimation
++			 * wraps its pictures / glyph atlases / app-drawn layer contents via
++			 * IOSurfaceAddress so the render server can sample them as-is. Map that
++			 * range instead of handing back a fresh zero buffer (which rendered all
++			 * content white). Mirrors HackiOS MiniIOSurface. No wired charge -- we
++			 * allocate no pixels of our own. */
++			IOMemoryDescriptor *md = NULL;
++			IOReturn held = kIOReturnNoMemory;
++			s->wrapped = true;
++			s->clientTask = fTask;
++			s->clientAddress = wrapAddr->unsigned64BitValue();
++			for (int a = 0; a < 2 && held != kIOReturnSuccess; a++) {   /* InOut, then read-only */
++				OSSafeReleaseNULL(md);
++				md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)s->clientAddress,
++				    s->allocSize, (a == 0 ? kIODirectionInOut : kIODirectionIn), s->clientTask);
++				held = (md != NULL) ? md->prepare() : kIOReturnNoMemory;
++			}
++			if (held != kIOReturnSuccess) {
++				OSSafeReleaseNULL(md);
++				ret = kIOReturnVMError;
++			} else {
++				s->memory = md;
++				s->mapCache = kIOMapDefaultCache;
++				if (!sweet_surface_publish(s)) {
++					ret = kIOReturnNoResources;
++				}
++			}
++		} else {
 +		IOBufferMemoryDescriptor *mem = NULL;
 +		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
 +		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
@@ -818,14 +854,15 @@
 +				ret = kIOReturnNoResources;
 +			}
 +		}
++		}
 +	}
 +	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
 +		char name[32];
 +		proc_selfname(name, sizeof(name));
 +		sweet_surface_creates_logged++;
-+		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
++		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u wrap %d -> 0x%x\n",
 +		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
-+		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
++		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), s->wrapped, ret);
 +	}
 +	props->release();
 +	if (ret != kIOReturnSuccess) {

@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3296 @@
+@@ -0,0 +1,3303 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -1413,7 +1413,7 @@
 +		__asm__ volatile("dsb osh" ::: "memory");
 +		printf("SWEET GMU: [Ic] NC_MODE+UCHE_MODE+hang written\n"); gmub_flush();
 +		/* group d: protect + 64-bit addr mode */
-+		CW(0x84Fu, 0x3u);                  /* CP_PROTECT_CNTL */
++		CW(0x84Fu, 0x0u);                  /* CP_PROTECT_CNTL: DISABLED. We enabled fault-on-unlisted (0x3) but never programmed the protect table (0x850-0x87F), so the first freedreno IB that writes a register wedges the CP (protstat hang). HackiOS leaves protection off during bring-up -> match it. */
 +		CW(0x842u, 0x1u);                  /* CP_ADDR_MODE_CNTL (64-bit) */
 +		/* a6xx_enable_64bit: ALL blocks must be in 64-bit addr mode, else they drop
 +		 * the hi dword of freedreno's >=4GiB stage-1 VAs -> mis-fetch/hang (the self-
@@ -2092,11 +2092,18 @@
 +	}
 +	kgsl_lock();
 +	seq = 0x51000000u | ((++g_submit_seq) & 0x00FFFFFFu);
-+	if (g_wptr + (n * 4u) + 8u >= KGSL_RING_DWORDS) {
++	if (g_wptr + (n * 4u) + 16u >= KGSL_RING_DWORDS) {
 +		g_wptr = 0;                 /* safe: prior submit idled the CP */
 +	}
 +	rb = g_rb;
 +	kk = g_wptr;
++	/* Per-submit cache-invalidate preamble (match HackiOS redwood_gpu_submit):
++	 * invalidate the GPU internal depth+color caches before the client IBs so
++	 * stale GMEM/cache state from the previous draw cannot corrupt this one. */
++	rb[kk++] = cp_type7(0x46u, 1u);               /* CP_EVENT_WRITE */
++	rb[kk++] = 0x00000018u;                        /* EVENT_INVALIDATE_DEPTH */
++	rb[kk++] = cp_type7(0x46u, 1u);               /* CP_EVENT_WRITE */
++	rb[kk++] = 0x00000019u;                        /* EVENT_INVALIDATE_COLOR */
 +	for (i = 0; i < n; i++) {
 +		rb[kk++] = cp_type7(0x3Fu, 3u);               /* CP_INDIRECT_BUFFER */
 +		rb[kk++] = (uint32_t)ibva[i];

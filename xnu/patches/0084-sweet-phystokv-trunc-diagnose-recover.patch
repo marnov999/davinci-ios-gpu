@@ -1,0 +1,44 @@
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -366,9 +366,33 @@ SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+ SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+
+
++/*
++ * SWEET bring-up shim: a managed window that crosses 0x100000000 (> 4 GiB)
++ * unmasks latent 32-bit physical-address truncations elsewhere in the kernel
++ * (e.g. 0x57778000 == 0x157778000 & 0xFFFFFFFF, which is below gPhysBase).
++ * Recover the dropped bit 32 so boot continues, and log the caller so the real
++ * truncation site can be found and fixed. TEMPORARY -- it masks a real bug.
++ */
++static pmap_paddr_t __attribute__((noinline))
++sweet_untruncate_pa(pmap_paddr_t pa, const char *who, void *ret)
++{
++	pmap_paddr_t fixed = pa | 0x100000000ULL;
++	if ((pa < gPhysBase) && (fixed >= gPhysBase) && ((fixed - gPhysBase) < real_phys_size)) {
++		static int sweet_trunc_logged = 0;
++		if (sweet_trunc_logged < 32) {
++			sweet_trunc_logged++;
++			printf("SWEET %s: truncated PA 0x%llx -> 0x%llx caller %p\n",
++			    who, (unsigned long long)pa, (unsigned long long)fixed, ret);
++		}
++		return fixed;
++	}
++	return pa;
++}
++
+ vm_map_address_t
+ phystokv(pmap_paddr_t pa)
+ {
++	pa = sweet_untruncate_pa(pa, "phystokv", __builtin_return_address(0));
+
+ 	for (size_t i = 0; (i < PTOV_TABLE_SIZE) && (ptov_table[i].len != 0); i++) {
+ 		if ((pa >= ptov_table[i].pa) && (pa < (ptov_table[i].pa + ptov_table[i].len))) {
+@@ -385,6 +410,7 @@ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
+ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
+ {
+
++	pa = sweet_untruncate_pa(pa, "phystokv_range", __builtin_return_address(0));
+ 	vm_size_t len;
+ 	for (size_t i = 0; (i < PTOV_TABLE_SIZE) && (ptov_table[i].len != 0); i++) {
+ 		if ((pa >= ptov_table[i].pa) && (pa < (ptov_table[i].pa + ptov_table[i].len))) {

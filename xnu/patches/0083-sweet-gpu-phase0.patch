@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4149 @@
+@@ -0,0 +1,4250 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2297,7 +2297,16 @@
 +#define GPU_SUBMIT_BOS     8192u
 +#define A6XX_CP_SCRATCH_REG2 0x885u
 +static uint32_t g_fence;            /* the last submission's number (redwood gpu_fence) */
++/* redwood ring_time / gpu_times: the core writes CP_ALWAYS_ON_COUNTER (19.2 MHz) at both ends of
++ * every submission into the result page, so what the GPU itself spends is known, not guessed. */
++#define GPU_TIMES_OFF      0x400u   /* 64 slots of { begin, end } u64 */
++#define GPU_TIMES          64u
++#define A6XX_CP_ALWAYS_ON_COUNTER 0x980u
++static uint32_t g_timed;            /* the last fence whose times are added up */
++static uint64_t g_gpu_ticks;
++static uint32_t g_gpu_timed;
 +static uint32_t g_reports;          /* hang reports printed (the first few) */
++static uint32_t g_gpu_level = 7u;   /* the perf level last acked (bring-up leaves the lowest, 180 MHz) */
 +
 +static void
 +ring_put(uint32_t word)
@@ -2320,6 +2329,24 @@
 +gpu_last(void)
 +{
 +	return g_fence;
++}
++
++/* redwood gpu_times: add up what the core spent on the submissions done since the last look. */
++static void
++gpu_times(void)
++{
++	volatile uint64_t *times = (volatile uint64_t *)(g_res_nc + GPU_TIMES_OFF);
++	uint32_t done = *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF);
++	if (done - g_timed > GPU_TIMES) {
++		g_timed = done - GPU_TIMES;                     /* (the older ones were written over) */
++	}
++	while (g_timed != done) {
++		uint32_t slot = ++g_timed % GPU_TIMES;
++		if (g_timed != 0 && times[2 * slot + 1] > times[2 * slot]) {
++			g_gpu_ticks += times[2 * slot + 1] - times[2 * slot];
++			g_gpu_timed++;
++		}
++	}
 +}
 +
 +/* redwood_gpu_report: a submission does not come back -- what the core and its SMMU context say. */
@@ -2377,7 +2404,7 @@
 +static uint32_t
 +gpu_submit(const uint64_t *ibva, const uint32_t *ibdw, unsigned n)
 +{
-+	uint32_t wanted = 4u + 4u * n + 2u + 5u, room = 0, fence;
++	uint32_t wanted = 8u + 4u + 4u * n + 2u + 5u, room = 0, fence;
 +	unsigned i, tries;
 +	if (!g_kgsl_ready || n == 0) {
 +		return 0;
@@ -2398,6 +2425,13 @@
 +		g_fence = 1;
 +	}
 +	fence = g_fence;
++	{       /* the time at the beginning (redwood ring_time(fence, 0)) */
++		uint64_t at = g_res_pa + GPU_TIMES_OFF + 16u * (fence % GPU_TIMES);
++		ring_put(cp_type7(0x3Eu, 3u));                   /* CP_REG_TO_MEM */
++		ring_put(A6XX_CP_ALWAYS_ON_COUNTER | 2u << 18 | 1u << 30);
++		ring_put((uint32_t)at);
++		ring_put((uint32_t)(at >> 32));
++	}
 +	/* Per-submit cache-invalidate preamble: stale depth/colour cache state from the previous
 +	 * draw must not corrupt this one. */
 +	ring_put(cp_type7(0x46u, 1u));                       /* CP_EVENT_WRITE */
@@ -2409,6 +2443,13 @@
 +		ring_put((uint32_t)ibva[i]);
 +		ring_put((uint32_t)(ibva[i] >> 32));
 +		ring_put(ibdw[i]);
++	}
++	{       /* the time at the end (redwood ring_time(fence, 1)) */
++		uint64_t at = g_res_pa + GPU_TIMES_OFF + 16u * (fence % GPU_TIMES) + 8u;
++		ring_put(cp_type7(0x3Eu, 3u));                   /* CP_REG_TO_MEM */
++		ring_put(A6XX_CP_ALWAYS_ON_COUNTER | 2u << 18 | 1u << 30);
++		ring_put((uint32_t)at);
++		ring_put((uint32_t)(at >> 32));
 +	}
 +	ring_put(cp_type4(A6XX_CP_SCRATCH_REG2, 1u));        /* the fence, for a hang's post-mortem */
 +	ring_put(fence);
@@ -3227,6 +3268,11 @@
 +	if (nanos >= 5ull * NSEC_PER_SEC) {
 +		uint64_t waiting;
 +		absolutetime_to_nanoseconds(g_waiting, &waiting);
++		gpu_times();
++		printf("SWEET DRM: the GPU worked %llu us on each of %u submissions (%llu ms in all), level %u\n",
++		    g_gpu_timed ? g_gpu_ticks * 10 / 192 / g_gpu_timed : 0, g_gpu_timed, g_gpu_ticks * 10 / 192 / 1000, g_gpu_level);
++		g_gpu_ticks = 0;
++		g_gpu_timed = 0;
 +		printf("SWEET DRM: %u submissions in %llu ms (%u IBs, %u buffers named, %llu KB of surfaces out of the cache); "
 +		    "fence %u done %u; buffers: %u made, %u kept ones given again, %u given back, %u left, %llu MB kept; "
 +		    "%u buffers %llu MB; %u waits of %llu us; va %llu MB in %u, %u holes (%u most), %llu KB lost, %u refused\n",
@@ -3584,6 +3630,8 @@
 +}
 +
 +#define MSM_PREP_NOSYNC 0x04u
++#define MSM_INFO_IOS_GPU_LEVEL 0x87u   /* private: value = GPU perf level 0 (825 MHz) .. 7 (180 MHz); out: DCVS return */
++static int gpu_set_level(uint32_t level, uint64_t *out);
 +#define MSM_INFO_IOS_REBOOT 0x86u      /* private: value 0 = set the PMIC reboot reason "bootloader" and
 +                                         * report; 1 = set it and reset (-> fastboot) */
 +static int sweet_reboot_fastboot(uint32_t mode);
@@ -3643,6 +3691,12 @@
 +		}
 +		if (gi->info == MSM_INFO_IOS_READ_PANEL) {   /* debug: read scanout thumbnail */
 +			return drm_do_read_panel((user_addr_t)gi->value, gi->handle, gi->len);
++		}
++		if (gi->info == MSM_INFO_IOS_GPU_LEVEL) {   /* the GPU's clock (legacy GMU DCVS by register) */
++			uint64_t o = 0;
++			int e = gpu_set_level((uint32_t)gi->value, &o);
++			gi->value = o;
++			return e;
 +		}
 +		if (gi->info == MSM_INFO_IOS_REBOOT) {   /* dev loop: reboot into fastboot (see sweet_reboot_fastboot) */
 +			return sweet_reboot_fastboot((uint32_t)gi->value) == 0 ? 0 : EIO;
@@ -4111,6 +4165,53 @@
 +		gpu_smc(PSCI_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, r);
 +	}
 +	return -1;
++}
++
++/*
++ * The GPU's clock, as Linux's a6xx_gmu_set_freq() sets it on a legacy GMU (the a618; davinci's own
++ * kernel has qcom,gpu-quirk-hfi-use-reg, the same register path): the perf level into
++ * GMU_DCVS_PERF_SETTING, "any bandwidth" into GMU_DCVS_BW_SETTING, and the DCVS OOB raised and
++ * cleared; the GMU firmware moves the GX clock and says how it went in GMU_DCVS_RETURN. davinci's
++ * levels (qcom,gpu-pwrlevels): 0 825, 1 800, 2 650, 3 565, 4 430, 5 355, 6 267, 7 180 MHz.
++ * With the lock held, the GPU idle first.
++ */
++#define GMUB_DCVS_ACK_OPTION    0x1CBFCu
++#define GMUB_DCVS_PERF_SETTING  0x1CBFDu
++#define GMUB_DCVS_BW_SETTING    0x1CBFEu
++#define GMUB_DCVS_RETURN        0x1CBFFu
++#define GMUB_OOB_DCVS_SET       (1u << 23)
++#define GMUB_OOB_DCVS_ACK       (1u << 31)
++static int
++gpu_set_level(uint32_t level, uint64_t *out)
++{
++	unsigned polls;
++	uint32_t info = 0, ret;
++	if (!g_kgsl_ready || !gpu_gmu || level > 7u) {
++		return EINVAL;
++	}
++	(void)gpu_wait(gpu_last(), 1000u);
++	gmub_wr(GMUB_DCVS_ACK_OPTION, 0);
++	gmub_wr(GMUB_DCVS_PERF_SETTING, (3u << 28) | level);
++	gmub_wr(GMUB_DCVS_BW_SETTING, 0xffu);
++	__asm__ volatile("dsb osh" ::: "memory");
++	gmub_wr(GMUB_HOST2GMU_INTR_SET, GMUB_OOB_DCVS_SET);
++	for (polls = 0; polls < 10000u; polls++) {             /* 100 ms */
++		info = gmub_rd(GMUB_GMU2HOST_INTR_INFO);
++		if (info & GMUB_OOB_DCVS_ACK) {
++			break;
++		}
++		gmub_udelay(10);
++	}
++	gmub_wr(GMUB_GMU2HOST_INTR_CLR, GMUB_OOB_DCVS_ACK);
++	gmub_wr(GMUB_HOST2GMU_INTR_SET, GMUB_OOB_DCVS_ACK);     /* clear the OOB (legacy: bit 31) */
++	ret = gmub_rd(GMUB_DCVS_RETURN);
++	printf("SWEET GPU: level %u asked: %s after %u polls (intr %#x), DCVS return %#x\n", level,
++	    (info & GMUB_OOB_DCVS_ACK) ? "acked" : "NOT acked", polls, info, ret);
++	if (info & GMUB_OOB_DCVS_ACK) {
++		g_gpu_level = level;
++	}
++	*out = (uint64_t)ret | ((uint64_t)((info & GMUB_OOB_DCVS_ACK) ? 1u : 0u) << 32);
++	return 0;
 +}
 +
 +static void

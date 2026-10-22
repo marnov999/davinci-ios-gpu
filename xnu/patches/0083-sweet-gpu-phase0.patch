@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3326 @@
+@@ -0,0 +1,3412 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -794,6 +794,31 @@
 +		*out_cva = cva;    /* object-backed cacheable kernel VA for the WC BO CPU-map */
 +	}
 +	g_gpuva_next += asize;
++	return 0;
++}
++
++/* Map EXISTING physically-backed pages (an IOSurface's wired backing) into the GPU
++ * stage-1 pagetable at a fresh gpuaddr, WB inner-shareable so the a6xx's reads are
++ * cache-coherent with the CPU writer (SpringBoard draws content surfaces cacheable)
++ * -- no per-frame copy, no flush. Fresh VA => no TLB invalidate. Returns gpuaddr.
++ * Backs MSM_INFO_IOS_IMPORT (zero-copy) in place of the leaking glTexImage2D copy. */
++#define GPU_PTE_WB_COHERENT 0xF47ull   /* valid 4K page, AttrIndx=1(WB), AP=01, SH=11(inner), AF */
++static int
++gpu_gpumem_map_phys(const uint64_t *pa, unsigned npages, uint64_t *out_gpuaddr)
++{
++	unsigned i;
++	uint64_t base;
++	if (!g_l2_nc || !g_gpuva_next || npages == 0u) { return -1; }
++	base = g_gpuva_next;
++	for (i = 0; i < npages; i++) {
++		uint64_t va = base + (uint64_t)i * 0x1000ull;
++		volatile uint64_t *l3 = gpu_pt_l3_for(va);
++		if (!l3) { return -1; }
++		l3[(va >> 12) & 0x1FFu] = (pa[i] & Q_ADDRMASK) | GPU_PTE_WB_COHERENT;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	*out_gpuaddr = base;
++	g_gpuva_next += (uint64_t)npages * 0x1000ull;
 +	return 0;
 +}
 +
@@ -2045,6 +2070,7 @@
 +struct kgsl_bo_ent  {
 +	int used; uint32_t id; uint64_t gpuaddr; uint64_t pa;
 +	vm_offset_t cpu_nc; vm_offset_t cva; vm_size_t size; vm_size_t mmapsize; uint32_t flags; int pid;
++	uint32_t surf_id;   /* 0 = normal BO; nonzero = zero-copy import of that IOSurface (cva==0) */
 +};
 +
 +/* XNU process KPIs: reclaim GPU contexts/BOs whose owning process has died.
@@ -2746,6 +2772,59 @@
 +	return 0;
 +}
 +
++/* ---- Zero-copy IOSurface import (MSM_INFO_IOS_IMPORT) ---------------------
++ * Map an IOSurface's wired backing pages into the GPU and return a GEM handle
++ * that freedreno samples DIRECTLY (eglCreateImageKHR dma-buf path, fd==handle),
++ * replacing the per-frame glTexImage2D copy that allocated a fresh ~12 MB BO
++ * each frame and never freed it (the OOM). The imported BO has cva==0, so
++ * kgsl_free_bo_ent() only clears its PTEs and never kmem_free's the surface's
++ * own backing. Cached per surface id so a re-import reuses the one BO (no VA or
++ * handle growth). This is the HackiOS zero-copy path, finally wired up. */
++#define MSM_INFO_IOS_IMPORT 0x85u
++extern int sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages,
++    unsigned *npages, uint32_t *allocSize, uint32_t *width, uint32_t *height,
++    uint32_t *bytesPerRow, uint32_t *pixelFormat);
++#define SWEET_IMPORT_MAX_PAGES 4096u    /* 16 MB: covers a full-screen BGRA surface */
++static uint64_t g_import_pa[SWEET_IMPORT_MAX_PAGES];
++static int
++drm_do_ios_import(uint32_t surf_id, uint32_t *out_handle)
++{
++	unsigned i, npages = 0;
++	uint32_t allocSize = 0, w = 0, h = 0, bpr = 0, fmt = 0;
++	uint64_t gpuaddr = 0;
++	if (surf_id == 0u) { return EINVAL; }
++	for (i = 0; i < KGSL_MAX_BO; i++) {   /* reuse an existing import of the same surface */
++		if (g_bo[i].used && g_bo[i].surf_id == surf_id) { *out_handle = g_bo[i].id; return 0; }
++	}
++	if (sweet_surface_gpu_pages(surf_id, g_import_pa, SWEET_IMPORT_MAX_PAGES, &npages,
++	        &allocSize, &w, &h, &bpr, &fmt) != 0 || npages == 0u) {
++		printf("SWEET DRM: ios_import surf %u FAILED (pages)\n", surf_id); gmub_flush();
++		return EINVAL;
++	}
++	if (gpu_gpumem_map_phys(g_import_pa, npages, &gpuaddr) != 0) {
++		printf("SWEET DRM: ios_import surf %u FAILED (map %u pages)\n", surf_id, npages); gmub_flush();
++		return ENOMEM;
++	}
++	for (i = 0; i < KGSL_MAX_BO; i++) { if (!g_bo[i].used) { break; } }
++	if (i == KGSL_MAX_BO) { return ENOMEM; }
++	g_bo[i].used = 1;
++	g_bo[i].id = g_mmap_page_next;
++	g_mmap_page_next += npages;
++	g_bo[i].gpuaddr = gpuaddr;
++	g_bo[i].pa = g_import_pa[0];
++	g_bo[i].cpu_nc = 0;
++	g_bo[i].cva = 0;                 /* imported: free clears PTEs only, never the surface backing */
++	g_bo[i].size = allocSize;
++	g_bo[i].mmapsize = (vm_size_t)npages * 0x1000u;
++	g_bo[i].flags = 0;
++	g_bo[i].pid = proc_selfpid();
++	g_bo[i].surf_id = surf_id;
++	*out_handle = g_bo[i].id;
++	printf("SWEET DRM: ios_import surf %u -> handle %u gpuaddr %#llx %ux%u fmt %#x (%u pages, zero-copy)\n",
++	    surf_id, g_bo[i].id, (unsigned long long)gpuaddr, w, h, fmt, npages); gmub_flush();
++	return 0;
++}
++
 +/* ---- On-screen present (Stage P1) ----------------------------------------
 + * Copy a rendered BO to the live scanout at FB_PHYS (= boot_args.Video.v_baseAddr,
 + * loader.c). The display controller is ALREADY scanning this region out (the shim
@@ -2972,6 +3051,13 @@
 +		}
 +		if (gi->info == MSM_INFO_IOS_READ_PANEL) {   /* debug: read scanout thumbnail */
 +			return drm_do_read_panel((user_addr_t)gi->value, gi->handle, gi->len);
++		}
++		if (gi->info == MSM_INFO_IOS_IMPORT) {   /* zero-copy: IOSurface id (value) -> GEM handle */
++			uint32_t hnd = 0;
++			int e = drm_do_ios_import((uint32_t)gi->value, &hnd);
++			if (e) { return e; }
++			gi->handle = hnd;
++			return 0;
 +		}
 +		bo = kgsl_bo_find(gi->handle);
 +		if (!bo) { return EINVAL; }

@@ -119,7 +119,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,1051 @@
+@@ -0,0 +1,1081 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *
@@ -306,6 +306,36 @@
 +	}
 +	IOLockUnlock(sweet_surface_lock);
 +	return s;
++}
++
++/* Export an imported surface's wired physical pages for GPU (freedreno) mapping;
++ * fills pa[] with 4K page phys + geometry. The backing is wired (IOBuffer) or
++ * physical/held (wrap), so the phys pages are stable for the GPU's use. Returns 0
++ * on success. Called from the GPU driver's MSM_INFO_IOS_IMPORT handler to enable
++ * zero-copy GPU sampling of CoreAnimation surfaces instead of per-frame
++ * glTexImage2D copies (which leaked a fresh ~12 MB BO per frame -> OOM). */
++extern "C" int
++sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *npages,
++    uint32_t *allocSize, uint32_t *width, uint32_t *height, uint32_t *bytesPerRow,
++    uint32_t *pixelFormat)
++{
++	SweetSurface *s = sweet_surface_copy(id);
++	unsigned n = 0;
++	IOByteCount off;
++	if (s == NULL) { return -1; }
++	if (s->memory == NULL) { s->release(); return -1; }
++	for (off = 0; off < s->allocSize; off += PAGE_SIZE) {
++		IOByteCount seglen = 0;
++		addr64_t phys = s->memory->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
++		if (phys == 0 || n >= maxpages) { s->release(); return -1; }
++		pa[n++] = (uint64_t)(phys & ~((addr64_t)PAGE_MASK));
++	}
++	*npages = n;
++	*allocSize = s->allocSize;
++	*width = s->width; *height = s->height;
++	*bytesPerRow = s->bytesPerRow; *pixelFormat = s->pixelFormat;
++	s->release();
++	return 0;
 +}
 +
 +/* The table lock; the framebuffer may publish a surface before the root starts. */

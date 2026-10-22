@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3314 @@
+@@ -0,0 +1,3326 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2671,9 +2671,21 @@
 +				gmub_flush();
 +			}
 +		}
-+		return EIO;
++		/*
++		 * A hung / timed-out submit (rc != 0) must NOT return an error here. Returning EIO leaves
++		 * Mesa's out_fence->kfence == 0 (msm_ringbuffer_sp.c:152 only sets kfence when the ioctl
++		 * succeeds), so the gallium batch that owns this submit's BOs is never retired and its
++		 * ~14 BOs are never freed -- no GEM_CLOSE, no madvise. Over a few minutes of compositing
++		 * that leaks ~2.6 GB (measured: 184 hung submits x ~14.1 BOs ~= 2600 never-freed BOs) and
++		 * backboardd OOM-panics: THE root cause of the "dies after 1-3 min" crash. So fall through
++		 * and retire the fence anyway (below): Mesa tears the batch down and frees its BOs. The
++		 * hung frame itself is dropped/garbled until the CP-wedge root cause is fixed, but the
++		 * device stays alive. We deliberately do NOT SW_RESET the CP -- ok/hang submits interleave
++		 * in the log (the CP recovers for the next submit), and a block reset would require
++		 * re-bootstrapping the CP microcode + ring. Diagnostics (HANG + IBDUMP) above still fire.
++		 */
 +	}
-+	*out_fence = ++g_drm_fence;   /* synchronous: retired on return */
++	*out_fence = ++g_drm_fence;   /* synchronous: retired on return (hung submits retire too, see above) */
 +	return 0;
 +}
 +

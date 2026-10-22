@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3290 @@
+@@ -0,0 +1,3296 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2642,21 +2642,27 @@
 +	gmub_flush();
 +	rc = kgsl_submit_ibs(ibva, ibdw, n);
 +	if (rc != 0) {
-+		/* dump freedreno's IB1 head + the region around the CP stall (invalidate the
-+		 * cacheable alias first so we read freedreno's WC-written cmdstream from DRAM) */
++		/* dump freedreno's IB1 head (invalidate the cacheable alias first so we read
++		 * freedreno's WC-written cmdstream from DRAM). This is DEBUG-ONLY; a GPU hang
++		 * must never panic the kernel, so touch nothing until the IB head page is
++		 * confirmed mapped -- bo0->cva can be stale/freed (a concurrent kgsl_reap_dead
++		 * of a dead process's BO, or a BO whose kernel alias does not cover mmapsize),
++		 * and flushing/reading an unmapped VA aborts (dc civac / load). */
 +		if (bo0 && bo0->cva) {
-+			volatile uint32_t *p = (volatile uint32_t *)(bo0->cva + ib0_off);
-+			uint32_t rem = gpu_rd(g_core, 0x92Au << 2);
-+			unsigned total = ibdw[0];
-+			unsigned stall = (rem && rem <= total) ? (total - rem) : 0;
-+			unsigned s0 = (stall > 6u) ? (stall - 6u) : 0u, k;
-+			gpu_dcache_clean(bo0->cva, bo0->mmapsize);
-+			printf("SWEET DRM: IBDUMP total=%u rem=%#x stall~%u head %08x %08x %08x %08x %08x %08x %08x %08x\n",
-+			    total, rem, stall, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-+			printf("SWEET DRM: IBDUMP @%u:", s0);
-+			for (k = s0; k < s0 + 16u && k < total; k++) { printf(" %08x", p[k]); }
-+			printf("\n");
-+			gmub_flush();
++			vm_offset_t head = bo0->cva + ib0_off;
++			vm_offset_t hpg = head & ~((vm_offset_t)PAGE_MASK);
++			if (pmap_find_phys(kernel_pmap, (addr64_t)hpg) == 0) {
++				printf("SWEET DRM: IBDUMP skipped (IB cva %#lx unmapped)\n", (unsigned long)head);
++			} else {
++				volatile uint32_t *p = (volatile uint32_t *)head;
++				uint32_t rem = gpu_rd(g_core, 0x92Au << 2);
++				unsigned total = ibdw[0];
++				unsigned stall = (rem && rem <= total) ? (total - rem) : 0;
++				gpu_dcache_clean(hpg, PAGE_SIZE);   /* one confirmed-mapped page only */
++				printf("SWEET DRM: IBDUMP total=%u rem=%#x stall~%u head %08x %08x %08x %08x %08x %08x %08x %08x\n",
++				    total, rem, stall, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++				gmub_flush();
++			}
 +		}
 +		return EIO;
 +	}

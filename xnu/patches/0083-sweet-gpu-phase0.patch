@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4068 @@
+@@ -0,0 +1,4149 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -3584,6 +3584,9 @@
 +}
 +
 +#define MSM_PREP_NOSYNC 0x04u
++#define MSM_INFO_IOS_REBOOT 0x86u      /* private: value 0 = set the PMIC reboot reason "bootloader" and
++                                         * report; 1 = set it and reset (-> fastboot) */
++static int sweet_reboot_fastboot(uint32_t mode);
 +/* With the lock held (drm_ioctl). */
 +static int
 +drm_ioctl_locked(unsigned nr, caddr_t data)
@@ -3640,6 +3643,9 @@
 +		}
 +		if (gi->info == MSM_INFO_IOS_READ_PANEL) {   /* debug: read scanout thumbnail */
 +			return drm_do_read_panel((user_addr_t)gi->value, gi->handle, gi->len);
++		}
++		if (gi->info == MSM_INFO_IOS_REBOOT) {   /* dev loop: reboot into fastboot (see sweet_reboot_fastboot) */
++			return sweet_reboot_fastboot((uint32_t)gi->value) == 0 ? 0 : EIO;
 +		}
 +		if (gi->info == MSM_INFO_IOS_IMPORT) {   /* zero-copy: IOSurface id (value) -> GEM handle */
 +			uint32_t hnd = 0;
@@ -4030,6 +4036,81 @@
 +	for (;;) {
 +		__asm__ volatile("wfe");
 +	}
++}
++
++/*
++ * The reboot reason, written as Linux writes it (what TWRP's "reboot bootloader" does: qcom-pon's
++ * reboot-mode sets PON SOFT_RB_SPARE bits[7:1] = 2 over SPMI, then the reset; ABL reads it back).
++ * Linux spmi-pmic-arb v5: an APID's read/write channel is at chnls + 0x10000 * apid -- the
++ * observer channel, which the reads use, is at obsrvr + 0x10000 * ee + 0x80 * apid. The write
++ * tried before used the observer's 0x80 stride on the write region, i.e. another channel than
++ * ours, which the XPU refused; and then it went through TrustZone, which refused it as well.
++ */
++static int
++spmi_pon_write_direct(unsigned apid, uint8_t val)
++{
++	vm_offset_t ch = ml_io_map(SPMI_CHNLS_PA + 0x10000u * apid, 0x1000u);
++	unsigned i;
++	if (!ch) {
++		return -1;
++	}
++	*(volatile uint32_t *)(ch + 0x10u) = val;                                   /* WDATA0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (0u << 27) | ((PON_SOFT_RB_SPARE & 0xffu) << 4) | 0u;   /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < 1000u; ++i) {
++		uint32_t st = *(volatile uint32_t *)(ch + 0x08u);                      /* STATUS */
++		if (st & 1u) {
++			return (st & 0x0eu) ? -2 : 0;
++		}
++		gmub_udelay(1);
++	}
++	return -3;
++}
++
++static int
++sweet_reboot_fastboot(uint32_t mode)
++{
++	vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x2000u);
++	vm_offset_t cfg  = ml_io_map(SPMI_CFG_PA, 0x1000u);
++	vm_offset_t obs  = ml_io_map(SPMI_OBS_PA, 0x10000u);
++	unsigned count, apid = 0xffffu, owner;
++	uint8_t old = 0, val, rb = 0xff;
++	int rc;
++
++	if (!core || !cfg || !obs) {
++		printf("SWEET REBOOT: SPMI map failed\n");
++		return -1;
++	}
++	count = (*(volatile uint32_t *)(core + 4)) & 0x7ffu;
++	if (!count || count > 512 || spmi_pon_read(core, cfg, obs, count, &apid, &old) != 0) {
++		printf("SWEET REBOOT: PON not found / not readable (count %u)\n", count);
++		return -1;
++	}
++	owner = (*(volatile uint32_t *)(cfg + 0x700u + 4u * apid)) & 7u;
++	val = (uint8_t)((old & 0x01u) | (PON_REASON_BL << 1));
++	rc = spmi_pon_write_direct(apid, val);
++	gmub_udelay(50);
++	(void)spmi_pon_read(core, cfg, obs, count, &apid, &rb);
++	printf("SWEET REBOOT: PON apid %u (owner ee %u) SOFT_RB_SPARE %#x -> %#x: write %d, reads back %#x%s\n",
++	    apid, owner, old, val, rc, rb, rb == val ? " (SET: a reset now goes to fastboot)" : " (NOT set)");
++	{       /* and the IMEM cookie the downstream kernel also leaves (harmless if ABL ignores it) */
++		vm_offset_t imem = ml_io_map(IMEM_PA, IMEM_SIZE);
++		if (imem) {
++			*(volatile uint32_t *)(imem + IMEM_RESTART_REASON_OFF) = RESTART_REASON_FASTBOOT;
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
++	}
++	if (mode == 0) {
++		return rb == val ? 0 : -1;
++	}
++	printf("SWEET REBOOT: resetting\n");
++	gpu_sleep(1);                      /* the line out over the network first */
++	{
++		uint64_t r[4];
++		gpu_smc(PSCI_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, r);
++	}
++	return -1;
 +}
 +
 +static void

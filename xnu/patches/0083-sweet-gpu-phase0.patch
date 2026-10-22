@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3264 @@
+@@ -0,0 +1,3290 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2862,6 +2862,29 @@
 +	return 0;
 +}
 +
++/* Read back the live scanout as a small thumbnail so a host tool can SEE what is
++ * actually on the panel (debug visibility). User passes value=buffer, handle=gw,
++ * len=gh; we point-sample the fbcon (a8r8g8b8) into gw*gh u32 and copyout. */
++#define MSM_INFO_IOS_READ_PANEL 0x84u
++static uint32_t g_panel_thumb[32 * 48];
++static int
++drm_do_read_panel(user_addr_t ubuf, uint32_t gw, uint32_t gh)
++{
++	volatile uint32_t *src = fbcon_base;
++	uint32_t x, y;
++	if (!src || !fbcon_stride || !fbcon_height || !fbcon_width) { return ENXIO; }
++	if (gw == 0u || gh == 0u || gw > 32u || gh > 48u || !ubuf) { return EINVAL; }
++	for (y = 0; y < gh; y++) {
++		uint32_t sy = y * fbcon_height / gh;
++		volatile uint32_t *srow = src + (uint32_t)sy * (fbcon_stride / 4u);
++		for (x = 0; x < gw; x++) {
++			uint32_t sx = x * fbcon_width / gw;
++			g_panel_thumb[y * gw + x] = srow[sx];
++		}
++	}
++	return copyout(g_panel_thumb, ubuf, (vm_size_t)gw * gh * 4u);
++}
++
 +static int
 +drm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
 +{
@@ -2921,6 +2944,9 @@
 +		if (gi->info == MSM_INFO_IOS_PRESENT_BO) {   /* P2b: present a GPU-rendered BO (no readback) */
 +			return drm_do_present_bo(gi->handle, (uint32_t)(gi->value & 0xffffu),
 +			    (uint32_t)((gi->value >> 16) & 0xffffu), gi->len);
++		}
++		if (gi->info == MSM_INFO_IOS_READ_PANEL) {   /* debug: read scanout thumbnail */
++			return drm_do_read_panel((user_addr_t)gi->value, gi->handle, gi->len);
 +		}
 +		bo = kgsl_bo_find(gi->handle);
 +		if (!bo) { return EINVAL; }

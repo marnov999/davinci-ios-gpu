@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3412 @@
+@@ -0,0 +1,4068 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -61,6 +61,7 @@
 +#include <kern/clock.h>
 +#include <kern/thread.h>
 +#include <kern/sched_prim.h>
++#include <kern/locks.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <vm/pmap.h>
@@ -686,85 +687,226 @@
 +#define Q_ADDRMASK 0x0000FFFFFFFFF000ull
 +/* Persistent GPU address space left live by gpu_stage_q (stage-1 enabled). The KGSL
 + * backend (gpu_gpumem_alloc) hands out buffers mapped into this pagetable at kernel-
-+ * assigned GPU VAs - exactly the IOCTL_KGSL_GPUMEM_ALLOC model. For now all gpumem VAs
-+ * live in the one L1[4]->L2[0]->L3 2MB window (0x1_0000_0000..0x1_0020_0000, 512 pages);
-+ * full multi-level mapping comes with the real UAPI. */
++ * assigned GPU VAs - exactly the IOCTL_KGSL_GPUMEM_ALLOC / MSM_INFO_GET_IOVA model.
++ *
++ * Ported from HackiOS redwood_adreno.c (space_map, redwood_gpu_address/_address_free,
++ * redwood_gpu_map/_unmap): buffers live at GPU VA 4..8 GB (L1[4..7]; L1[0..3] are the 1 GB
++ * identity blocks the ring, SQE and result page are reached through), with tables grown on
++ * demand. An address is the buffer's from when it is made until it is given back, and
++ * nothing moves a live buffer; addresses given back are unmapped (TLB invalidated) and
++ * handed out again. (The bump allocator this replaces never reused an address, so after
++ * 1 GB of buffers made in all -- a minute or two of compositing -- its L2 index wrapped
++ * and new buffers' PTEs overwrote live ones', with no TLB invalidate.) */
 +static vm_offset_t g_l3_nc;        /* legacy: NC ptr to L3[0] (direct-VA stages) */
-+static volatile uint64_t *g_l2_nc; /* NC ptr to the L2 table (grow L3 tables on demand) */
-+static volatile uint64_t *g_l3_tabs[512]; /* NC ptr to each L3 table by L2 index (NULL=unmapped) */
-+static uint64_t    g_gpuva_next;   /* next free GPU VA to assign (bump allocator) */
++static volatile uint64_t *g_l2_nc; /* NC ptr to L1[4]'s L2 table; non-NULL = pagetable up */
++static volatile uint64_t *g_l1_nc; /* NC ptr to the L1 table (to grow more L2s) */
++static uint64_t    g_gpuva_next;   /* first VA past what the bring-up stages used: the allocator starts here */
++#define GPU_VA_L1_FIRST     4u
++#define GPU_VA_L1_COUNT     4u
++#define GPU_VA_END          ((uint64_t)(GPU_VA_L1_FIRST + GPU_VA_L1_COUNT) << 30)
++#define GPU_ADDRESS_GRANULE 0x10000ull          /* what one allocation is rounded up to (redwood) */
++static volatile uint64_t *g_l2_tabs[GPU_VA_L1_COUNT];      /* NC ptr per L1 index (NULL = none yet) */
++static volatile uint64_t *g_l3_tabs[GPU_VA_L1_COUNT][512]; /* NC ptr per L1/L2 index (NULL = none yet) */
++static struct { uint64_t start, size; } gpu_free[1024];   /* the addresses not in use, in order */
++static unsigned gpu_free_count, gpu_va_holes;
++static bool     gpu_free_ready;
++static uint64_t gpu_va_used, gpu_va_lost;
++static uint32_t gpu_va_live, gpu_va_refused;
 +
 +/* Submit path published by the boot code once the ring + stage-1 pagetable are
 + * live, so the KGSL GPU_COMMAND ioctl (and the in-kernel self-test) can submit
 + * IBs on the same ring the bring-up stages used. */
 +static vm_offset_t        g_core;        /* GPU core MMIO base */
 +static volatile uint32_t *g_rb;          /* ring NC ptr */
++#define KGSL_RING_DWORDS  (0x8000u / 4u)  /* the ring: 32 KB (CP_RB_CNTL BUFSZ 12) */
 +static unsigned           g_wptr;        /* current ring write index (dwords) */
 +static uint64_t           g_res_pa;      /* TS completion result page (phys, identity-mapped) */
 +static vm_offset_t        g_res_nc;      /* its NC CPU ptr */
 +static int                g_kgsl_ready;  /* submit path live */
-+static volatile int       g_kgsl_lock;   /* trivial spinlock serialising submits */
 +static vm_offset_t        g_smmu_base;   /* GPU SMMU base (for CB0 FSR fault readback) */
 +
-+/* Return the NC-mapped L3 table for a GPU VA, allocating a new L3 page and linking
-+ * it into the L2 on demand. Lets the GPU VA space grow past the initial 2 MB L3
-+ * (each L2 entry = one L3 = 2 MB; L2 has 512 => up to 1 GB of GPU VA). */
++/* Drop the SMMU's cached translations and walks for CB0 (ASID 0) and wait for it. Needed
++ * after a PTE is cleared (redwood_gpu_unmap) and after a table entry is added to the live
++ * pagetable: the MMU-500 caches intermediate walks, so without it a stale "invalid" L1/L2
++ * entry translation-faults (fsr.TF) the new region. */
++static void
++gpu_tlb_flush(void)
++{
++	unsigned p;
++	if (!g_smmu_base) {
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_wr(g_smmu_base, 0x8000u + 0x610u, 0u);         /* CB0 S1_TLBIASID (ASID 0) */
++	gpu_wr(g_smmu_base, 0x8000u + 0x7F0u, 0u);         /* CB0 TLBSYNC */
++	for (p = 0; p < 2000u; p++) {
++		if (!(gpu_rd(g_smmu_base, 0x8000u + 0x7F4u) & 1u)) { break; }
++		gmub_udelay(1);
++	}
++}
++
++/* One zeroed 4K table, NC-mapped (redwood space_new_table: a 16K page gives four). */
++static volatile uint64_t *
++gpu_pt_table(uint64_t *out_pa)
++{
++	static vm_offset_t spare_nc;
++	static uint64_t    spare_pa;
++	static unsigned    spare_left;
++	volatile uint64_t *t;
++	vm_offset_t at;
++	unsigned j;
++	if (spare_left == 0) {
++		vm_offset_t cva = 0, nc;
++		uint64_t pa = 0;
++		if (gmub_alloc_phys(&cva, &pa, PAGE_SIZE) != 0) {
++			return NULL;
++		}
++		gpu_dcache_clean(cva, PAGE_SIZE);   /* flush the KMA_ZERO dirty cacheable lines to DRAM,
++		                                     * else they later evict and clobber the NC-written PTEs */
++		if (!(nc = ml_io_map(pa, PAGE_SIZE))) {
++			return NULL;
++		}
++		spare_nc = nc;
++		spare_pa = pa;
++		spare_left = (unsigned)(PAGE_SIZE / 0x1000u);
++	}
++	at = (vm_offset_t)(PAGE_SIZE - 0x1000u * spare_left);
++	spare_left--;
++	t = (volatile uint64_t *)(spare_nc + at);
++	for (j = 0; j < 512u; j++) {
++		t[j] = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	*out_pa = spare_pa + at;
++	return t;
++}
++
++/* The NC-mapped L3 table for a buffer VA, its L2 and L3 made and linked on demand. */
 +static volatile uint64_t *
 +gpu_pt_l3_for(uint64_t va)
 +{
-+	unsigned l2i = (unsigned)((va >> 21) & 0x1FFu);
-+	vm_offset_t t_cva = 0, t_nc;
-+	uint64_t t_pa = 0;
-+	unsigned j;
-+	if (!g_l2_nc) {
++	unsigned l1i = (unsigned)((va >> 30) & 0x1FFu), l2i = (unsigned)((va >> 21) & 0x1FFu), k;
++	volatile uint64_t *t;
++	uint64_t pa = 0;
++	if (!g_l2_nc || !g_l1_nc || (va >> 39) != 0 ||
++	    l1i < GPU_VA_L1_FIRST || l1i >= GPU_VA_L1_FIRST + GPU_VA_L1_COUNT) {
 +		return NULL;
 +	}
-+	if (g_l3_tabs[l2i]) {
-+		return g_l3_tabs[l2i];
-+	}
-+	if (gmub_alloc_phys(&t_cva, &t_pa, PAGE_SIZE) != 0) {    /* one zeroed table page */
-+		return NULL;
-+	}
-+	if (!(t_nc = ml_io_map(t_pa, PAGE_SIZE))) {
-+		return NULL;
-+	}
-+	gpu_dcache_clean(t_cva, PAGE_SIZE);   /* flush the KMA_ZERO dirty cacheable lines to DRAM,
-+	                                       * else they later evict and clobber the NC-written PTEs */
-+	for (j = 0; j < 512u; j++) {
-+		((volatile uint64_t *)t_nc)[j] = 0;
-+	}
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	g_l2_nc[l2i] = (t_pa & Q_ADDRMASK) | 0x3ull;            /* L2[l2i] -> new L3 (table desc) */
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	/* Adding a table entry to a LIVE stage-1 pagetable: the SMMU (MMU-500) caches
-+	 * intermediate walks, so without a TLB/walk-cache invalidate it keeps the stale
-+	 * "L2[l2i]=invalid" and the GPU translation-faults (fsr.TF) on this region. */
-+	if (g_smmu_base) {
-+		unsigned p;
-+		gpu_wr(g_smmu_base, 0x8000u + 0x610u, 0u);         /* CB0 S1_TLBIASID (ASID 0) */
-+		gpu_wr(g_smmu_base, 0x8000u + 0x7F0u, 0u);         /* CB0 TLBSYNC */
-+		for (p = 0; p < 2000u; p++) {
-+			if (!(gpu_rd(g_smmu_base, 0x8000u + 0x7F4u) & 1u)) { break; }
-+			gmub_udelay(1);
++	k = l1i - GPU_VA_L1_FIRST;
++	if (!g_l2_tabs[k]) {
++		if (!(t = gpu_pt_table(&pa))) {
++			return NULL;
 +		}
++		g_l1_nc[l1i] = (pa & Q_ADDRMASK) | 0x3ull;      /* L1[l1i] -> new L2 (table desc) */
++		g_l2_tabs[k] = t;
++		gpu_tlb_flush();
 +	}
-+	g_l3_tabs[l2i] = (volatile uint64_t *)t_nc;
-+	return g_l3_tabs[l2i];
++	if (!g_l3_tabs[k][l2i]) {
++		if (!(t = gpu_pt_table(&pa))) {
++			return NULL;
++		}
++		g_l2_tabs[k][l2i] = (pa & Q_ADDRMASK) | 0x3ull; /* L2[l2i] -> new L3 (table desc) */
++		g_l3_tabs[k][l2i] = t;
++		gpu_tlb_flush();
++	}
++	return g_l3_tabs[k][l2i];
 +}
 +
-+/* KGSL GPUMEM_ALLOC backend: allocate `size` bytes of FREEABLE, NON-contiguous,
-+ * wired memory (no 4 MiB-contiguous constraint that panicked kmem_alloc) and map
-+ * each 4 KB page's own phys into the GPU stage-1 pagetable (non-cacheable), growing
-+ * L3 tables on demand. Returns gpuaddr + the cacheable kernel VA (cva: the kernel
-+ * CPU view AND the source for the write-combine user mmap) + the first page phys.
-+ * The CPU view is cacheable, so in-kernel writers gpu_dcache_clean() before the GPU
-+ * reads (the self-tests do); userland uses the WC mmap, which is already coherent. */
++/* redwood gpu_address_span: an allocation's size in whole granules. */
++static uint64_t
++gpu_address_span(uint64_t size)
++{
++	return (size + (GPU_ADDRESS_GRANULE - 1)) & ~(GPU_ADDRESS_GRANULE - 1);
++}
++
++/* redwood_gpu_address: addresses for a buffer of so many bytes; 0: none left. */
++static uint64_t
++gpu_address(uint64_t size)
++{
++	unsigned i;
++	if (!gpu_free_ready) {
++		uint64_t start = gpu_address_span(g_gpuva_next);   /* past what the bring-up stages used */
++		gpu_free[0].start = start;
++		gpu_free[0].size = GPU_VA_END - start;
++		gpu_free_count = 1;
++		gpu_free_ready = true;
++	}
++	size = gpu_address_span(size);
++	for (i = 0; i < gpu_free_count; i++) {
++		if (gpu_free[i].size >= size) {
++			uint64_t address = gpu_free[i].start;
++			gpu_free[i].start += size;
++			gpu_free[i].size -= size;
++			if (gpu_free[i].size == 0) {
++				memmove(&gpu_free[i], &gpu_free[i + 1], (--gpu_free_count - i) * sizeof(gpu_free[0]));
++			}
++			gpu_va_used += size;
++			gpu_va_live++;
++			return address;
++		}
++	}
++	gpu_va_refused++;
++	return 0;
++}
++
++/* redwood_gpu_address_free: give addresses back (the free list coalesces). */
++static void
++gpu_address_free(uint64_t address, uint64_t size)
++{
++	unsigned at;
++	size = gpu_address_span(size);
++	gpu_va_used -= size;
++	gpu_va_live--;
++	for (at = 0; at < gpu_free_count && gpu_free[at].start < address; at++) {
++	}
++	if (at > 0 && gpu_free[at - 1].start + gpu_free[at - 1].size == address) {
++		gpu_free[at - 1].size += size;
++		if (at < gpu_free_count && address + size == gpu_free[at].start) {
++			gpu_free[at - 1].size += gpu_free[at].size;
++			memmove(&gpu_free[at], &gpu_free[at + 1], (--gpu_free_count - at) * sizeof(gpu_free[0]));
++		}
++	} else if (at < gpu_free_count && address + size == gpu_free[at].start) {
++		gpu_free[at].start = address;
++		gpu_free[at].size += size;
++	} else if (gpu_free_count < sizeof(gpu_free) / sizeof(gpu_free[0])) {
++		memmove(&gpu_free[at + 1], &gpu_free[at], (gpu_free_count++ - at) * sizeof(gpu_free[0]));
++		gpu_free[at].start = address;
++		gpu_free[at].size = size;
++	} else {
++		gpu_va_lost += size;        /* no room to remember the hole: lost, and counted, never reused blind */
++	}
++	if (gpu_free_count > gpu_va_holes) {
++		gpu_va_holes = gpu_free_count;
++	}
++}
++
++/* redwood_gpu_unmap: a buffer's pages out of the GPU's address space, and out of its TLB. */
++static void
++gpu_unmap(uint64_t address, uint64_t size)
++{
++	uint64_t off;
++	for (off = 0; off < size; off += 0x1000ull) {
++		volatile uint64_t *l3 = gpu_pt_l3_for(address + off);
++		if (l3) {
++			l3[((address + off) >> 12) & 0x1FFu] = 0;
++		}
++	}
++	gpu_tlb_flush();
++}
++
++/* KGSL GPUMEM_ALLOC / MSM GEM_NEW backend: allocate `size` bytes of FREEABLE, NON-contiguous,
++ * wired memory and map each 4 KB page's own phys into the GPU stage-1 pagetable at addresses
++ * of its own (non-cacheable: redwood PTE_CORE). Returns gpuaddr + the cacheable kernel VA
++ * (cva: the kernel CPU view AND the source for the write-combine user mmap) + the first page
++ * phys. In-kernel writers gpu_dcache_clean() before the GPU reads (the self-tests do);
++ * userland uses the WC mmap, which is already coherent. */
++#define GPU_PTE_CORE 0xE43ull   /* valid 4K page, AttrIndx=0 (uncached), AP unpriv, SH outer, AF, nG */
 +static int
 +gpu_gpumem_alloc(vm_size_t size, uint64_t *gpuaddr, vm_offset_t *cpu_nc, uint64_t *out_pa,
 +    vm_offset_t *out_cva)
 +{
 +	vm_offset_t cva = 0;
-+	uint64_t off;
++	uint64_t off, base;
 +	vm_size_t asize = (size + (vm_size_t)PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
 +	if (!g_l2_nc || !g_gpuva_next) {
 +		return -1;                 /* stage-1 pagetable not up */
@@ -772,20 +914,26 @@
 +	if (kmem_alloc(kernel_map, &cva, asize, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		return -1;                 /* non-contiguous, wired, freeable (no KMA_PERMANENT) */
 +	}
++	if ((base = gpu_address(asize)) == 0) {
++		kmem_free(kernel_map, cva, asize);
++		return -1;
++	}
 +	for (off = 0; off < asize; off += 0x1000ull) {
-+		uint64_t va = g_gpuva_next + off;
++		uint64_t va = base + off;
 +		uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(cva + off)))
 +		            | (off & ((uint64_t)PAGE_SIZE - 1u));   /* 4K sub-page phys within the 16K page */
 +		volatile uint64_t *l3 = gpu_pt_l3_for(va);
 +		if (!l3) {
++			gpu_unmap(base, off);
++			gpu_address_free(base, asize);
 +			kmem_free(kernel_map, cva, asize);
 +			return -1;
 +		}
-+		l3[(va >> 12) & 0x1FFu] = (pa & Q_ADDRMASK) | 0xE43ull;   /* L3 4K page, non-cached */
++		l3[(va >> 12) & 0x1FFu] = (pa & Q_ADDRMASK) | GPU_PTE_CORE;
 +	}
 +	gpu_dcache_clean(cva, asize);     /* flush the zeroed state to DRAM before the GPU (NC) sees it */
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	*gpuaddr = g_gpuva_next;
++	*gpuaddr = base;
 +	*cpu_nc = cva;
 +	if (out_pa) {
 +		*out_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)cva));
@@ -793,32 +941,32 @@
 +	if (out_cva) {
 +		*out_cva = cva;    /* object-backed cacheable kernel VA for the WC BO CPU-map */
 +	}
-+	g_gpuva_next += asize;
 +	return 0;
 +}
 +
-+/* Map EXISTING physically-backed pages (an IOSurface's wired backing) into the GPU
-+ * stage-1 pagetable at a fresh gpuaddr, WB inner-shareable so the a6xx's reads are
-+ * cache-coherent with the CPU writer (SpringBoard draws content surfaces cacheable)
-+ * -- no per-frame copy, no flush. Fresh VA => no TLB invalidate. Returns gpuaddr.
-+ * Backs MSM_INFO_IOS_IMPORT (zero-copy) in place of the leaking glTexImage2D copy. */
-+#define GPU_PTE_WB_COHERENT 0xF47ull   /* valid 4K page, AttrIndx=1(WB), AP=01, SH=11(inner), AF */
++/* Map EXISTING physically-backed pages (an IOSurface's wired backing) into the GPU at
++ * addresses of their own. Uncached like every other buffer (redwood surfaceBuffer() maps a
++ * surface with PTE_CORE too): what the CPU has written of the surface is pushed out of its
++ * cache before a submission names it (drm_do_gem_submit), as RedwoodGPU's submit() does. */
 +static int
 +gpu_gpumem_map_phys(const uint64_t *pa, unsigned npages, uint64_t *out_gpuaddr)
 +{
 +	unsigned i;
 +	uint64_t base;
 +	if (!g_l2_nc || !g_gpuva_next || npages == 0u) { return -1; }
-+	base = g_gpuva_next;
++	if ((base = gpu_address((uint64_t)npages * 0x1000ull)) == 0) { return -1; }
 +	for (i = 0; i < npages; i++) {
 +		uint64_t va = base + (uint64_t)i * 0x1000ull;
 +		volatile uint64_t *l3 = gpu_pt_l3_for(va);
-+		if (!l3) { return -1; }
-+		l3[(va >> 12) & 0x1FFu] = (pa[i] & Q_ADDRMASK) | GPU_PTE_WB_COHERENT;
++		if (!l3) {
++			gpu_unmap(base, (uint64_t)i * 0x1000ull);
++			gpu_address_free(base, (uint64_t)npages * 0x1000ull);
++			return -1;
++		}
++		l3[(va >> 12) & 0x1FFu] = (pa[i] & Q_ADDRMASK) | GPU_PTE_CORE;
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	*out_gpuaddr = base;
-+	g_gpuva_next += (uint64_t)npages * 0x1000ull;
 +	return 0;
 +}
 +
@@ -875,8 +1023,10 @@
 +	 * pool offset 0x3000; VAs 0,1,2 (0x100000000/1000/2000) are used by Q, so gpumem
 +	 * starts at 0x100003000. */
 +	g_l3_nc = pt_nc + 0x3000u;
-+	g_l2_nc = (volatile uint64_t *)(pt_nc + 0x2000u);       /* L2 table (to grow more L3s) */
-+	g_l3_tabs[0] = (volatile uint64_t *)(pt_nc + 0x3000u);  /* initial L3 = VA 0x1_0000_0000..+2MB */
++	g_l1_nc = (volatile uint64_t *)(pt_nc + 0x1000u);       /* L1 table (to grow more L2s) */
++	g_l2_tabs[0] = (volatile uint64_t *)(pt_nc + 0x2000u);  /* L1[4]'s L2 (to grow more L3s) */
++	g_l3_tabs[0][0] = (volatile uint64_t *)(pt_nc + 0x3000u); /* initial L3 = VA 0x1_0000_0000..+2MB */
++	g_l2_nc = g_l2_tabs[0];
 +	g_gpuva_next = 0x100003000ull;
 +	g_smmu_base = smmu;                                     /* for CB0 FSR fault readback on submit */
 +	/* ---- flip CB0 passthrough -> stage-1 (keep S2CR0/SMR0 routing from Stage J) ---- */
@@ -1957,9 +2107,11 @@
 +			 * submit on this same ring (kk is the post-Stage-S write index). ---- */
 +			g_core = core;
 +			g_rb = rb;
-+			g_wptr = kk;
++			g_wptr = kk % KGSL_RING_DWORDS;
 +			g_res_pa = res_pa;
 +			g_res_nc = res_nc;
++			*(volatile uint32_t *)(res_nc + 0xF0u) = 0;      /* GPU_FENCE_OFF: no submission done yet */
++			__asm__ volatile("dsb sy" ::: "memory");
 +			g_kgsl_ready = 1;
 +		}
 +	}
@@ -2063,14 +2215,18 @@
 +
 +/* ---- context + buffer-object tables ---- */
 +#define KGSL_MAX_CTX      32u
-+#define KGSL_MAX_BO       512u
-+#define KGSL_RING_DWORDS  (0x8000u / 4u)
++#define KGSL_MAX_BO       4096u
 +
 +struct kgsl_ctx_ent { int used; uint32_t id; uint32_t ts_issued; uint32_t ts_retired; int pid; };
 +struct kgsl_bo_ent  {
-+	int used; uint32_t id; uint64_t gpuaddr; uint64_t pa;
++	int used;           /* 0 free; 1 live; 2 being given back (not to be found meanwhile) */
++	uint32_t id; uint64_t gpuaddr; uint64_t pa;
 +	vm_offset_t cpu_nc; vm_offset_t cva; vm_size_t size; vm_size_t mmapsize; uint32_t flags; int pid;
 +	uint32_t surf_id;   /* 0 = normal BO; nonzero = zero-copy import of that IOSurface (cva==0) */
++	void    *surf;      /* ... and the surface itself, held for as long as the BO is there */
++	uint32_t seed;      /* the surface's seed when it was last pushed out of the cache, */
++	uint64_t pushed;    /* ... and when that was (mach_absolute_time) */
++	uint32_t fence;     /* the last submission that names it (0: none has) */
 +};
 +
 +/* XNU process KPIs: reclaim GPU contexts/BOs whose owning process has died.
@@ -2084,10 +2240,22 @@
 +static struct kgsl_bo_ent  g_bo[KGSL_MAX_BO];
 +static uint32_t g_ctx_next = 1;
 +static uint32_t g_mmap_page_next = 4;   /* 4K-page units; multiple of 4 keeps id<<12 16K-aligned */
-+static uint32_t g_submit_seq = 0;
 +
-+static void kgsl_lock(void)   { while (__atomic_exchange_n(&g_kgsl_lock, 1, __ATOMIC_ACQUIRE)) { gmub_udelay(5); } }
-+static void kgsl_unlock(void) { __atomic_store_n(&g_kgsl_lock, 0, __ATOMIC_RELEASE); }
++/* SweetSurface.cpp (0046): an IOSurface held by the GPU, its seed, and its pixels pushed out
++ * of this processor's cache. */
++extern void    *sweet_surface_gpu_ref(uint32_t id);
++extern void     sweet_surface_gpu_unref(void *surface);
++extern uint32_t sweet_surface_gpu_seed(void *surface);
++extern void     sweet_surface_gpu_flush(void *surface);
++
++/*
++ * One lock around everything that is the GPU's: the ring, the fence, the address space and
++ * the buffer tables (HackiOS RedwoodGPU.cpp gGPULock). A waiter lets go of it while it waits.
++ */
++static lck_grp_t *g_gpu_grp;
++static lck_mtx_t *g_gpu_mtx;
++static void gpu_lock(void)   { lck_mtx_lock(g_gpu_mtx); }
++static void gpu_unlock(void) { lck_mtx_unlock(g_gpu_mtx); }
 +
 +static struct kgsl_ctx_ent *kgsl_ctx_find(uint32_t id)
 +{
@@ -2095,110 +2263,351 @@
 +	for (i = 0; i < KGSL_MAX_CTX; i++) { if (g_ctx[i].used && g_ctx[i].id == id) { return &g_ctx[i]; } }
 +	return NULL;
 +}
++/* handle -> table index hint (RedwoodGPU indexes handles directly; ours are mmap-offset ids, so
++ * a hint per id hash is checked first, and the table searched when it misses) */
++#define KGSL_BO_HINTS 8192u
++static uint16_t g_bo_hint[KGSL_BO_HINTS];
++static void kgsl_bo_hint(const struct kgsl_bo_ent *b) { g_bo_hint[b->id % KGSL_BO_HINTS] = (uint16_t)(b - g_bo); }
 +static struct kgsl_bo_ent *kgsl_bo_find(uint32_t id)
 +{
-+	unsigned i;
-+	for (i = 0; i < KGSL_MAX_BO; i++) { if (g_bo[i].used && g_bo[i].id == id) { return &g_bo[i]; } }
++	unsigned i = g_bo_hint[id % KGSL_BO_HINTS];
++	if (i < KGSL_MAX_BO && g_bo[i].used == 1 && g_bo[i].id == id) { return &g_bo[i]; }
++	for (i = 0; i < KGSL_MAX_BO; i++) {
++		if (g_bo[i].used == 1 && g_bo[i].id == id) { kgsl_bo_hint(&g_bo[i]); return &g_bo[i]; }
++	}
 +	return NULL;
 +}
 +
-+/* Submit n IBs (each a GPU VA + dword count) on the live ring: emit n
-+ * CP_INDIRECT_BUFFER packets, one CACHE_FLUSH_TS (seqno -> g_res+0xF0) and a WFI,
-+ * ring the WPTR doorbell, then poll for completion. Synchronous (the CP goes idle
-+ * each call), so wrapping g_wptr back to 0 when near the ring end is safe. */
++/* ===================== the ring and its fence =====================
++ * Ported from HackiOS redwood_adreno.c (redwood_gpu_submit, redwood_gpu_done, redwood_gpu_last,
++ * redwood_gpu_report) and RedwoodGPU.cpp (gpuWait). A submission goes into the ring -- a real
++ * circular one, a packet may run over its end as Linux's do -- and the core is told; nothing
++ * waits for it. Its number, the fence, is written by the core into the result page once it has
++ * finished it and everything before it (CACHE_FLUSH_TS), and into CP_SCRATCH_REG2 for whoever
++ * reads the registers after a hang. Whoever needs a submission done waits for its fence, with
++ * the lock let go. (What this replaces polled every submission to the end under a spinlock,
++ * with three 250 ms log-flush delays in the way, and started the ring over at 0 while the CP
++ * still had the stale words between its read pointer and the end of the ring to run.)
++ */
++#define GPU_FENCE_OFF      0xF0u    /* in the result page: the fence the core has finished */
++#define GPU_PATIENCE_MS    5000u    /* for a wait somebody asks for without a limit (redwood) */
++#define GPU_ASK_AGAIN_US   200u     /* while waiting: between two looks at how far the core is */
++#define GPU_PUSH_AGAIN_MS  4u       /* a surface is pushed out of the cache again this long after the last */
++#define GPU_SUBMIT_CMDS    64u
++#define GPU_SUBMIT_BOS     8192u
++#define A6XX_CP_SCRATCH_REG2 0x885u
++static uint32_t g_fence;            /* the last submission's number (redwood gpu_fence) */
++static uint32_t g_reports;          /* hang reports printed (the first few) */
++
++static void
++ring_put(uint32_t word)
++{
++	g_rb[g_wptr] = word;
++	g_wptr = (g_wptr + 1u) % KGSL_RING_DWORDS;
++}
++
++/* redwood_gpu_done: how far the 3D core has got (the result page is NC-mapped). */
++static bool
++gpu_done(uint32_t fence)
++{
++	if (!g_kgsl_ready || fence == 0) {
++		return true;
++	}
++	return (int32_t)(*(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF) - fence) >= 0;
++}
++
++static uint32_t
++gpu_last(void)
++{
++	return g_fence;
++}
++
++/* redwood_gpu_report: a submission does not come back -- what the core and its SMMU context say. */
++static void
++gpu_report(const char *why)
++{
++	if (g_reports >= 8u) {
++		return;
++	}
++	g_reports++;
++	printf("SWEET DRM: GPU %s: submission %u is the last, the core has done %u; ring read up to %u, "
++	    "written up to %u; rbbm %#x; ib1 %#x_%08x rem %#x; ib2 rem %#x; protect %#x; smmu fsr %#x far %#x\n",
++	    why, g_fence, *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF),
++	    gpu_rd(g_core, 0x806u << 2), g_wptr, gpu_rd(g_core, 0x210u << 2),
++	    gpu_rd(g_core, 0x929u << 2), gpu_rd(g_core, 0x928u << 2),
++	    gpu_rd(g_core, 0x92Au << 2), gpu_rd(g_core, 0x92Du << 2), gpu_rd(g_core, 0x8CAu << 2),
++	    g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x058u) : 0,
++	    g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x060u) : 0);
++}
++
++/* RedwoodGPU gpuWait: wait for the core to be done with `fence`; with the lock held, which is
++ * let go of while waiting. A wait of a second or more that comes to nothing is reported. */
++static uint32_t g_waits;
++static uint64_t g_waiting;
++static bool
++gpu_wait(uint32_t fence, uint64_t milliseconds)
++{
++	uint64_t began = mach_absolute_time(), patience;
++	bool waited = false;
++	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
++	for (;; waited = true) {
++		if (gpu_done(fence)) {
++			if (waited) {
++				g_waits++;
++				g_waiting += mach_absolute_time() - began;
++			}
++			return true;
++		}
++		if (mach_absolute_time() - began >= patience) {
++			break;
++		}
++		gpu_unlock();
++		gmub_udelay(GPU_ASK_AGAIN_US);
++		gpu_lock();
++	}
++	if (milliseconds >= 1000u) {
++		gpu_report("no answer");
++	}
++	return false;
++}
++
++/* redwood_gpu_submit: command buffers for the core to run, in order, as Linux's a6xx_submit
++ * puts them in the ring. Returns the submission's number; 0: the ring stayed full (the core is
++ * not reading it). With the lock held throughout, as redwood does. */
++static uint32_t
++gpu_submit(const uint64_t *ibva, const uint32_t *ibdw, unsigned n)
++{
++	uint32_t wanted = 4u + 4u * n + 2u + 5u, room = 0, fence;
++	unsigned i, tries;
++	if (!g_kgsl_ready || n == 0) {
++		return 0;
++	}
++	for (tries = 0; tries < 10000u; tries++) {           /* 2 s */
++		uint32_t rptr = gpu_rd(g_core, 0x806u << 2) % KGSL_RING_DWORDS;   /* CP_RB_RPTR */
++		room = (rptr + KGSL_RING_DWORDS - g_wptr - 1u) % KGSL_RING_DWORDS;
++		if (room >= wanted) {
++			break;
++		}
++		gmub_udelay(GPU_ASK_AGAIN_US);
++	}
++	if (room < wanted) {
++		gpu_report("the ring is full");
++		return 0;
++	}
++	if (++g_fence == 0) {
++		g_fence = 1;
++	}
++	fence = g_fence;
++	/* Per-submit cache-invalidate preamble: stale depth/colour cache state from the previous
++	 * draw must not corrupt this one. */
++	ring_put(cp_type7(0x46u, 1u));                       /* CP_EVENT_WRITE */
++	ring_put(0x00000018u);                               /* EVENT_INVALIDATE_DEPTH */
++	ring_put(cp_type7(0x46u, 1u));                       /* CP_EVENT_WRITE */
++	ring_put(0x00000019u);                               /* EVENT_INVALIDATE_COLOR */
++	for (i = 0; i < n; i++) {
++		ring_put(cp_type7(0x3Fu, 3u));                   /* CP_INDIRECT_BUFFER */
++		ring_put((uint32_t)ibva[i]);
++		ring_put((uint32_t)(ibva[i] >> 32));
++		ring_put(ibdw[i]);
++	}
++	ring_put(cp_type4(A6XX_CP_SCRATCH_REG2, 1u));        /* the fence, for a hang's post-mortem */
++	ring_put(fence);
++	ring_put(cp_type7(0x46u, 4u));                       /* CP_EVENT_WRITE CACHE_FLUSH_TS */
++	ring_put(0x00000004u);
++	ring_put((uint32_t)(g_res_pa + GPU_FENCE_OFF));      /* phys, identity-mapped */
++	ring_put((uint32_t)((g_res_pa + GPU_FENCE_OFF) >> 32));
++	ring_put(fence);
++	__asm__ volatile("dsb sy" ::: "memory");             /* the ring is NC: the words are in memory */
++	gpu_wr(g_core, 0x807u << 2, g_wptr);                 /* CP_RB_WPTR doorbell */
++	__asm__ volatile("dsb sy" ::: "memory");
++	return fence;
++}
++
++/* The KGSL front-end (turnip) and the in-kernel self-tests submit synchronously: submit, then
++ * wait for that one fence. With the lock held. */
 +static int
 +kgsl_submit_ibs(const uint64_t *ibva, const uint32_t *ibdw, unsigned n)
 +{
-+	volatile uint32_t *rb;
-+	unsigned kk, i, polls;
-+	uint32_t seq;
-+	int ok;
-+	if (!g_kgsl_ready || n == 0 || n > 16u) {
-+		return -1;
++	uint32_t fence = gpu_submit(ibva, ibdw, n);
++	if (fence == 0) {
++		return -2;
 +	}
-+	kgsl_lock();
-+	seq = 0x51000000u | ((++g_submit_seq) & 0x00FFFFFFu);
-+	if (g_wptr + (n * 4u) + 16u >= KGSL_RING_DWORDS) {
-+		g_wptr = 0;                 /* safe: prior submit idled the CP */
-+	}
-+	rb = g_rb;
-+	kk = g_wptr;
-+	/* Per-submit cache-invalidate preamble (match HackiOS redwood_gpu_submit):
-+	 * invalidate the GPU internal depth+color caches before the client IBs so
-+	 * stale GMEM/cache state from the previous draw cannot corrupt this one. */
-+	rb[kk++] = cp_type7(0x46u, 1u);               /* CP_EVENT_WRITE */
-+	rb[kk++] = 0x00000018u;                        /* EVENT_INVALIDATE_DEPTH */
-+	rb[kk++] = cp_type7(0x46u, 1u);               /* CP_EVENT_WRITE */
-+	rb[kk++] = 0x00000019u;                        /* EVENT_INVALIDATE_COLOR */
-+	for (i = 0; i < n; i++) {
-+		rb[kk++] = cp_type7(0x3Fu, 3u);               /* CP_INDIRECT_BUFFER */
-+		rb[kk++] = (uint32_t)ibva[i];
-+		rb[kk++] = (uint32_t)(ibva[i] >> 32);
-+		rb[kk++] = ibdw[i];
-+	}
-+	rb[kk++] = cp_type7(0x46u, 4u);                       /* CACHE_FLUSH_TS */
-+	rb[kk++] = 0x00000004u;                               /* event = CACHE_FLUSH_TS */
-+	rb[kk++] = (uint32_t)(g_res_pa + 0xF0u);              /* completion word (phys, identity) */
-+	rb[kk++] = (uint32_t)((g_res_pa + 0xF0u) >> 32);
-+	rb[kk++] = seq;
-+	rb[kk++] = cp_type7(38u, 0u);                         /* CP_WAIT_FOR_IDLE */
-+	*(volatile uint32_t *)(g_res_nc + 0xF0u) = 0;
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	gmub_flush();
-+	g_wptr = kk;
-+	printf("SWEET DRM: submit n=%u ib0=%#llx dw0=%u wptr=%u seq=%#x -> doorbell\n",
-+	    n, (unsigned long long)ibva[0], ibdw[0], g_wptr, seq);
-+	gmub_flush();
-+	gpu_wr(g_core, 0x807u << 2, g_wptr);                  /* CP_RB_WPTR doorbell */
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	for (polls = 0; polls < 200000u; ++polls) {
-+		if (*(volatile uint32_t *)(g_res_nc + 0xF0u) == seq) { break; }
-+		gmub_udelay(10);
-+	}
-+	ok = (*(volatile uint32_t *)(g_res_nc + 0xF0u) == seq);
-+	{
-+		uint32_t fsr = g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x058u) : 0;
-+		uint32_t rbbm = gpu_rd(g_core, 0x210u << 2);
-+		printf("SWEET DRM: submit done ok=%d polls=%u fsr=%#x far=%#x rbbm=%#x\n",
-+		    ok, polls, fsr, g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x060u) : 0, rbbm);
-+		if (!ok) {   /* dump CP state so we can localise WHERE the GPU wedged in the IB */
-+			printf("SWEET DRM: HANG rptr=%#x wptr=%u ib1=%#x_%#x ib1_rem=%#x ib2_rem=%#x protstat=%#x\n",
-+			    gpu_rd(g_core, 0x806u << 2), g_wptr,
-+			    gpu_rd(g_core, 0x929u << 2), gpu_rd(g_core, 0x928u << 2),  /* CP_IB1_BASE_HI/LO */
-+			    gpu_rd(g_core, 0x92Au << 2), gpu_rd(g_core, 0x92Du << 2),  /* CP_IB1/IB2_REM_SIZE */
-+			    gpu_rd(g_core, 0x8CAu << 2));                              /* CP_PROTECT_STATUS */
-+		}
-+		gmub_flush();
-+	}
-+	kgsl_unlock();
-+	return ok ? 0 : -2;
++	return gpu_wait(fence, 2000u) ? 0 : -2;
 +}
 +
-+/* ---- handler helpers (kernel-struct in/out; the ioctl wrapper and the self-test
-+ *      both call these; the wrapper adds copyin/copyout of nested user ptrs) ---- */
-+/* Tear down one BO entry: clear its L3 PTEs + release the wired backing. */
++/* ===================== buffers given back =====================
++ * Ported from HackiOS RedwoodGPU.cpp (freeBuffer, reap, keep, dropKept, gemNew).
++ *
++ * A buffer given back while the GPU is still at it keeps its memory and its addresses until
++ * its submission is done ("left"), and nobody waits for that. A buffer of a program's own,
++ * given back and done with, is kept -- memory and addresses -- for the next one of the same
++ * size and kind from the same program ("kept"; CoreAnimation makes a texture per frame of an
++ * animation and gives them back a score at a time: each made afresh costs memory got, cleared,
++ * and entered page by page into the GPU's address space). At most GPU_KEPT_BYTES are kept, none
++ * for longer than GPU_KEPT_SECONDS. A buffer is never freed under a GPU that may still use it.
++ */
++struct gpu_left {
++	vm_offset_t cva; uint64_t gpuaddr; vm_size_t mmapsize; uint32_t flags; int pid;
++	void *surf; uint32_t surf_id; uint32_t fence;
++};
++#define GPU_LEFT 256u
++static struct gpu_left g_left[GPU_LEFT];
++static uint32_t g_left_count;
++
++struct gpu_kept {
++	vm_offset_t cva;    /* 0: this place is free */
++	uint64_t gpuaddr, pa, since; vm_size_t mmapsize; uint32_t flags; int pid;
++};
++#define GPU_KEPT          48u
++#define GPU_KEPT_BYTES    (160ull << 20)
++#define GPU_KEPT_SECONDS  60u
++#define GPU_KEEP_FROM     (256u << 10)      /* bytes: smaller ones are not worth it */
++static struct gpu_kept g_kept[GPU_KEPT];
++static uint64_t g_kept_bytes;
++static uint32_t g_bo_count;
++static uint64_t g_bo_bytes;
++
++/* What the last seconds' work was, for one log line every five (RedwoodGPU gGPUStat). */
++static struct {
++	uint64_t since, flushed;
++	uint32_t submissions, commands, buffers, surfaces, made, given_again, closed, left_now;
++} g_stat;
++
++/* A buffer's memory and addresses given up for good: the GPU is done with it. */
 +static void
-+kgsl_free_bo_ent(struct kgsl_bo_ent *b)
++gpu_bo_destroy(vm_offset_t cva, uint64_t gpuaddr, vm_size_t mmapsize, void *surf)
 +{
-+	uint64_t off;
-+	if (!b || !b->used) { return; }
-+	for (off = 0; off < b->mmapsize; off += 0x1000ull) {
-+		uint64_t va = b->gpuaddr + off;
-+		volatile uint64_t *l3 = g_l3_tabs[(va >> 21) & 0x1FFu];
-+		if (l3) { l3[(va >> 12) & 0x1FFu] = 0; }
++	gpu_unmap(gpuaddr, mmapsize);
++	gpu_address_free(gpuaddr, mmapsize);
++	if (cva) {
++		kmem_free(kernel_map, cva, mmapsize);
 +	}
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	if (b->cva) { kmem_free(kernel_map, b->cva, b->mmapsize); }
-+	b->used = 0;
++	if (surf) {
++		sweet_surface_gpu_unref(surf);
++	}
 +}
 +
-+/* Reclaim contexts/BOs whose owning process has exited (pid no longer resolves).
-+ * Called at allocation time so leaked GPU state from dead processes (e.g. test
-+ * runs, or a SIGKILLed backboardd) is freed instead of exhausting the 32-ctx table. */
++static void
++gpu_drop_kept(struct gpu_kept *k)
++{
++	if (k->cva == 0) {
++		return;
++	}
++	gpu_bo_destroy(k->cva, k->gpuaddr, k->mmapsize, NULL);
++	g_kept_bytes -= k->mmapsize;
++	k->cva = 0;
++}
++
++/* RedwoodGPU keep: the GPU done with a buffer of a program's own -- kept if it is worth it
++ * (those kept longest make way). */
++static bool
++gpu_keep(vm_offset_t cva, uint64_t gpuaddr, uint64_t pa, vm_size_t mmapsize, uint32_t flags, int pid)
++{
++	struct gpu_kept *place;
++	unsigned i;
++	if (cva == 0 || mmapsize < GPU_KEEP_FROM || mmapsize > GPU_KEPT_BYTES / 4u) {
++		return false;
++	}
++	for (;;) {
++		struct gpu_kept *oldest = NULL;
++		place = NULL;
++		for (i = 0; i < GPU_KEPT; i++) {
++			if (g_kept[i].cva == 0) {
++				place = place ? place : &g_kept[i];
++			} else if (oldest == NULL || g_kept[i].since < oldest->since) {
++				oldest = &g_kept[i];
++			}
++		}
++		if (place != NULL && g_kept_bytes + mmapsize <= GPU_KEPT_BYTES) {
++			break;
++		}
++		gpu_drop_kept(oldest);
++	}
++	place->cva = cva;
++	place->gpuaddr = gpuaddr;
++	place->pa = pa;
++	place->mmapsize = mmapsize;
++	place->flags = flags;
++	place->pid = pid;
++	place->since = mach_absolute_time();
++	g_kept_bytes += mmapsize;
++	return true;
++}
++
++/* RedwoodGPU freeBuffer: a handle given back. With the lock held. If the GPU is not done
++ * with the buffer it goes on the left list; if that is full, it is waited for; and if the
++ * GPU never answers, the memory stays the GPU's for good (it may yet be written). */
++static void
++gpu_bo_release(struct kgsl_bo_ent *b)
++{
++	bool busy;
++	if (!b || b->used != 1) {
++		return;
++	}
++	b->used = 2;                                   /* nobody finds it while it is given back */
++	busy = b->fence != 0 && !gpu_done(b->fence);
++	if (busy && g_left_count == GPU_LEFT) {
++		busy = !gpu_wait(b->fence, 1000u);         /* nowhere to keep it: this one is waited for */
++	}
++	if (busy && g_left_count < GPU_LEFT) {
++		struct gpu_left *l = &g_left[g_left_count++];
++		l->cva = b->cva;
++		l->gpuaddr = b->gpuaddr;
++		l->mmapsize = b->mmapsize;
++		l->flags = b->flags;
++		l->pid = b->pid;
++		l->surf = b->surf;
++		l->surf_id = b->surf_id;
++		l->fence = b->fence;
++	} else if (busy) {
++		static uint32_t said;
++		if (said++ < 8u) {
++			printf("SWEET DRM: the GPU is not done with what it was given: a buffer of %lu bytes stays its own\n",
++			    (unsigned long)b->mmapsize);
++		}
++	} else if (!(b->surf == NULL && gpu_keep(b->cva, b->gpuaddr, b->pa, b->mmapsize, b->flags, b->pid))) {
++		gpu_bo_destroy(b->cva, b->gpuaddr, b->mmapsize, b->surf);
++	}
++	g_bo_count--;
++	g_bo_bytes -= b->mmapsize;
++	g_stat.closed++;
++	bzero(b, sizeof(*b));
++}
++
++/* RedwoodGPU reap: buffers given back early that the GPU is done with now. With the lock held. */
++static void
++gpu_reap(void)
++{
++	uint32_t i;
++	for (i = 0; i < g_left_count;) {
++		struct gpu_left *l = &g_left[i];
++		if (!gpu_done(l->fence)) {
++			i++;
++			continue;
++		}
++		if (!(l->surf == NULL &&
++		    gpu_keep(l->cva, l->gpuaddr, ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)l->cva)),
++		    l->mmapsize, l->flags, l->pid))) {
++			gpu_bo_destroy(l->cva, l->gpuaddr, l->mmapsize, l->surf);
++		}
++		*l = g_left[--g_left_count];
++	}
++}
++
++/* Reclaim contexts/BOs whose owning process has exited (pid no longer resolves), at most once
++ * a second: leaked GPU state of dead processes (a SIGKILLed backboardd) is given back the
++ * same way a close gives it back -- never under a GPU that may still use it. With the lock held. */
 +static void
 +kgsl_reap_dead(void)
 +{
++	static uint64_t last;
++	uint64_t now = mach_absolute_time(), second;
 +	unsigned i, nctx = 0, nbo = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
++	if (last != 0 && now - last < second) {
++		return;
++	}
++	last = now;
 +	for (i = 0; i < KGSL_MAX_CTX; i++) {
 +		if (g_ctx[i].used && g_ctx[i].pid > 0) {
 +			struct proc *p = proc_find(g_ctx[i].pid);
@@ -2206,11 +2615,18 @@
 +		}
 +	}
 +	for (i = 0; i < KGSL_MAX_BO; i++) {
-+		if (g_bo[i].used && g_bo[i].pid > 0) {
++		if (g_bo[i].used == 1 && g_bo[i].pid > 0) {
 +			struct proc *p = proc_find(g_bo[i].pid);
-+			if (p) { proc_rele(p); } else { kgsl_free_bo_ent(&g_bo[i]); nbo++; }
++			if (p) { proc_rele(p); } else { gpu_bo_release(&g_bo[i]); nbo++; }
 +		}
 +	}
++	for (i = 0; i < GPU_KEPT; i++) {
++		if (g_kept[i].cva != 0 && g_kept[i].pid > 0) {
++			struct proc *p = proc_find(g_kept[i].pid);
++			if (p) { proc_rele(p); } else { gpu_drop_kept(&g_kept[i]); }
++		}
++	}
++	gpu_reap();
 +	if (nctx || nbo) { printf("SWEET DRM: reaped %u dead ctx, %u dead bo\n", nctx, nbo); }
 +}
 +
@@ -2241,31 +2657,89 @@
 +	c->used = 0;
 +	return 0;
 +}
++
++/* A free slot of the BO table; NULL: none. */
++static struct kgsl_bo_ent *
++kgsl_bo_slot(void)
++{
++	static unsigned next;
++	unsigned n;
++	for (n = 0; n < KGSL_MAX_BO; n++) {
++		unsigned i = (next + n) % KGSL_MAX_BO;      /* one given back is not the next given */
++		if (g_bo[i].used == 0) {
++			next = i + 1u;
++			return &g_bo[i];
++		}
++	}
++	return NULL;
++}
++
++/* GEM_NEW / GPUMEM_ALLOC (RedwoodGPU gemNew): one kept of this size and kind of this program's,
++ * if there is one (the one kept last), else made. With the lock held. */
 +static int
 +kgsl_do_gpumem_alloc(vm_size_t size, uint32_t flags, struct kgsl_bo_ent **out)
 +{
-+	unsigned i;
-+	uint64_t gpuaddr = 0, pa = 0;
++	struct kgsl_bo_ent *b;
++	struct gpu_kept *found = NULL;
++	uint64_t gpuaddr = 0, pa = 0, now = mach_absolute_time(), old;
 +	vm_offset_t nc = 0, cva = 0;
 +	vm_size_t asize = (size + (vm_size_t)PAGE_SIZE - 1) & ~((vm_size_t)PAGE_SIZE - 1);
++	uint32_t kflags = flags & ~(KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_MEMFLAGS_IOCOHERENT);
++	int pid = proc_selfpid();
++	unsigned i;
++	if (asize == 0 || asize > (256u << 20)) {
++		return -1;
++	}
 +	kgsl_reap_dead();
-+	for (i = 0; i < KGSL_MAX_BO; i++) { if (!g_bo[i].used) { break; } }
-+	if (i == KGSL_MAX_BO) { return -1; }
-+	if (gpu_gpumem_alloc(asize, &gpuaddr, &nc, &pa, &cva) != 0) { return -1; }
-+	g_bo[i].used = 1;
-+	g_bo[i].id = g_mmap_page_next;                /* id = 4K-page offset base (16K aligned) */
++	if ((b = kgsl_bo_slot()) == NULL) {
++		printf("SWEET DRM: no handles left for a buffer of %lu bytes (%u buffers, %llu MB)\n",
++		    (unsigned long)asize, g_bo_count, g_bo_bytes >> 20);
++		return -1;
++	}
++	nanoseconds_to_absolutetime((uint64_t)GPU_KEPT_SECONDS * NSEC_PER_SEC, &old);
++	for (i = 0; i < GPU_KEPT; i++) {
++		struct gpu_kept *k = &g_kept[i];
++		if (k->cva != 0 && now - k->since > old) {
++			gpu_drop_kept(k);
++		}
++		if (k->cva != 0 && k->mmapsize == asize && k->flags == kflags && k->pid == pid &&
++		    (found == NULL || k->since > found->since)) {
++			found = k;
++		}
++	}
++	if (found != NULL) {
++		cva = found->cva;
++		nc = found->cva;
++		gpuaddr = found->gpuaddr;
++		pa = found->pa;
++		g_kept_bytes -= found->mmapsize;
++		found->cva = 0;
++		g_stat.given_again++;
++	} else if (gpu_gpumem_alloc(asize, &gpuaddr, &nc, &pa, &cva) != 0) {
++		printf("SWEET DRM: no memory for a buffer of %lu bytes (%u buffers, %llu MB; va %llu MB used, %u refused)\n",
++		    (unsigned long)asize, g_bo_count, g_bo_bytes >> 20, gpu_va_used >> 20, gpu_va_refused);
++		return -1;
++	} else {
++		g_stat.made++;
++	}
++	bzero(b, sizeof(*b));
++	b->used = 1;
++	b->id = g_mmap_page_next;                    /* id = 4K-page offset base (16K aligned) */
 +	g_mmap_page_next += (uint32_t)(asize / 0x1000u);
-+	g_bo[i].gpuaddr = gpuaddr;
-+	g_bo[i].pa = pa;
-+	g_bo[i].cpu_nc = nc;
-+	g_bo[i].cva = cva;                            /* cacheable kernel VA for BO CPU-map */
-+	g_bo[i].size = size;
-+	g_bo[i].mmapsize = asize;
++	b->gpuaddr = gpuaddr;
++	b->pa = pa;
++	b->cpu_nc = nc;
++	b->cva = cva;                                /* cacheable kernel VA for BO CPU-map */
++	b->size = size;
++	b->mmapsize = asize;
 +	/* we honour only WRITECOMBINE (cachemode bits[27:26]=0); drop capability bits we
 +	 * don't implement so turnip's (flags & requested)==requested probe degrades */
-+	g_bo[i].flags = flags & ~(KGSL_MEMFLAGS_USE_CPU_MAP | KGSL_MEMFLAGS_IOCOHERENT);
-+	g_bo[i].pid = proc_selfpid();
-+	*out = &g_bo[i];
++	b->flags = kflags;
++	b->pid = pid;
++	g_bo_count++;
++	g_bo_bytes += asize;
++	kgsl_bo_hint(b);
++	*out = b;
 +	return 0;
 +}
 +static int
@@ -2273,7 +2747,8 @@
 +{
 +	struct kgsl_bo_ent *b = kgsl_bo_find(id);
 +	if (!b) { return -1; }
-+	kgsl_free_bo_ent(b);   /* clear L3 PTEs + release the wired backing */
++	gpu_bo_release(b);
++	gpu_reap();
 +	return 0;
 +}
 +
@@ -2320,7 +2795,31 @@
 +	di->gmem_sizebytes = 0x100000u;    /* a618 GMEM = 1 MiB */
 +}
 +
-+static int kgsl_open(__unused dev_t dev, __unused int f, __unused int dt, __unused struct proc *p) { return 0; }
++/*
++ * The device nodes are there from the start (gpu_nodes_register), and an open waits until the
++ * GPU's bring-up is over: whoever opens one -- backboardd's GLES context for CoreAnimation --
++ * gets the GPU, or ENXIO if the bring-up failed, never "no such file" because it was early.
++ * (HackiOS's system does not go on starting until the GPU is up; here the bring-up runs in its
++ * own thread, and it was a race: the window server sometimes started before the GPU was there
++ * and drew in software for the rest of the run.)
++ */
++static volatile int g_gpu_boot_done;   /* the bring-up thread is through (g_kgsl_ready says how) */
++static int
++kgsl_open(__unused dev_t dev, __unused int f, __unused int dt, __unused struct proc *p)
++{
++	unsigned waited;
++	for (waited = 0; !g_gpu_boot_done && waited < 1200u; waited++) {   /* 120 s at most */
++		uint64_t deadline;
++		clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
++		assert_wait_deadline((event_t)&g_gpu_boot_done, THREAD_UNINT, deadline);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	if (waited != 0) {
++		printf("SWEET GPU: an open waited %u ms for the bring-up: %s\n", waited * 100u,
++		    g_kgsl_ready ? "the GPU is there" : "NO GPU");
++	}
++	return g_kgsl_ready ? 0 : ENXIO;
++}
 +static int kgsl_close(__unused dev_t dev, __unused int f, __unused int dt, __unused struct proc *p) { return 0; }
 +static int kgsl_norw(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag) { return ENODEV; }
 +
@@ -2333,15 +2832,10 @@
 +}
 +
 +static int drm_do_gem_mmap(struct kgsl_bo_ent *bo, uint64_t *out_uaddr);
++/* With the lock held (kgsl_ioctl). */
 +static int
-+kgsl_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++kgsl_ioctl_locked(unsigned nr, caddr_t data)
 +{
-+	unsigned nr  = (unsigned)(cmd & 0xffu);
-+	unsigned grp = (unsigned)((cmd >> 8) & 0xffu);
-+	if (grp != KGSL_IOC_TYPE) {
-+		return ENOTTY;
-+	}
-+	printf("SWEET KGSL: ioctl nr=%#x\n", nr);   /* log every ioctl a real freedreno sends */
 +	switch (nr) {
 +	case KGSL_IOC_GETPROPERTY: {
 +		struct kgsl_device_getproperty *gp = (struct kgsl_device_getproperty *)data;
@@ -2425,8 +2919,23 @@
 +		return 0;
 +	}
 +	default:
-+		return 0;   /* logged + accepted (Tier-2/3 stub) */
++		return 0;   /* accepted (Tier-2/3 stub) */
 +	}
++}
++
++static int
++kgsl_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	unsigned nr  = (unsigned)(cmd & 0xffu);
++	unsigned grp = (unsigned)((cmd >> 8) & 0xffu);
++	int e;
++	if (grp != KGSL_IOC_TYPE) {
++		return ENOTTY;
++	}
++	gpu_lock();
++	e = kgsl_ioctl_locked(nr, data);
++	gpu_unlock();
++	return e;
 +}
 +
 +/* mmap() of a GPU object: userland (turnip on /dev/kgsl, freedreno on the DRM node)
@@ -2490,10 +2999,13 @@
 +	if (kgsl_do_drawctxt_create(0x13u, &cid) != 0) {
 +		printf("SWEET KGSL: [U] drawctxt_create FAIL\n"); return;
 +	}
++	gpu_lock();
 +	if (kgsl_do_gpumem_alloc(PAGE_SIZE, 0, &ib) != 0 ||
 +	    kgsl_do_gpumem_alloc(PAGE_SIZE, 0, &dst) != 0) {
++		gpu_unlock();
 +		printf("SWEET KGSL: [U] gpumem_alloc FAIL\n"); return;
 +	}
++	gpu_unlock();
 +	*(volatile uint32_t *)dst->cpu_nc = 0;
 +	((volatile uint32_t *)ib->cpu_nc)[0] = cp_type7(0x3Du, 3u);     /* CP_MEM_WRITE -> dst gpuaddr */
 +	((volatile uint32_t *)ib->cpu_nc)[1] = (uint32_t)dst->gpuaddr;
@@ -2504,7 +3016,9 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	ibva = ib->gpuaddr;
 +	ibdw = 4u;
++	gpu_lock();
 +	rc = kgsl_submit_ibs(&ibva, &ibdw, 1);
++	gpu_unlock();
 +	c = kgsl_ctx_find(cid);
 +	if (c && rc == 0) { c->ts_issued++; c->ts_retired = c->ts_issued; }
 +	gpu_dcache_clean(dst->cpu_nc, PAGE_SIZE);   /* invalidate: CPU re-reads GPU-written DRAM */
@@ -2523,12 +3037,9 @@
 +gpu_kgsl_init(void)
 +{
 +	struct kgsl_devinfo di;
-+	g_kgsl_major = cdevsw_add(-1, &kgsl_cdevsw);
 +	if (g_kgsl_major < 0) {
-+		printf("SWEET KGSL: cdevsw_add failed\n");
-+		return;
++		return;                 /* not registered (gpu_nodes_register) */
 +	}
-+	devfs_make_node(makedev(g_kgsl_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "kgsl-3d0");
 +	kgsl_fill_devinfo(&di);     /* in-kernel self-test of the DEVICE_INFO reply */
 +	printf("SWEET KGSL: /dev/kgsl-3d0 registered (major=%d); devinfo chip_id=%#x gpu_id=%u -> %s\n",
 +	    g_kgsl_major, di.chip_id, di.gpu_id,
@@ -2617,7 +3128,6 @@
 +struct drm_msm_gem_madvise  { uint32_t handle; uint32_t madv; uint32_t retained; };     /* 12 */
 +
 +static uint32_t g_sq_next = 1;      /* submitqueue id counter */
-+static uint32_t g_drm_fence = 0;    /* monotonic retire fence seqno */
 +
 +static int
 +drm_do_get_param(uint32_t param, uint64_t *out)
@@ -2628,91 +3138,124 @@
 +	case MSM_PARAM_GMEM_SIZE: *out = 0x100000u;     return 0;
 +	case MSM_PARAM_GMEM_BASE: *out = 0x100000u;     return 0;
 +	case MSM_PARAM_MAX_FREQ:  *out = 500000000u;    return 0;
-+	case MSM_PARAM_TIMESTAMP: *out = 0;             return 0;
++	case MSM_PARAM_TIMESTAMP: *out = mach_absolute_time(); return 0;
 +	case MSM_PARAM_PRIORITIES:*out = 1;             return 0;
-+	case MSM_PARAM_VA_START:  *out = 0x100000000ull;return 0;  /* GPU iova window (softpin) */
-+	case MSM_PARAM_VA_SIZE:   *out = 0x100000000ull;return 0;
++	case MSM_PARAM_VA_START:  *out = (uint64_t)GPU_VA_L1_FIRST << 30; return 0;  /* where buffers are put (the kernel puts them) */
++	case MSM_PARAM_VA_SIZE:   *out = GPU_VA_END - ((uint64_t)GPU_VA_L1_FIRST << 30); return 0;
 +	default: return EINVAL;    /* freedreno treats most params as optional */
 +	}
 +}
 +
-+/* GEM_SUBMIT: resolve each CMD_BUF to its BO iova and submit as CP_INDIRECT_BUFFER
-+ * via the shared ring core; assign a per-device fence seqno. */
++/* GEM_SUBMIT (port of HackiOS RedwoodGPU::submit). With the lock held.
++ *  - each CMD_BUF resolved to its BO's address, checked to lie inside the BO;
++ *  - every IOSurface the submission names pushed out of this processor's cache when its seed
++ *    says it has changed, and in any case once in GPU_PUSH_AGAIN_MS (not everybody who draws
++ *    into a surface says so): the GPU reads memory, uncached;
++ *  - the submission put in the ring, not waited for;
++ *  - every BO it names given its fence: a BO given back before that fence is done keeps its
++ *    memory and addresses until it is (gpu_bo_release), and the display waits for a surface's
++ *    fence before it shows it (sweet_gpu_surface_wait). */
 +static int
 +drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
 +{
-+	uint64_t ibva[16];
-+	uint32_t ibdw[16];
-+	unsigned n = 0, i;
-+	int rc;
-+	struct kgsl_bo_ent *bo0 = NULL;   /* first CMD_BUF BO, for the on-hang IB dump */
-+	uint32_t ib0_off = 0;
-+	if (s->nr_cmds == 0 || s->nr_cmds > 16u) {
++	uint64_t ibva[GPU_SUBMIT_CMDS];
++	uint32_t ibdw[GPU_SUBMIT_CMDS];
++	struct drm_msm_gem_submit_bo chunk[32];
++	uint64_t began = mach_absolute_time(), again, nanos;
++	unsigned n = 0, i, j;
++	uint32_t fence;
++	if (s->nr_cmds == 0 || s->nr_cmds > GPU_SUBMIT_CMDS || s->nr_bos == 0 || s->nr_bos > GPU_SUBMIT_BOS) {
++		printf("SWEET DRM: a submission of %u command buffers in %u buffers: not taken\n", s->nr_cmds, s->nr_bos);
 +		return EINVAL;
 +	}
 +	for (i = 0; i < s->nr_cmds; i++) {
 +		struct drm_msm_gem_submit_cmd c;
 +		struct drm_msm_gem_submit_bo  b;
 +		struct kgsl_bo_ent *bo;
-+		user_addr_t ce = (user_addr_t)(s->cmds + (uint64_t)i * sizeof(c));
-+		user_addr_t be;
-+		if (copyin(ce, &c, sizeof(c)) != 0) { return EINVAL; }
-+		if (c.type != MSM_SUBMIT_CMD_BUF) { continue; }   /* IB_TARGET/CTX_RESTORE are pinned, not dispatched */
++		if (copyin((user_addr_t)(s->cmds + (uint64_t)i * sizeof(c)), &c, sizeof(c)) != 0) { return EFAULT; }
++		if (c.type != MSM_SUBMIT_CMD_BUF) { continue; }   /* the other kinds are for a GPU shared between address spaces */
 +		if (c.submit_idx >= s->nr_bos) { return EINVAL; }
-+		be = (user_addr_t)(s->bos + (uint64_t)c.submit_idx * sizeof(b));
-+		if (copyin(be, &b, sizeof(b)) != 0) { return EINVAL; }
++		if (copyin((user_addr_t)(s->bos + (uint64_t)c.submit_idx * sizeof(b)), &b, sizeof(b)) != 0) { return EFAULT; }
 +		bo = kgsl_bo_find(b.handle);
-+		if (!bo) { return EINVAL; }
-+		if (n >= 16u) { return EINVAL; }
++		if (!bo || c.nr_relocs != 0 || (c.size & 3u) || (c.submit_offset & 3u) ||
++		    (uint64_t)c.submit_offset + c.size > bo->mmapsize) {
++			printf("SWEET DRM: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
++			    i, b.handle, c.submit_offset, c.size, c.nr_relocs);
++			return EINVAL;
++		}
 +		ibva[n] = bo->gpuaddr + c.submit_offset;
 +		ibdw[n] = c.size / 4u;
-+		if (bo0 == NULL) { bo0 = bo; ib0_off = c.submit_offset; }
 +		n++;
 +	}
 +	if (n == 0) { return EINVAL; }
-+	printf("SWEET DRM: GEM_SUBMIT queueid=%u nr_bos=%u nr_cmds=%u -> %u IBs\n",
-+	    s->queueid, s->nr_bos, s->nr_cmds, n);
-+	gmub_flush();
-+	rc = kgsl_submit_ibs(ibva, ibdw, n);
-+	if (rc != 0) {
-+		/* dump freedreno's IB1 head (invalidate the cacheable alias first so we read
-+		 * freedreno's WC-written cmdstream from DRAM). This is DEBUG-ONLY; a GPU hang
-+		 * must never panic the kernel, so touch nothing until the IB head page is
-+		 * confirmed mapped -- bo0->cva can be stale/freed (a concurrent kgsl_reap_dead
-+		 * of a dead process's BO, or a BO whose kernel alias does not cover mmapsize),
-+		 * and flushing/reading an unmapped VA aborts (dc civac / load). */
-+		if (bo0 && bo0->cva) {
-+			vm_offset_t head = bo0->cva + ib0_off;
-+			vm_offset_t hpg = head & ~((vm_offset_t)PAGE_MASK);
-+			if (pmap_find_phys(kernel_pmap, (addr64_t)hpg) == 0) {
-+				printf("SWEET DRM: IBDUMP skipped (IB cva %#lx unmapped)\n", (unsigned long)head);
-+			} else {
-+				volatile uint32_t *p = (volatile uint32_t *)head;
-+				uint32_t rem = gpu_rd(g_core, 0x92Au << 2);
-+				unsigned total = ibdw[0];
-+				unsigned stall = (rem && rem <= total) ? (total - rem) : 0;
-+				gpu_dcache_clean(hpg, PAGE_SIZE);   /* one confirmed-mapped page only */
-+				printf("SWEET DRM: IBDUMP total=%u rem=%#x stall~%u head %08x %08x %08x %08x %08x %08x %08x %08x\n",
-+				    total, rem, stall, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-+				gmub_flush();
-+			}
++	nanoseconds_to_absolutetime((uint64_t)GPU_PUSH_AGAIN_MS * NSEC_PER_MSEC, &again);
++	for (i = 0; i < s->nr_bos; i += j) {
++		unsigned m = s->nr_bos - i < 32u ? s->nr_bos - i : 32u;
++		if (copyin((user_addr_t)(s->bos + (uint64_t)i * sizeof(chunk[0])), chunk, m * sizeof(chunk[0])) != 0) { return EFAULT; }
++		for (j = 0; j < m; j++) {
++			struct kgsl_bo_ent *b = kgsl_bo_find(chunk[j].handle);
++			uint32_t seed;
++			if (b == NULL || b->surf == NULL) { continue; }
++			seed = sweet_surface_gpu_seed(b->surf);
++			if (seed == b->seed && began - b->pushed < again) { continue; }
++			b->seed = seed;
++			b->pushed = began;
++			sweet_surface_gpu_flush(b->surf);
++			g_stat.flushed += b->mmapsize;
 +		}
-+		/*
-+		 * A hung / timed-out submit (rc != 0) must NOT return an error here. Returning EIO leaves
-+		 * Mesa's out_fence->kfence == 0 (msm_ringbuffer_sp.c:152 only sets kfence when the ioctl
-+		 * succeeds), so the gallium batch that owns this submit's BOs is never retired and its
-+		 * ~14 BOs are never freed -- no GEM_CLOSE, no madvise. Over a few minutes of compositing
-+		 * that leaks ~2.6 GB (measured: 184 hung submits x ~14.1 BOs ~= 2600 never-freed BOs) and
-+		 * backboardd OOM-panics: THE root cause of the "dies after 1-3 min" crash. So fall through
-+		 * and retire the fence anyway (below): Mesa tears the batch down and frees its BOs. The
-+		 * hung frame itself is dropped/garbled until the CP-wedge root cause is fixed, but the
-+		 * device stays alive. We deliberately do NOT SW_RESET the CP -- ok/hang submits interleave
-+		 * in the log (the CP recovers for the next submit), and a block reset would require
-+		 * re-bootstrapping the CP microcode + ring. Diagnostics (HANG + IBDUMP) above still fire.
-+		 */
 +	}
-+	*out_fence = ++g_drm_fence;   /* synchronous: retired on return (hung submits retire too, see above) */
++	__asm__ volatile("dsb sy" ::: "memory");             /* and what was written last is in memory */
++	fence = gpu_submit(ibva, ibdw, n);
++	if (fence == 0) {
++		return EIO;                                      /* the ring stayed full: the core is not reading it */
++	}
++	for (i = 0; i < s->nr_bos; i += j) {
++		unsigned m = s->nr_bos - i < 32u ? s->nr_bos - i : 32u;
++		if (copyin((user_addr_t)(s->bos + (uint64_t)i * sizeof(chunk[0])), chunk, m * sizeof(chunk[0])) != 0) { break; }
++		for (j = 0; j < m; j++) {
++			struct kgsl_bo_ent *b = kgsl_bo_find(chunk[j].handle);
++			if (b != NULL) { b->fence = fence; }
++		}
++	}
++	gpu_reap();
++	/* every five seconds in which something was submitted: how much, and what it cost (RedwoodGPU) */
++	g_stat.submissions++;
++	g_stat.commands += n;
++	g_stat.buffers += s->nr_bos;
++	if (g_stat.since == 0) { g_stat.since = began; }
++	absolutetime_to_nanoseconds(mach_absolute_time() - g_stat.since, &nanos);
++	if (nanos >= 5ull * NSEC_PER_SEC) {
++		uint64_t waiting;
++		absolutetime_to_nanoseconds(g_waiting, &waiting);
++		printf("SWEET DRM: %u submissions in %llu ms (%u IBs, %u buffers named, %llu KB of surfaces out of the cache); "
++		    "fence %u done %u; buffers: %u made, %u kept ones given again, %u given back, %u left, %llu MB kept; "
++		    "%u buffers %llu MB; %u waits of %llu us; va %llu MB in %u, %u holes (%u most), %llu KB lost, %u refused\n",
++		    g_stat.submissions, nanos / NSEC_PER_MSEC, g_stat.commands, g_stat.buffers, g_stat.flushed >> 10,
++		    g_fence, *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF),
++		    g_stat.made, g_stat.given_again, g_stat.closed, g_left_count, g_kept_bytes >> 20,
++		    g_bo_count, g_bo_bytes >> 20, g_waits, g_waits ? waiting / NSEC_PER_USEC / g_waits : 0,
++		    gpu_va_used >> 20, gpu_va_live, gpu_free_count, gpu_va_holes, gpu_va_lost >> 10, gpu_va_refused);
++		bzero(&g_stat, sizeof(g_stat));
++		g_waits = 0;
++		g_waiting = 0;
++	}
++	*out_fence = fence;
 +	return 0;
++}
++
++/* How long from now an msm time is, in milliseconds (0: now or past), at most GPU_PATIENCE_MS.
++ * msm's clock goes on while the machine sleeps (CLOCK_MONOTONIC on Darwin), as RedwoodGPU has it. */
++static uint64_t
++drm_ms_until(const struct drm_msm_timespec *when)
++{
++	uint64_t now;
++	int64_t left;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	left = when->tv_sec * (int64_t)NSEC_PER_SEC + when->tv_nsec - (int64_t)now;
++	if (left <= 0) {
++		return 0;
++	}
++	return (uint64_t)left / NSEC_PER_MSEC > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : (uint64_t)left / NSEC_PER_MSEC;
 +}
 +
 +/* ---- BO CPU-map (Route B): iOS has no cdev mmap() path, so instead of
@@ -2765,21 +3308,25 @@
 +		printf("SWEET DRM: gem_mmap vm_map id=%u kr=%d\n", bo->id, kr);
 +		return ENOMEM;
 +	}
-+	printf("SWEET DRM: gem_mmap id=%u iova=%#llx -> uva=%#llx size=%#lx (WC)\n",
-+	    bo->id, (unsigned long long)bo->gpuaddr, (unsigned long long)uaddr,
-+	    (unsigned long)bo->mmapsize);
++	{
++		static uint32_t told;
++		if (told++ < 16u) {
++			printf("SWEET DRM: gem_mmap id=%u iova=%#llx -> uva=%#llx size=%#lx (WC)\n",
++			    bo->id, (unsigned long long)bo->gpuaddr, (unsigned long long)uaddr,
++			    (unsigned long)bo->mmapsize);
++		}
++	}
 +	*out_uaddr = (uint64_t)uaddr;
 +	return 0;
 +}
 +
 +/* ---- Zero-copy IOSurface import (MSM_INFO_IOS_IMPORT) ---------------------
-+ * Map an IOSurface's wired backing pages into the GPU and return a GEM handle
-+ * that freedreno samples DIRECTLY (eglCreateImageKHR dma-buf path, fd==handle),
-+ * replacing the per-frame glTexImage2D copy that allocated a fresh ~12 MB BO
-+ * each frame and never freed it (the OOM). The imported BO has cva==0, so
-+ * kgsl_free_bo_ent() only clears its PTEs and never kmem_free's the surface's
-+ * own backing. Cached per surface id so a re-import reuses the one BO (no VA or
-+ * handle growth). This is the HackiOS zero-copy path, finally wired up. */
++ * Port of HackiOS RedwoodGPUUserClient::surfaceBuffer: the memory of an IOSurface as a GEM
++ * buffer, which freedreno samples or draws into DIRECTLY (eglCreateImageKHR dma-buf path,
++ * fd==handle) instead of a glTexImage2D copy per frame. The surface is held for as long as the
++ * buffer is there (a surface freed under a GPU mapping would be memory the GPU still writes).
++ * A surface that is a buffer already is that buffer again, as with Linux's handles. Mapped
++ * uncached; its CPU-written pixels are pushed out of the cache by the submissions naming it. */
 +#define MSM_INFO_IOS_IMPORT 0x85u
 +extern int sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages,
 +    unsigned *npages, uint32_t *allocSize, uint32_t *width, uint32_t *height,
@@ -2792,37 +3339,84 @@
 +	unsigned i, npages = 0;
 +	uint32_t allocSize = 0, w = 0, h = 0, bpr = 0, fmt = 0;
 +	uint64_t gpuaddr = 0;
++	struct kgsl_bo_ent *b;
++	void *surf;
 +	if (surf_id == 0u) { return EINVAL; }
-+	for (i = 0; i < KGSL_MAX_BO; i++) {   /* reuse an existing import of the same surface */
-+		if (g_bo[i].used && g_bo[i].surf_id == surf_id) { *out_handle = g_bo[i].id; return 0; }
++	for (i = 0; i < KGSL_MAX_BO; i++) {   /* a surface that is a buffer already is that buffer */
++		if (g_bo[i].used == 1 && g_bo[i].surf_id == surf_id) { *out_handle = g_bo[i].id; return 0; }
 +	}
++	if ((b = kgsl_bo_slot()) == NULL) { return ENOMEM; }
++	if ((surf = sweet_surface_gpu_ref(surf_id)) == NULL) { return ENOENT; }
 +	if (sweet_surface_gpu_pages(surf_id, g_import_pa, SWEET_IMPORT_MAX_PAGES, &npages,
 +	        &allocSize, &w, &h, &bpr, &fmt) != 0 || npages == 0u) {
-+		printf("SWEET DRM: ios_import surf %u FAILED (pages)\n", surf_id); gmub_flush();
++		sweet_surface_gpu_unref(surf);
++		printf("SWEET DRM: ios_import surf %u FAILED (pages)\n", surf_id);
 +		return EINVAL;
 +	}
 +	if (gpu_gpumem_map_phys(g_import_pa, npages, &gpuaddr) != 0) {
-+		printf("SWEET DRM: ios_import surf %u FAILED (map %u pages)\n", surf_id, npages); gmub_flush();
++		sweet_surface_gpu_unref(surf);
++		printf("SWEET DRM: ios_import surf %u FAILED (map %u pages)\n", surf_id, npages);
 +		return ENOMEM;
 +	}
-+	for (i = 0; i < KGSL_MAX_BO; i++) { if (!g_bo[i].used) { break; } }
-+	if (i == KGSL_MAX_BO) { return ENOMEM; }
-+	g_bo[i].used = 1;
-+	g_bo[i].id = g_mmap_page_next;
++	bzero(b, sizeof(*b));
++	b->used = 1;
++	b->id = g_mmap_page_next;
 +	g_mmap_page_next += npages;
-+	g_bo[i].gpuaddr = gpuaddr;
-+	g_bo[i].pa = g_import_pa[0];
-+	g_bo[i].cpu_nc = 0;
-+	g_bo[i].cva = 0;                 /* imported: free clears PTEs only, never the surface backing */
-+	g_bo[i].size = allocSize;
-+	g_bo[i].mmapsize = (vm_size_t)npages * 0x1000u;
-+	g_bo[i].flags = 0;
-+	g_bo[i].pid = proc_selfpid();
-+	g_bo[i].surf_id = surf_id;
-+	*out_handle = g_bo[i].id;
-+	printf("SWEET DRM: ios_import surf %u -> handle %u gpuaddr %#llx %ux%u fmt %#x (%u pages, zero-copy)\n",
-+	    surf_id, g_bo[i].id, (unsigned long long)gpuaddr, w, h, fmt, npages); gmub_flush();
++	b->gpuaddr = gpuaddr;
++	b->pa = g_import_pa[0];
++	b->cpu_nc = 0;
++	b->cva = 0;                 /* the surface's memory: never kmem_free'd here */
++	b->size = allocSize;
++	b->mmapsize = (vm_size_t)npages * 0x1000u;
++	b->flags = 0;
++	b->pid = proc_selfpid();
++	b->surf_id = surf_id;
++	b->surf = surf;
++	b->seed = sweet_surface_gpu_seed(surf) - 1u;   /* pushed out of the cache before its first use */
++	g_bo_count++;
++	g_bo_bytes += b->mmapsize;
++	kgsl_bo_hint(b);
++	g_stat.surfaces++;
++	*out_handle = b->id;
++	{
++		static uint32_t told;
++		if (told++ < 16u) {
++			printf("SWEET DRM: ios_import surf %u -> handle %u gpuaddr %#llx %ux%u fmt %#x (%u pages, zero-copy)\n",
++			    surf_id, b->id, (unsigned long long)gpuaddr, w, h, fmt, npages);
++		}
++	}
 +	return 0;
++}
++
++/* For the display (SweetSurface.cpp AppleCLCD::swap, as HackiOS MiniIOSurfaceDrawn): wait,
++ * at most `ms`, for the GPU to be done with the last submission that named surface `surf_id`.
++ * 1: done (or the GPU never had it); 0: not done in time -- shown as it is. */
++int
++sweet_gpu_surface_wait(uint32_t surf_id, uint32_t ms)
++{
++	uint32_t fence = 0;
++	unsigned i;
++	int done = 1;
++	if (g_gpu_mtx == NULL || !g_kgsl_ready || surf_id == 0u) {
++		return 1;
++	}
++	gpu_lock();
++	for (i = 0; i < KGSL_MAX_BO; i++) {
++		if (g_bo[i].used == 1 && g_bo[i].surf_id == surf_id && g_bo[i].fence != 0 &&
++		    (fence == 0 || (int32_t)(g_bo[i].fence - fence) > 0)) {
++			fence = g_bo[i].fence;
++		}
++	}
++	for (i = 0; i < g_left_count; i++) {      /* given back already, the GPU still at it */
++		if (g_left[i].surf_id == surf_id && (fence == 0 || (int32_t)(g_left[i].fence - fence) > 0)) {
++			fence = g_left[i].fence;
++		}
++	}
++	if (fence != 0 && !gpu_wait(fence, ms)) {
++		done = 0;
++	}
++	gpu_unlock();
++	return done;
 +}
 +
 +/* ---- On-screen present (Stage P1) ----------------------------------------
@@ -2989,15 +3583,11 @@
 +	return copyout(g_panel_thumb, ubuf, (vm_size_t)gw * gh * 4u);
 +}
 +
++#define MSM_PREP_NOSYNC 0x04u
++/* With the lock held (drm_ioctl). */
 +static int
-+drm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++drm_ioctl_locked(unsigned nr, caddr_t data)
 +{
-+	unsigned nr  = (unsigned)(cmd & 0xffu);
-+	unsigned typ = (unsigned)((cmd >> 8) & 0xffu);
-+	if (typ != DRM_IOC_TYPE) {
-+		return ENOTTY;
-+	}
-+	printf("SWEET DRM: ioctl nr=%#x\n", nr);
 +	switch (nr) {
 +	case DRM_NR_VERSION: {
 +		struct drm_version *v = (struct drm_version *)data;
@@ -3018,8 +3608,7 @@
 +	}
 +	case DRM_NR_GEM_CLOSE: {
 +		struct drm_gem_close *gc = (struct drm_gem_close *)data;
-+		(void)kgsl_do_gpumem_free(gc->handle);
-+		return 0;
++		return kgsl_do_gpumem_free(gc->handle) == 0 ? 0 : EINVAL;
 +	}
 +	case DRM_NR_MSM_GET_PARAM: {
 +		struct drm_msm_param *mp = (struct drm_msm_param *)data;
@@ -3074,8 +3663,24 @@
 +		default: return EINVAL;   /* SET_NAME/METADATA optional; freedreno degrades */
 +		}
 +	}
-+	case DRM_NR_MSM_GEM_CPU_PREP:
-+		return 0;                 /* synchronous submit => GPU already idle on the BO */
++	case DRM_NR_MSM_GEM_CPU_PREP: {
++		/* Is the GPU done with a buffer (RedwoodGPU kMsmGemCpuPrep): its last submission here,
++		 * all it has been given if the buffer is not known. NOTE the shim encodes this request
++		 * Linux-_IOW, which XNU reads as IOC_OUT: nothing is copied in, so the request comes
++		 * zeroed -- then it is waited for as for no limit, all the GPU has been given. */
++		struct drm_msm_gem_cpu_prep *cp = (struct drm_msm_gem_cpu_prep *)data;
++		struct kgsl_bo_ent *bo = cp->handle ? kgsl_bo_find(cp->handle) : NULL;
++		uint32_t fence = bo ? bo->fence : gpu_last();
++		uint64_t ms;
++		if (cp->op & MSM_PREP_NOSYNC) {
++			ms = 0;
++		} else if (cp->timeout.tv_sec == 0 && cp->timeout.tv_nsec == 0) {
++			ms = GPU_PATIENCE_MS;
++		} else {
++			ms = drm_ms_until(&cp->timeout);
++		}
++		return gpu_wait(fence, ms) ? 0 : EBUSY;
++	}
 +	case DRM_NR_MSM_GEM_SUBMIT: {
 +		struct drm_msm_gem_submit *s = (struct drm_msm_gem_submit *)data;
 +		uint32_t fence = 0;
@@ -3084,22 +3689,21 @@
 +		s->fence = fence;
 +		return 0;
 +	}
-+	case DRM_NR_MSM_WAIT_FENCE:
-+		return 0;                 /* synchronous submit => target already retired */
++	case DRM_NR_MSM_WAIT_FENCE: {
++		/* RedwoodGPU kMsmWaitFence. Zeroed (see CPU_PREP): all the GPU has been given. */
++		struct drm_msm_wait_fence *wf = (struct drm_msm_wait_fence *)data;
++		uint32_t fence = wf->fence ? wf->fence : gpu_last();
++		uint64_t ms = (wf->timeout.tv_sec == 0 && wf->timeout.tv_nsec == 0) ? GPU_PATIENCE_MS :
++		    drm_ms_until(&wf->timeout);
++		return gpu_wait(fence, ms) ? 0 : ETIMEDOUT;
++	}
 +	case DRM_NR_MSM_GEM_MADVISE: {
++		/* RedwoodGPU: retained, always. Nothing here takes a buffer's memory away while its
++		 * handle is somebody's -- Mesa's cache gives an idle buffer back itself (GEM_CLOSE),
++		 * and freeing it under the handle (as was done here) left Mesa a mapped, cached,
++		 * possibly still-submitted buffer whose memory and addresses were someone else's. */
 +		struct drm_msm_gem_madvise *gm = (struct drm_msm_gem_madvise *)data;
-+		/* Mesa/freedreno's fd_bo cache marks idle BOs WONTNEED (madv=1) when it
-+		 * puts them in its cache, expecting the kernel to reclaim under pressure.
-+		 * The old no-op (always retained=1) meant NOTHING was ever reclaimed, so
-+		 * cached BOs accumulated unbounded -> kmem OOM panic. Purge the backing
-+		 * now on WONTNEED (bounds memory; Mesa re-inits on reuse via WILLNEED and
-+		 * retained=0). WILLNEED (madv=0) reports whether the BO is still backed. */
-+		if (gm->madv != 0u) {
-+			(void)kgsl_do_gpumem_free(gm->handle);   /* free PTEs + wired backing; no-op if already gone */
-+			gm->retained = 0u;
-+		} else {
-+			gm->retained = (kgsl_bo_find(gm->handle) != NULL) ? 1u : 0u;
-+		}
++		gm->retained = 1u;
 +		return 0;
 +	}
 +	case DRM_NR_MSM_SUBMITQUEUE_NEW: {
@@ -3113,6 +3717,24 @@
 +	default:
 +		return ENOTTY;
 +	}
++}
++
++static int
++drm_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
++{
++	unsigned nr  = (unsigned)(cmd & 0xffu);
++	unsigned typ = (unsigned)((cmd >> 8) & 0xffu);
++	int e;
++	if (typ != DRM_IOC_TYPE) {
++		return ENOTTY;
++	}
++	gpu_lock();
++	e = drm_ioctl_locked(nr, data);
++	gpu_unlock();
++	if (e == ENOTTY) {
++		printf("SWEET DRM: ioctl nr=%#x is not known here\n", nr);
++	}
++	return e;
 +}
 +
 +static const struct cdevsw drm_cdevsw = {
@@ -3149,10 +3771,13 @@
 +		return;
 +	}
 +	(void)drm_do_get_param(MSM_PARAM_CHIP_ID, &chip);
++	gpu_lock();
 +	if (kgsl_do_gpumem_alloc(PAGE_SIZE, 0x20000u /*MSM_BO_WC*/, &ib) != 0 ||
 +	    kgsl_do_gpumem_alloc(PAGE_SIZE, 0x20000u, &dst) != 0) {
++		gpu_unlock();
 +		printf("SWEET DRM: [V] GEM_NEW FAIL\n"); return;
 +	}
++	gpu_unlock();
 +	*(volatile uint32_t *)dst->cpu_nc = 0;
 +	((volatile uint32_t *)ib->cpu_nc)[0] = cp_type7(0x3Du, 3u);     /* CP_MEM_WRITE -> dst iova */
 +	((volatile uint32_t *)ib->cpu_nc)[1] = (uint32_t)dst->gpuaddr;
@@ -3162,8 +3787,10 @@
 +	gpu_dcache_clean(dst->cpu_nc, PAGE_SIZE);
 +	__asm__ volatile("dsb sy" ::: "memory");
 +	ibva = ib->gpuaddr; ibdw = 4u;
++	gpu_lock();
 +	rc = kgsl_submit_ibs(&ibva, &ibdw, 1);
-+	if (rc == 0) { fence = ++g_drm_fence; } else { fence = 0; }
++	fence = rc == 0 ? gpu_last() : 0;
++	gpu_unlock();
 +	gpu_dcache_clean(dst->cpu_nc, PAGE_SIZE);   /* invalidate: CPU re-reads GPU-written DRAM */
 +	got = *(volatile uint32_t *)dst->cpu_nc;
 +	printf("SWEET DRM: [V] MSM GEM SELFTEST chip_id=%#llx gem_ib=%u(iova=%#llx) gem_dst=%u(iova=%#llx) "
@@ -3179,18 +3806,33 @@
 +static void
 +gpu_drm_init(void)
 +{
++	if (g_drm_major < 0) {
++		return;                 /* not registered (gpu_nodes_register) */
++	}
++	printf("SWEET DRM: /dev/dri/renderD128 (major=%d) name=msm -> MSM-DRM render node "
++	    "for gallium-freedreno GLES\n", g_drm_major);
++	gpu_stage_v();
++}
++
++/* Both device nodes, before the bring-up starts: an open waits for it (kgsl_open). Nothing of
++ * the GPU is touched here. */
++static void
++gpu_nodes_register(void)
++{
++	g_kgsl_major = cdevsw_add(-1, &kgsl_cdevsw);
++	if (g_kgsl_major < 0) {
++		printf("SWEET KGSL: cdevsw_add failed\n");
++	} else {
++		devfs_make_node(makedev(g_kgsl_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "kgsl-3d0");
++	}
 +	g_drm_major = cdevsw_add(-1, &drm_cdevsw);
 +	if (g_drm_major < 0) {
 +		printf("SWEET DRM: cdevsw_add failed\n");
-+		return;
++	} else {
++		/* Mesa's libdrm shim opens this node (drmOpenWithType("msm",...)); drmGetVersion
++		 * must then report name="msm". */
++		devfs_make_node(makedev(g_drm_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "dri/renderD128");
 +	}
-+	/* Mesa's libdrm shim opens this node (drmOpenWithType("msm",...)); drmGetVersion
-+	 * must then report name="msm". If devfs rejects the subdir form, fall back to a
-+	 * flat name and point the shim's IOS_DRM_RENDER_NODE at it. */
-+	devfs_make_node(makedev(g_drm_major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "dri/renderD128");
-+	printf("SWEET DRM: /dev/dri/renderD128 registered (major=%d) name=msm -> MSM-DRM render node "
-+	    "for gallium-freedreno GLES\n", g_drm_major);
-+	gpu_stage_v();
 +}
 +
 +static void
@@ -3395,10 +4037,22 @@
 +{
 +	(void)arg;
 +	(void)wr;
-+	gpu_sleep(45); /* let USB CDC-ECM + host log capture fully come up first;
-+	                * v19 printed the probe before the link flowed -> lost. 45s
-+	                * puts the probe well after the link is stable. */
++	/* The bring-up used to wait 45 s for the USB log capture to come up, so that its lines were
++	 * not lost -- and the window server, starting at 30-60 s, raced it (see kgsl_open). Now the
++	 * nodes are there first and an open waits for the GPU; boot-arg sweetgpu_delay=S still
++	 * delays the bring-up for a run that needs its lines over USB. */
++	{
++		uint32_t delay_s = 0;
++		(void)PE_parse_boot_argn("sweetgpu_delay", &delay_s, sizeof(delay_s));
++		gpu_nodes_register();
++		if (delay_s != 0) {
++			gpu_sleep(delay_s);
++		}
++	}
 +	gpu_probe();
++	g_gpu_boot_done = 1;
++	thread_wakeup((event_t)&g_gpu_boot_done);
++	printf("SWEET GPU: bring-up over: %s\n", g_kgsl_ready ? "the GPU is kept for the window server" : "NO GPU (software)");
 +	/* Auto-reboot to fastboot via TZ-mediated PON write (SCM_IO_WRITE) for a
 +	 * HANDS-FREE dev loop. Direct EL1 SPMI write XPU-faults (v17), so the write
 +	 * now goes through EL3. Runs AFTER all GPU output is printed+flushed (6s), so
@@ -3433,6 +4087,8 @@
 +		return;
 +	}
 +	gpu_level = enabled;
++	g_gpu_grp = lck_grp_alloc_init("sweet_gpu", LCK_GRP_ATTR_NULL);
++	g_gpu_mtx = lck_mtx_alloc_init(g_gpu_grp, LCK_ATTR_NULL);
 +	kern_return_t kr = kernel_thread_start(gpu_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);

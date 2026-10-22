@@ -1,0 +1,105 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a340be0..e14b23b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -292,6 +292,10 @@ get32(const uint8_t *p, uint32_t off)
+ }
+ 
+ static uint32_t sweet_fb_swaps_logged;
++
++/* sweet_gpu.c: wait for the GPU to be done with the last submission naming a surface. */
++extern "C" int sweet_gpu_surface_wait(uint32_t surf_id, uint32_t ms);
++#define SWEET_SWAP_GPU_MS 100   /* a frame the GPU has not drawn by then is shown as it is (HackiOS: 500; the vsync workloop waits here) */
+ static uint64_t sweet_fb_swap_count;
+ 
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+@@ -352,6 +356,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		/* the GPU may still be drawing it (submissions are not waited for): HackiOS MiniIOSurfaceDrawn */
++		if (!sweet_gpu_surface_wait(id, SWEET_SWAP_GPU_MS)) {
++			static uint32_t told;
++			if (told++ < 8) {
++				IOLog("SWEET FB: present: the GPU is not done with surface %u after %u ms; shown as it is\n",
++				    id, SWEET_SWAP_GPU_MS);
++			}
++		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index db6f711..506a05b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -202,11 +202,12 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
+ 	IOByteCount off;
+ 	if (s == NULL) { return -1; }
+ 	if (s->memory == NULL) { s->release(); return -1; }
+-	for (off = 0; off < s->allocSize; off += PAGE_SIZE) {
++	/* One entry per 4K GPU page (the GPU maps 4K pages; a 16K kernel page is four of them). */
++	for (off = 0; off < s->allocSize; off += 4096) {
+ 		IOByteCount seglen = 0;
+ 		addr64_t phys = s->memory->getPhysicalSegment(off, &seglen, kIOMemoryMapperNone);
+ 		if (phys == 0 || n >= maxpages) { s->release(); return -1; }
+-		pa[n++] = (uint64_t)(phys & ~((addr64_t)PAGE_MASK));
++		pa[n++] = (uint64_t)(phys & ~((addr64_t)4095));
+ 	}
+ 	*npages = n;
+ 	*allocSize = s->allocSize;
+@@ -216,6 +217,55 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
+ 	return 0;
+ }
+ 
++/*
++ * The GPU's hold on a surface (HackiOS RedwoodGPU surfaceBuffer: "the surface is held for as
++ * long as the buffer is there"), its seed (bumped by whoever writes it and unlocks it), and
++ * its pixels pushed out of this processor's cache: the GPU maps surfaces uncached, and what a
++ * CPU writer left in the cache would otherwise be read stale -- and evict later over what the
++ * GPU drew. Cache maintenance by VA acts on the physical lines whatever the VA's attributes,
++ * so the buffer's own (cached) kernel address is used when there is one, else the kernel map.
++ */
++extern "C" void *
++sweet_surface_gpu_ref(uint32_t id)
++{
++	return sweet_surface_copy(id);
++}
++
++extern "C" void
++sweet_surface_gpu_unref(void *surface)
++{
++	if (surface != NULL) {
++		((SweetSurface *)surface)->release();
++	}
++}
++
++extern "C" uint32_t
++sweet_surface_gpu_seed(void *surface)
++{
++	return *sweet_surface_seed((SweetSurface *)surface);
++}
++
++extern "C" void
++sweet_surface_gpu_flush(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	IOBufferMemoryDescriptor *bmd;
++	uintptr_t va, line, end;
++	if (s == NULL || s->memory == NULL) {
++		return;
++	}
++	bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	va = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
++	if (va == 0) {
++		return;
++	}
++	end = va + s->memory->getLength();
++	for (line = va & ~(uintptr_t)63; line < end; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ /* The table lock; the framebuffer may publish a surface before the root starts. */
+ static void
+ sweet_surface_init_lock(void)

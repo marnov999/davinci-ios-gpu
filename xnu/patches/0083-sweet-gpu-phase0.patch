@@ -2792,7 +2792,7 @@
 +	di->chip_id = 0x06010800u;         /* Adreno a618 - the field turnip derives gpu_id 618 from */
 +	di->mmu_enabled = 1;               /* stage-1 pagetables are up */
 +	di->gpu_id = 618;
-+	di->gmem_sizebytes = 0x100000u;    /* a618 GMEM = 1 MiB */
++	di->gmem_sizebytes = 0x80000u;     /* a618 GMEM = 512 KB (Linux adreno_device.c SZ_512K) */
 +}
 +
 +/*
@@ -3135,7 +3135,7 @@
 +	switch (param) {
 +	case MSM_PARAM_CHIP_ID:   *out = 0x06010800ull; return 0;  /* the field freedreno derives gen from */
 +	case MSM_PARAM_GPU_ID:    *out = 618u;          return 0;
-+	case MSM_PARAM_GMEM_SIZE: *out = 0x100000u;     return 0;
++	case MSM_PARAM_GMEM_SIZE: *out = 0x80000u;      return 0;  /* a618: 512 KB (Linux adreno_device.c SZ_512K); 1 MB made Mesa's bins overlap */
 +	case MSM_PARAM_GMEM_BASE: *out = 0x100000u;     return 0;
 +	case MSM_PARAM_MAX_FREQ:  *out = 500000000u;    return 0;
 +	case MSM_PARAM_TIMESTAMP: *out = mach_absolute_time(); return 0;

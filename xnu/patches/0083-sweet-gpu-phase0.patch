@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,3303 @@
+@@ -0,0 +1,3314 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2990,7 +2990,18 @@
 +		return 0;                 /* synchronous submit => target already retired */
 +	case DRM_NR_MSM_GEM_MADVISE: {
 +		struct drm_msm_gem_madvise *gm = (struct drm_msm_gem_madvise *)data;
-+		gm->retained = 1;
++		/* Mesa/freedreno's fd_bo cache marks idle BOs WONTNEED (madv=1) when it
++		 * puts them in its cache, expecting the kernel to reclaim under pressure.
++		 * The old no-op (always retained=1) meant NOTHING was ever reclaimed, so
++		 * cached BOs accumulated unbounded -> kmem OOM panic. Purge the backing
++		 * now on WONTNEED (bounds memory; Mesa re-inits on reuse via WILLNEED and
++		 * retained=0). WILLNEED (madv=0) reports whether the BO is still backed. */
++		if (gm->madv != 0u) {
++			(void)kgsl_do_gpumem_free(gm->handle);   /* free PTEs + wired backing; no-op if already gone */
++			gm->retained = 0u;
++		} else {
++			gm->retained = (kgsl_bo_find(gm->handle) != NULL) ? 1u : 0u;
++		}
 +		return 0;
 +	}
 +	case DRM_NR_MSM_SUBMITQUEUE_NEW: {

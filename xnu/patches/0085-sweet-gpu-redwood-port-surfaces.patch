@@ -29,7 +29,7 @@ index a340be0..e14b23b 100644
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index db6f711..506a05b 100644
+index db6f711..d5344a6 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -202,11 +202,12 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
@@ -103,3 +103,22 @@ index db6f711..506a05b 100644
  /* The table lock; the framebuffer may publish a surface before the root starts. */
  static void
  sweet_surface_init_lock(void)
+@@ -948,6 +998,18 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 6:         /* WrapClientImage: a surface around memory of the caller's own */
++	case 7:         /* WrapClientMemory */
++		/*
++		 * Not done here, and said so (HackiOS MiniIOSurface: kIOReturnUnsupported). The
++		 * framework then returns NULL and CoreAnimation uploads the picture as an ordinary
++		 * texture. Answered "success" with nothing filled in (the default below), the
++		 * framework made an empty surface (id 0, no memory, null color info): the GPU
++		 * renderer drew the lock screen's text and pictures from it as black, and the
++		 * window server crashed on its color info.
++		 */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {

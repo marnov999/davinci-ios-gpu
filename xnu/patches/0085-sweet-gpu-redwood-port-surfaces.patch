@@ -29,14 +29,17 @@ index a340be0..e14b23b 100644
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index db6f711..d5344a6 100644
+index db6f711..4eec4ff 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -202,11 +202,12 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
+@@ -202,11 +202,15 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
  	IOByteCount off;
  	if (s == NULL) { return -1; }
  	if (s->memory == NULL) { s->release(); return -1; }
 -	for (off = 0; off < s->allocSize; off += PAGE_SIZE) {
++	/* Memory of a program's own with a surface made around it is not in whole pages, and seldom
++	 * in rows the GPU takes (HackiOS surfaceBuffer refuses it): the GL bridge copies it instead. */
++	if (s->wrapped) { s->release(); return -1; }
 +	/* One entry per 4K GPU page (the GPU maps 4K pages; a 16K kernel page is four of them). */
 +	for (off = 0; off < s->allocSize; off += 4096) {
  		IOByteCount seglen = 0;
@@ -47,7 +50,7 @@ index db6f711..d5344a6 100644
  	}
  	*npages = n;
  	*allocSize = s->allocSize;
-@@ -216,6 +217,55 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
+@@ -216,6 +220,55 @@ sweet_surface_gpu_pages(uint32_t id, uint64_t *pa, unsigned maxpages, unsigned *
  	return 0;
  }
  
@@ -103,7 +106,56 @@ index db6f711..d5344a6 100644
  /* The table lock; the framebuffer may publish a surface before the root starts. */
  static void
  sweet_surface_init_lock(void)
-@@ -948,6 +998,18 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -633,9 +686,13 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut)
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	/* The creator of a surface around its own memory has the pixels where they are: it is
++	 * told that address, and nothing is mapped a second time (HackiOS returnSurface). */
++	if (!(s->wrapped && s->clientTask == fTask)) {
++		ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	}
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+-	if (ref->data == NULL || ref->state == NULL) {
++	if ((ref->data == NULL && !(s->wrapped && s->clientTask == fTask)) || ref->state == NULL) {
+ 		ref->release();
+ 		return kIOReturnVMError;
+ 	}
+@@ -673,7 +730,7 @@ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x00, ref->data != NULL ? ref->data->getAddress() : s->clientAddress);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -836,10 +893,22 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			s->wrapped = true;
+ 			s->clientTask = fTask;
+ 			s->clientAddress = wrapAddr->unsigned64BitValue();
++			/* As HackiOS MiniIOSurface: the memory is as big as its owner says, not a byte
++			 * more (rounding up to whole pages ran past the owner's allocation and the
++			 * hold failed: every icon CoreAnimation wraps came back kIOReturnVMError), and
++			 * a picture that is only shown is held for reading (kIODirectionOut: the
++			 * device reads it) when it cannot be held for writing -- kIODirectionIn, as
++			 * here before, wants it writable too. */
++			{
++				uint64_t need = (uint64_t)s->offset +
++				    (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++				uint64_t told = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++				s->allocSize = (uint32_t)(told > need ? told : need);
++			}
+ 			for (int a = 0; a < 2 && held != kIOReturnSuccess; a++) {   /* InOut, then read-only */
+ 				OSSafeReleaseNULL(md);
+ 				md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)s->clientAddress,
+-				    s->allocSize, (a == 0 ? kIODirectionInOut : kIODirectionIn), s->clientTask);
++				    s->allocSize, (a == 0 ? kIODirectionInOut : kIODirectionOut), s->clientTask);
+ 				held = (md != NULL) ? md->prepare() : kIOReturnNoMemory;
+ 			}
+ 			if (held != kIOReturnSuccess) {
+@@ -948,6 +1017,18 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  		sweet_surf_log_once("sel", selector);
  		return kIOReturnSuccess;
  	}

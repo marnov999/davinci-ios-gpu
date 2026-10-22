@@ -1,8 +1,145 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a340be0..e14b23b 100644
+index a340be0..39d7e7f 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -292,6 +292,10 @@ get32(const uint8_t *p, uint32_t off)
+@@ -49,7 +49,9 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -99,6 +101,31 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 
++	/*
++	 * Putting a frame on the panel is a copy of ~10 MB by the CPU (there is no display
++	 * controller of ours behind the framebuffer). As HackiOS MiniIOMobileFramebuffer does it:
++	 * read from the surface's own cached kernel address (the GPU's surfaces are pushed out of
++	 * this processor's cache before every submission that names them, so nothing stale is
++	 * there), not the write-combined mapping -- reads through that one are uncached, and a
++	 * frame took tens of milliseconds -- and share the rows out among helper threads on the
++	 * other cores (boot-arg sweetfb_threads, default 3: the presenting thread and two helpers).
++	 */
++	struct RowJob {
++		uintptr_t src;          /* first pixel of the first row to copy */
++		uint64_t  stride;       /* bytes from one source row to the next */
++		uintptr_t dst;          /* first pixel of the first panel row */
++		uint64_t  rowBytes;     /* bytes from one panel row to the next */
++		size_t    bytes;        /* bytes of a row */
++		int32_t   rows;
++	};
++	IOLock            *fHelperLock;
++	const RowJob      *fHelperJob;
++	uint64_t           fHelperGeneration;
++	unsigned           fHelpersBusy, fHelpersStarted, fThreads;
++	static void helperMain(void *self, wait_result_t wr);
++	static void copyRows(const RowJob *job, int32_t y0, int32_t y1);
++	void copyFrame(const RowJob *job);
++
+ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+@@ -192,8 +219,25 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	{
++		uint32_t threads = 3;
++		thread_t thread;
++		PE_parse_boot_argn("sweetfb_threads", &threads, sizeof(threads));
++		fThreads = threads >= 1 && threads <= 8 ? threads : 1;
++		fHelperLock = IOLockAlloc();
++		for (unsigned i = 0; fHelperLock != NULL && i + 1 < fThreads; i++) {
++			if (kernel_thread_start(&AppleCLCD::helperMain, this, &thread) != KERN_SUCCESS) {
++				fThreads = i + 1;
++				break;
++			}
++			thread_deallocate(thread);
++		}
++		if (fHelperLock == NULL) {
++			fThreads = 1;
++		}
++	}
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+@@ -206,6 +250,67 @@ AppleCLCD::start(IOService *provider)
+ 	return true;
+ }
+ 
++void
++AppleCLCD::copyRows(const RowJob *job, int32_t y0, int32_t y1)
++{
++	for (int32_t y = y0; y < y1; y++) {
++		memcpy((void *)(job->dst + (uint64_t)y * job->rowBytes), (const void *)(job->src + (uint64_t)y * job->stride),
++		    job->bytes);
++	}
++}
++
++/* A helper: waits for a frame, copies its share of the rows (share index + 1; the presenter takes 0). */
++void
++AppleCLCD::helperMain(void *self, __unused wait_result_t wr)
++{
++	AppleCLCD *fb = (AppleCLCD *)self;
++	uint64_t done = 0;
++	unsigned index;
++
++	IOLockLock(fb->fHelperLock);
++	index = fb->fHelpersStarted++;
++	IOLockUnlock(fb->fHelperLock);
++	for (;;) {
++		const RowJob *job;
++		IOLockLock(fb->fHelperLock);
++		while (fb->fHelperGeneration == done) {
++			IOLockSleep(fb->fHelperLock, &fb->fHelperGeneration, THREAD_UNINT);
++		}
++		done = fb->fHelperGeneration;
++		job = fb->fHelperJob;
++		IOLockUnlock(fb->fHelperLock);
++		copyRows(job, (int32_t)((int64_t)job->rows * (index + 1) / fb->fThreads),
++		    (int32_t)((int64_t)job->rows * (index + 2) / fb->fThreads));
++		IOLockLock(fb->fHelperLock);
++		if (--fb->fHelpersBusy == 0) {
++			IOLockWakeup(fb->fHelperLock, &fb->fHelpersBusy, true);
++		}
++		IOLockUnlock(fb->fHelperLock);
++	}
++}
++
++/* The rows shared out: the helpers take theirs, this thread the first share, then waits for them. */
++void
++AppleCLCD::copyFrame(const RowJob *job)
++{
++	if (fThreads <= 1 || fHelpersStarted + 1 < fThreads) {
++		copyRows(job, 0, job->rows);
++		return;
++	}
++	IOLockLock(fHelperLock);
++	fHelperJob = job;
++	fHelpersBusy = fThreads - 1;
++	fHelperGeneration++;
++	IOLockWakeup(fHelperLock, &fHelperGeneration, false);
++	IOLockUnlock(fHelperLock);
++	copyRows(job, 0, (int32_t)((int64_t)job->rows / fThreads));
++	IOLockLock(fHelperLock);
++	while (fHelpersBusy != 0) {
++		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
++	}
++	IOLockUnlock(fHelperLock);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -292,6 +397,10 @@ get32(const uint8_t *p, uint32_t off)
  }
  
  static uint32_t sweet_fb_swaps_logged;
@@ -13,10 +150,11 @@ index a340be0..e14b23b 100644
  static uint64_t sweet_fb_swap_count;
  
  /* Copy each enabled layer's surface into the panel memory (no scaling). */
-@@ -352,6 +356,14 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -352,7 +461,17 @@ AppleCLCD::present(const uint8_t *rec)
  			OSSafeReleaseNULL(s);
  			continue;
  		}
+-		uintptr_t src = s->kernelAddress();
 +		/* the GPU may still be drawing it (submissions are not waited for): HackiOS MiniIOSurfaceDrawn */
 +		if (!sweet_gpu_surface_wait(id, SWEET_SWAP_GPU_MS)) {
 +			static uint32_t told;
@@ -25,9 +163,32 @@ index a340be0..e14b23b 100644
 +				    id, SWEET_SWAP_GPU_MS);
 +			}
 +		}
- 		uintptr_t src = s->kernelAddress();
++		/* the surface's own cached address when it has one (see RowJob), else the kernel map */
++		IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++		uintptr_t src = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
  		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+@@ -396,11 +515,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
+-			}
++			RowJob job;
++			job.src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			job.stride = s->bytesPerRow;
++			job.dst = fPixels + (uint64_t)dy * fRowBytes + (uint64_t)dx * 4;
++			job.rowBytes = fRowBytes;
++			job.bytes = (size_t)w * 4;
++			job.rows = h;
++			copyFrame(&job);
+ 		}
+ 		s->release();
+ 	}
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
 index db6f711..4eec4ff 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp

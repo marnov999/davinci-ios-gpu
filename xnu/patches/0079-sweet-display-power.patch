@@ -31,11 +31,14 @@
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -216,6 +224,26 @@
+@@ -216,6 +224,29 @@
  		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
-+	if (fb->fPowerOff) {
++	if (0 && fb->fPowerOff) {   /* POWER-OFF HANDLING DISABLED: backboardd auto-dims the display
++	                             * seconds after boot (no backlight service), which skipped the panel
++	                             * flush and left the screen black. Keep flushing the live rendered
++	                             * frame regardless of power state on this research bench. */
 +		/* Fade out: halve every channel each vsync, then black, then idle. */
 +		uint32_t step = fb->fFadeStep;
 +		if (step <= 6) {
@@ -58,7 +61,7 @@
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
  	uint8_t *rec = NULL;
  	if (flush) {
-@@ -506,6 +534,19 @@
+@@ -506,6 +537,19 @@
  			    args->scalarInput[0] ? "on" : "off");
  		}
  		break;

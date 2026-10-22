@@ -119,7 +119,7 @@
 +#endif /* _SWEET_SURFACE_H */
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -0,0 +1,915 @@
+@@ -0,0 +1,1051 @@
 +/*
 + * Built-in IOSurface for SWEET.
 + *
@@ -175,8 +175,8 @@
 +	kSweetSurfaceTrapDecrementUse   = 1,
 +	kSweetSurfaceTrapLock           = 2,
 +	kSweetSurfaceTrapUnlock         = 3,
-+	kSweetSurfaceTrapRelease        = 4,
-+	kSweetSurfaceTrapReleaseFailed  = 5,
++	kSweetSurfaceTrapDetach         = 4,
++	kSweetSurfaceTrapRelease        = 5,
 +};
 +
 +#define SWEET_SURFACE_RESULT_SIZE       0xa68
@@ -373,11 +373,52 @@
 +	return s;
 +}
 +
++/*
++ * A Mach send right for a surface (IOSurfaceCreateMachPort). It holds a table
++ * user-count on the surface for as long as the port exists, so a surface handed
++ * to another process cannot leave the id table -- a later lookup-by-id from that
++ * process then still finds it (this is what stopped cross-process glyph/icon
++ * surfaces resolving to id 0). Mirrors MiniIOSurface IOSurfaceSendRight (cpp:789)
++ * + makeSendRight surfaceHold (cpp:1340) + IOSurfaceSendRight::free (cpp:806).
++ */
++class SweetSurfaceSendRight : public OSObject {
++	OSDeclareDefaultStructors(SweetSurfaceSendRight);
++
++public:
++	SweetSurface *surface;
++
++	bool init() APPLE_KEXT_OVERRIDE { surface = NULL; return OSObject::init(); }
++	void free() APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetSurfaceSendRight, OSObject);
++
++void
++SweetSurfaceSendRight::free()
++{
++	if (surface != NULL) {
++		sweet_surface_put(surface);     /* drop the table user-count taken in sweet_surface_port_in_task */
++		surface = NULL;
++	}
++	OSObject::free();
++}
++
 +mach_port_name_t
 +sweet_surface_port_in_task(SweetSurface *s, task_t task)
 +{
 +	mach_port_name_t name = 0;
-+	IOUserClient::copyPortNameForObjectInTask(task, s, &name);
++	SweetSurfaceSendRight *right = OSTypeAlloc(SweetSurfaceSendRight);
++	if (right == NULL || !right->init()) {
++		OSSafeReleaseNULL(right);
++		return 0;
++	}
++	if (!sweet_surface_get(s)) {            /* re-insert into the table + bump users for the port's life */
++		right->release();
++		return 0;
++	}
++	right->surface = s;
++	IOUserClient::copyPortNameForObjectInTask(task, right, &name);
++	right->release();                       /* the port holds the only reference now */
 +	return name;
 +}
 +
@@ -401,6 +442,34 @@
 +	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
 +}
 +
++/* Bytes per element when the client did not say (mirrors MiniIOSurface defaultBytesPerElement cpp:365). */
++#define SWEET_FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
++static uint32_t
++sweet_default_bpe(uint32_t format)
++{
++	switch (format) {
++	case SWEET_FOURCC('L', '0', '0', '8'):
++	case SWEET_FOURCC('A', '0', '0', '8'):
++	case 0x00000008:
++		return 1;
++	case SWEET_FOURCC('L', '5', '6', '5'):
++	case SWEET_FOURCC('B', '5', '6', '5'):
++	case SWEET_FOURCC('L', '5', '5', '5'):
++	case SWEET_FOURCC('2', 'v', 'u', 'y'):
++	case SWEET_FOURCC('y', 'u', 'v', 's'):
++	case SWEET_FOURCC('y', 'u', 'v', 'f'):
++	case SWEET_FOURCC('L', '0', '1', '6'):
++	case SWEET_FOURCC('L', '0', '0', 'h'):
++		return 2;
++	case SWEET_FOURCC('R', 'G', 'h', 'A'):
++		return 8;
++	case SWEET_FOURCC('R', 'G', 'f', 'A'):
++		return 16;
++	default:
++		return 4;
++	}
++}
++
 +/* Geometry from the creation properties (IOSurface.h keys). */
 +static IOReturn
 +sweet_surface_layout(SweetSurface *s, OSDictionary *props)
@@ -409,10 +478,11 @@
 +
 +	s->width = sweet_dict_u32(props, "IOSurfaceWidth", 0);
 +	s->height = sweet_dict_u32(props, "IOSurfaceHeight", 0);
-+	s->bytesPerElement = (uint16_t)sweet_dict_u32(props, "IOSurfaceBytesPerElement", 4);
++	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	s->bytesPerElement = (uint16_t)sweet_dict_u32(props, "IOSurfaceBytesPerElement",
++	    sweet_default_bpe(s->pixelFormat));
 +	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
 +	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
-+	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
 +	/* iOS wide-gamut / 10-bit formats CoreAnimation draws as BGRA; our GL bridge renders only
 +	 * single-plane BGRA, so substitute them (matches HackiOS MiniIOSurface) and drop plane info. */
 +	bool sweet_fmt_subst = (s->pixelFormat == 'w30r' || s->pixelFormat == 'l10r' ||
@@ -491,8 +561,9 @@
 +	IOMemoryMap  *data;
 +	IOMemoryMap  *state;
 +	uint32_t      count;
++	bool          detached;         /* client let go (trap 4) but has not released yet (trap 5) */
 +
-+	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { detached = false; return OSObject::init(); }
 +	void free() APPLE_KEXT_OVERRIDE;
 +};
 +
@@ -540,7 +611,7 @@
 +	IOLock  *fLock;
 +	OSArray *fRefs;
 +
-+	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	SweetSurfaceRef *findRef(uint32_t id, bool detached, unsigned int *index);
 +	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut);
 +	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
 +	IOReturn create(IOExternalMethodArguments *args);
@@ -557,6 +628,7 @@
 +	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
 +	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
 +	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
 +	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
 +};
 +
@@ -612,11 +684,11 @@
 +
 +/* Lock held. */
 +SweetSurfaceRef *
-+IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++IOSurfaceRootUserClient::findRef(uint32_t id, bool detached, unsigned int *index)
 +{
 +	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
 +		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
-+		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached == detached) {
 +			if (index != NULL) {
 +				*index = i;
 +			}
@@ -634,7 +706,7 @@
 +IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut)
 +{
 +	IOLockLock(fLock);
-+	SweetSurfaceRef *ref = findRef(s->id, NULL);
++	SweetSurfaceRef *ref = findRef(s->id, false, NULL);
 +	if (ref != NULL && ref->surface == s) {
 +		ref->count++;
 +		IOLockUnlock(fLock);
@@ -660,7 +732,7 @@
 +		return kIOReturnVMError;
 +	}
 +	IOLockLock(fLock);
-+	SweetSurfaceRef *raced = findRef(s->id, NULL);
++	SweetSurfaceRef *raced = findRef(s->id, false, NULL);
 +	if (raced != NULL && raced->surface == s) {
 +		/* Another thread mapped it meanwhile: count there, drop ours. */
 +		raced->count++;
@@ -744,6 +816,40 @@
 +	return kIOReturnSuccess;
 +}
 +
++static uint32_t sweet_surface_lookups_logged;
++
++/*
++ * Log a lookup/return outcome: the surface geometry, whether its backing mapped,
++ * and how much of that backing is non-zero (mirrors MiniIOSurface cpp:1311-1313),
++ * so an empty cross-process result (id 0 in the sampler) can be told apart from a
++ * resolved-but-blank one. Gated: first 64, plus every failure.
++ */
++static void
++sweet_surf_log_lookup(const char *how, uint32_t reqid, SweetSurface *s, IOReturn ret, bool mapped)
++{
++	if (ret == kIOReturnSuccess && sweet_surface_lookups_logged >= 64) {
++		return;
++	}
++	sweet_surface_lookups_logged++;
++	uint32_t id = reqid, w = 0, h = 0, fmt = 0, planes = 0, nonzero = 0, total = 0;
++	if (s != NULL) {
++		id = s->id; w = s->width; h = s->height; fmt = s->pixelFormat; planes = s->planeCount;
++		uintptr_t base = s->kernelAddress();
++		uint64_t len = s->memory != NULL ? s->memory->getLength() : 0;
++		if (base != 0 && len >= 4) {
++			const uint8_t *p = (const uint8_t *)base;
++			for (uint64_t at = 0; at + 4 <= len; at += 64) {
++				nonzero += (p[at] | p[at + 1] | p[at + 2] | p[at + 3]) != 0;
++				total++;
++			}
++		}
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET SURF: %s lookup/%s id %u %ux%u fmt 0x%x planes %u mapped %d nonzero %u/%u -> 0x%x\n",
++	    name, how, id, w, h, fmt, planes, mapped, nonzero, total, ret);
++}
++
 +/* Map s for this client and answer with its lock result. Takes s's user count. */
 +IOReturn
 +IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
@@ -751,6 +857,7 @@
 +	SweetSurfaceRef *ref = NULL;
 +	IOReturn ret = addRef(s, &ref);
 +	if (ret != kIOReturnSuccess) {
++		sweet_surf_log_lookup("ret", s->id, s, ret, false);   /* createMappingInTask failed */
 +		return ret;
 +	}
 +	uint8_t *out = (uint8_t *)IOMallocZeroData(SWEET_SURFACE_RESULT_SIZE);
@@ -761,6 +868,7 @@
 +		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
 +		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
 +	}
++	sweet_surf_log_lookup("ret", s->id, s, ret, true);
 +	if (ret != kIOReturnSuccess) {
 +		/* The caller never learns the id: undo this create/lookup. */
 +		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
@@ -898,6 +1006,9 @@
 +		if (s != NULL) {
 +			ret = sweet_surface_get(s) ? returnSurface(s, args) : kIOReturnNotFound;
 +			s->release();
++		} else {
++			/* id not in the table: the sampler gets an empty IOSurface (id 0) */
++			sweet_surf_log_lookup("id", (uint32_t)arg0, NULL, kIOReturnNotFound, false);
 +		}
 +		sweet_surf_log_once("sel", selector);
 +		return ret;
@@ -905,9 +1016,13 @@
 +	case kSweetSurfaceLookupFromPort: {
 +		OSObject *obj = NULL;
 +		IOReturn ret = IOUserClient::copyObjectForPortNameInTask(fTask, (mach_port_name_t)arg0, &obj);
-+		SweetSurface *s = OSDynamicCast(SweetSurface, obj);
++		SweetSurfaceSendRight *right = OSDynamicCast(SweetSurfaceSendRight, obj);
++		SweetSurface *s = right != NULL ? right->surface : NULL;
 +		if (ret == kIOReturnSuccess) {
 +			ret = (s != NULL && sweet_surface_get(s)) ? returnSurface(s, args) : kIOReturnBadArgument;
++		}
++		if (ret != kIOReturnSuccess) {
++			sweet_surf_log_lookup("port", s != NULL ? s->id : 0, s, ret, false);
 +		}
 +		OSSafeReleaseNULL(obj);
 +		sweet_surf_log_once("sel", selector);
@@ -1001,12 +1116,33 @@
 +	return ret;
 +}
 +
++/*
++ * A client drops a surface in two steps (mirrors MiniIOSurface cpp:1784/1798):
++ * trap 4 "detach" marks the ref while the client still holds its own lock, trap 5
++ * "release" drops it. A lookup of the same surface in between finds no non-detached
++ * ref and builds a fresh view instead of colliding with the dying one.
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, false, NULL);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
 +IOReturn
 +IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
 +{
 +	unsigned int index;
 +	IOLockLock(fLock);
-+	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, true, &index);    /* a detached view first */
++	if (ref == NULL) {
++		ref = findRef((uint32_t)(uintptr_t)id, false, &index);
++	}
 +	if (ref != NULL && --ref->count == 0) {
 +		fRefs->removeObject(index);     /* unmaps and drops the user count */
 +	}
@@ -1019,8 +1155,8 @@
 +	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
 +	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
 +	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
++	[kSweetSurfaceTrapDetach]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
 +	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
-+	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
 +};
 +
 +IOExternalTrap *

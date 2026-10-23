@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dc2c1d7..f103b7d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -549,7 +549,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fNextTick = now;
+ 		}
+ 		fb->fNextTick += period;
+-		if (fb->fLatchAt != 0 && now - fb->fLatchAt < period * 60u) {
++		static int phase_lock = -1;
++		if (phase_lock < 0) {
++			/*
++			 * Off unless boot-arg sweetfb_phaselock=1: since a swap is flipped as it comes (0107), the
++			 * moment the engine takes a flip follows CoreAnimation's frame, which follows this tick --
++			 * chasing it stretched the tick to 17-18 ms, and CoreAnimation, which draws on it, to
++			 * ~53 frames a second. The panel itself runs at 60 Hz (XBL's SAMSUNG_EA_NOTCH_FHD: 60 Hz,
++			 * DSC, 682 MHz bit clock): a fixed 16.67 ms is what to give.
++			 */
++			int v = 0;
++			(void)PE_parse_boot_argn("sweetfb_phaselock", &v, sizeof(v));
++			phase_lock = v != 0;
++		}
++		if (phase_lock && fb->fLatchAt != 0 && now - fb->fLatchAt < period * 60u) {
+ 			/*
+ 			 * In step with the panel: the display engine takes a flip at the start of the panel's
+ 			 * frame (its own timing, not this timer's), and SwapWait waits for that. A tick just

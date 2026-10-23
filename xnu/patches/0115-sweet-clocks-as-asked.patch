@@ -1,0 +1,201 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 8f87e34..d652e7f 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -32,6 +32,8 @@
+ #include <kern/sched_prim.h>
+ #include <kern/locks.h>
+ #include <sys/vnode.h>
++#include <sys/uio.h>
++extern vnode_t rootvnode;
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/pmap.h>
+@@ -5506,26 +5508,32 @@ sweet_cpufreq(void)
+ }
+ 
+ /*
+- * The clocks as a phone keeps them (on with sweetcpufreq=1; boot-arg sweetdvfs=0 keeps everything at
+- * the top as before): all at the top while something is being drawn, low after 1.5 s of nothing,
+- * and capped while the battery is low -- every cluster at its top row and the GPU at 610 MHz took
+- * more than the charger gives and ran the battery flat while plugged in, slowing to 8 frames a
+- * second at the end (the hardware's own limits) before the power went. "Something drawn": a swap
+- * (SweetFramebuffer.cpp) or a GPU submission, which also wake this at once from low clocks.
+- * The battery: the voltage SweetBattery.cpp measures (its percentage is only an estimate).
++ * The clocks, as asked (on with sweetcpufreq=1): /usr/local/gltest/clocks, read every half second,
++ *     l3=ROW little=ROW big=ROW gpu=LEVEL auto=0|1
++ * ROW: a row of the cluster's table (the CPUFREQ lines; past the last row is the last), LEVEL:
++ * the GPU's (0 = 610 MHz, the fastest). Without the file: L3 and big at their top, little at row 6
++ * (1497 MHz; what draws runs on the big cores, sched_prim.c), the GPU at 0. auto=1: after 1.5 s
++ * with nothing drawn (no swap, no submission), all low until something is (the rows of "idle").
++ * The battery is not looked at: its readings jump too much to decide anything by.
+  */
+-volatile uint32_t sweet_battery_mv;             /* SweetBattery.cpp, as last measured; 0 not yet */
++volatile uint32_t sweet_battery_mv;             /* SweetBattery.cpp, as last measured (not used here) */
+ static volatile uint64_t g_dvfs_active;         /* mach time of the last swap or submission */
+-static int g_dvfs_mode = -1;                    /* 0 fast, 1 idle, 2 low battery */
+ static int g_dvfs_on;
+ static int g_dvfs_chan;
++static volatile int g_dvfs_idle;                /* auto=1 and nothing drawn for 1.5 s */
++struct sweet_clocks {
++	uint32_t row[3];                        /* L3, little, big */
++	uint32_t gpu;
++	int autoidle;
++};
++static struct sweet_clocks g_clocks = { { 99, 6, 99 }, 0, 0 };
++static const struct sweet_clocks g_clocks_idle = { { 3, 2, 1 }, 99, 1 };
+ 
+-void sweet_dvfs_kick(void);
+ void
+ sweet_dvfs_kick(void)
+ {
+ 	g_dvfs_active = mach_absolute_time();
+-	if (g_dvfs_on && g_dvfs_mode == 1) {
++	if (g_dvfs_on && g_dvfs_idle) {
+ 		thread_wakeup((event_t)&g_dvfs_chan);
+ 	}
+ }
+@@ -5547,24 +5555,16 @@ osm_set(unsigned c, uint32_t row)
+ }
+ 
+ static void
+-dvfs_apply(int mode)
++clocks_apply(const struct sweet_clocks *k, const char *why)
+ {
+-	/*
+-	 * rows: L3 768/1132/top, little 768/1324/1497, big 652/1209/top (tables in the CPUFREQ lines).
+-	 * Fast: the big cluster at its top -- what draws runs there (sched_prim.c choose_processor) --
+-	 * and the little cluster lower (boot-arg sweetdvfs_little=ROW, 6 = 1497 MHz; its clock is the
+-	 * cluster's, not a core's): less heat and power for what runs there now, background work.
+-	 */
+-	static uint32_t rows[3][3] = { { 99, 6, 99 }, { 3, 2, 1 }, { 6, 5, 5 } };
+-	static int once;
+-	if (!once) {
+-		once = 1;
+-		(void)PE_parse_boot_argn("sweetdvfs_little", &rows[0][1], sizeof(rows[0][1]));
+-	}
+-	uint32_t level = mode == 0 ? 0u : mode == 1 ? (g_gpu_nlevels ? g_gpu_nlevels - 1u : 7u) : g_gpu_nlevels / 2u;
++	uint32_t level = k->gpu, rows[3];
+ 	uint64_t o = 0;
++	if (g_gpu_nlevels != 0 && level >= g_gpu_nlevels) {
++		level = g_gpu_nlevels - 1u;
++	}
+ 	for (unsigned c = 0; c < 3u; c++) {
+-		osm_set(c, rows[mode][c]);
++		rows[c] = k->row[c] > g_osm_top[c] ? g_osm_top[c] : k->row[c];
++		osm_set(c, rows[c]);
+ 	}
+ 	if (g_hfi_up && g_kgsl_ready && level != g_gpu_level) {
+ 		gpu_lock();
+@@ -5575,31 +5575,89 @@ dvfs_apply(int mode)
+ 	}
+ 	{
+ 		static uint32_t told;
+-		if (told++ < 12 || mode == 2) {
+-			printf("SWEET DVFS: %s (GPU level %u, battery %u mV)\n", mode == 0 ? "fast" : mode == 1 ? "idle" : "LOW BATTERY: capped",
+-			    g_gpu_level, sweet_battery_mv);
++		if (told++ < 40) {
++			printf("SWEET CLOCKS: %s: L3 %u MHz, little %u MHz, big %u MHz, GPU level %u (%u MHz)\n", why,
++			    g_osm_base[0] ? osm_row_khz(gpu_rd(g_osm_base[0], OSM_FREQ_REG(rows[0]))) / 1000u : 0,
++			    g_osm_base[1] ? osm_row_khz(gpu_rd(g_osm_base[1], OSM_FREQ_REG(rows[1]))) / 1000u : 0,
++			    g_osm_base[2] ? osm_row_khz(gpu_rd(g_osm_base[2], OSM_FREQ_REG(rows[2]))) / 1000u : 0,
++			    g_gpu_level, g_gpu_nlevels ? g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : 0] : 0);
++		}
++	}
++}
++
++/* /usr/local/gltest/clocks into *k (what it does not say stays); true if it was read */
++static bool
++clocks_file(struct sweet_clocks *k)
++{
++	static const char *keys[5] = { "l3=", "little=", "big=", "gpu=", "auto=" };
++	char text[128];
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx;
++	int resid = 0;
++	if (rootvnode == NULLVP) {
++		return false;
++	}
++	ctx = vfs_context_kernel();
++	if (vnode_lookup("/usr/local/gltest/clocks", 0, &vp, ctx) != 0) {
++		return false;
++	}
++	bzero(text, sizeof(text));
++	(void)vn_rdwr(UIO_READ, vp, (caddr_t)text, sizeof(text) - 1, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	vnode_put(vp);
++	for (unsigned i = 0; i < 5u; i++) {
++		const char *at = strnstr(text, keys[i], sizeof(text));
++		uint32_t v = 0;
++		bool any = false;
++		if (at == NULL) {
++			continue;
++		}
++		for (at += strlen(keys[i]); *at >= '0' && *at <= '9'; at++) {
++			v = v * 10u + (uint32_t)(*at - '0');
++			any = true;
++		}
++		if (!any) {
++			continue;
++		}
++		if (i < 3u) {
++			k->row[i] = v;
++		} else if (i == 3u) {
++			k->gpu = v;
++		} else {
++			k->autoidle = v != 0;
+ 		}
+ 	}
+-	g_dvfs_mode = mode;
++	return true;
+ }
+ 
+ static void
+ dvfs_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t idle_after, now;
+-	bool low = false;
++	uint64_t idle_after;
++	struct sweet_clocks applied;
++	unsigned tick = 0;
++	bool first = true;
+ 	nanoseconds_to_absolutetime(1500ull * NSEC_PER_MSEC, &idle_after);
+-	for (;;) {
+-		int mode;
++	bzero(&applied, sizeof(applied));
++	for (;; tick++) {
++		struct sweet_clocks want;
++		bool idle;
+ 		assert_wait_timeout((event_t)&g_dvfs_chan, THREAD_UNINT, 100, NSEC_PER_MSEC);
+ 		(void)thread_block(THREAD_CONTINUE_NULL);
+-		now = mach_absolute_time();
+-		if (sweet_battery_mv != 0) {    /* (hysteresis: capped below 3.5 V, freed above 3.65 V) */
+-			low = low ? sweet_battery_mv < 3650u : sweet_battery_mv < 3500u;
++		if (tick % 5u == 0) {
++			struct sweet_clocks k = g_clocks;
++			if (clocks_file(&k) && memcmp(&k, &g_clocks, sizeof(k)) != 0) {
++				g_clocks = k;
++			}
+ 		}
+-		mode = low ? 2 : (now - g_dvfs_active > idle_after ? 1 : 0);
+-		if (mode != g_dvfs_mode) {
+-			dvfs_apply(mode);
++		idle = g_clocks.autoidle && mach_absolute_time() - g_dvfs_active > idle_after;
++		g_dvfs_idle = idle;
++		want = idle ? g_clocks_idle : g_clocks;
++		want.autoidle = g_clocks.autoidle;
++		if (first || memcmp(&want, &applied, sizeof(want)) != 0) {
++			clocks_apply(&want, idle ? "idle" : "as asked");
++			applied = want;
++			first = false;
+ 		}
+ 	}
+ }
+@@ -5686,7 +5744,6 @@ gpu_thread(void *arg, wait_result_t wr)
+  * again ("Missing executable"), and nothing could reach the phone. At every boot, once the root
+  * volume is there, it is made 0755 again. Only that one file, only its mode.
+  */
+-extern vnode_t rootvnode;
+ static void
+ sweet_push_exec_bit(void *arg, wait_result_t wr)
+ {

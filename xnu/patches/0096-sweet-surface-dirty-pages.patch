@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 6cb1711..c2b62a9 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -26,6 +26,8 @@
+  * ignored (logged once per selector).
+  */
+ #include "SweetSurface.h"
++extern "C" boolean_t pmap_is_modified(ppnum_t pn);
++extern "C" void pmap_clear_modify(ppnum_t pn);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -1148,6 +1150,35 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 200: {     /* SWEET: has surface arg0 been written by a processor since the last ask? (eagl.c surface_changed) */
++		/*
++		 * The GL bridge copies some surfaces into textures and has to notice when they are drawn
++		 * into; not every writer moves the seed, so it added up all their memory every frame --
++		 * 15% of the window server's processor time. The pages know: XNU keeps a "modified" bit
++		 * per page, set by the first write after it was cleared. Asked here and cleared, a page
++		 * at a time; out: 1 written, 0 not.
++		 */
++		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
++		uint64_t dirty = 0;
++		if (s == NULL || s->memory == NULL || args->scalarOutputCount < 1) {
++			OSSafeReleaseNULL(s);
++			return kIOReturnNotFound;
++		}
++		for (uint64_t off = 0; off < s->allocSize; off += PAGE_SIZE) {
++			IOByteCount len = 0;
++			addr64_t pa = s->memory->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++			ppnum_t pn = (ppnum_t)(pa >> PAGE_SHIFT);
++			if (pa != 0 && pmap_is_modified(pn)) {
++				dirty = 1;
++				pmap_clear_modify(pn);
++			}
++		}
++		args->scalarOutput[0] = dirty;
++		args->scalarOutputCount = 1;
++		s->release();
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
+ 	case 6:         /* WrapClientImage: a surface around memory of the caller's own */
+ 	case 7:         /* WrapClientMemory */
+ 		/*

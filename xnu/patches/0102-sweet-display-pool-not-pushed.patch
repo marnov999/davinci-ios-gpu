@@ -1,0 +1,21 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0751ae8..3e9147c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -429,6 +429,16 @@ extern "C" int64_t
+ sweet_surface_gpu_push_written(void *surface)
+ {
+ 	SweetSurface *s = (SweetSurface *)surface;
++	if (s != NULL && s->poolSlot != 0) {
++		/*
++		 * CoreAnimation's own framebuffers (the display pool): only the GPU draws into them, and
++		 * their pages never say otherwise -- an IOSurface's user mappings are wired, and the pmap
++		 * leaves a page with a wired mapping "modified" (arm_force_fast_fault skips wired PTEs, so
++		 * phys_attribute_clear keeps the bit). Pushing all of one out every frame was 11 MB of
++		 * cache maintenance a frame for nothing. Pushed out whole at first use only (the caller).
++		 */
++		return 0;
++	}
+ 	return s != NULL && s->memory != NULL ? sweet_surface_push_written(s) : -1;
+ }
+ 

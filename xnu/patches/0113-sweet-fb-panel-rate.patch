@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0396ab5..dc2c1d7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -56,6 +56,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" int sweet_panel_power(int on);
+ extern "C" void sweet_dpu_survey(void);
+ extern "C" void sweet_prof_start(void);
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern "C" void sweet_dvfs_kick(void);      /* bsd/dev/sweet_gpu.c: wake the clocks (something is drawn) */
+ 
+ enum {
+@@ -519,8 +520,23 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		absolutetime_to_nanoseconds(now - fb->fRateSince, &ns);
+ 		if (ns >= 1000000000ull) {
+ 			if (want && fb->fRateSwaps != 0) {
+-				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms\n", fb->fRateSwaps,
+-				    fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull);
++				/*
++				 * And how often the panel itself is refreshed: INTF1's frame counter (sde_hw_intf.c
++				 * INTF_FRAME_COUNT 0x0AC, INTF1 at MDP + 0x6b800). The frames CoreAnimation can show
++				 * are no more than that, whatever this timer says.
++				 */
++				static vm_offset_t intf;
++				static uint32_t last_frames;
++				uint32_t frames = 0;
++				if (intf == 0) {
++					intf = ml_io_map_unmappable(SWEET_MDP_PA + 0x6b000u, 0x1000u, 0x7u /* VM_WIMG_IO */);
++				}
++				if (intf != 0) {
++					frames = *(volatile uint32_t *)(intf + 0x800u + 0x0acu);
++				}
++				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms; panel %u frames\n", fb->fRateSwaps,
++				    fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull, frames - last_frames);
++				last_frames = frames;
+ 			}
+ 			fb->fRateSwaps = fb->fRateShown = fb->fRateFlips = fb->fRateLate = 0;
+ 			fb->fRateSince = now;
+@@ -701,7 +717,6 @@ AppleCLCD::swap(const uint8_t *rec)
+  * be one physical piece below 4 GB (SweetSurface allocates CoreAnimation's full-screen ones so);
+  * anything else is copied as before, with VIG0 back on the boot framebuffer.
+  */
+-extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ 
+ bool
+ AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride)

@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4250 @@
+@@ -0,0 +1,4258 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -441,8 +441,16 @@
 +/* Give the 100ms USB-log streamer (on another core) time to flush the last
 + * printf before the next stage, so a reset can't swallow the stage we died at.
 + * 250ms busy-wait; harmless between the GMU boot's logical phases. */
++static int gmub_fast = -1;   /* boot-arg sweetgpu_fast=1: no log-flush pauses (the window server waits for the bring-up) */
 +static void gmub_flush(void)
 +{
++	if (gmub_fast < 0) {
++		int v = 0;
++		gmub_fast = PE_parse_boot_argn("sweetgpu_fast", &v, sizeof(v)) && v != 0;
++	}
++	if (gmub_fast) {
++		return;
++	}
 +	delay_for_interval(250000u, NSEC_PER_USEC);
 +}
 +

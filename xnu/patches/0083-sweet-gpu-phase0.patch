@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5284 @@
+@@ -0,0 +1,5362 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2977,6 +2977,79 @@
 +	return 0;
 +}
 +static void battery_report(void);
++int sweet_panel_brightness(uint32_t level);
++
++/*
++ * The panel's brightness (davinci: Samsung AMOLED "xiaomi f4 36 02 0b fhd cmd", dt
++ * qcom,mdss-brightness-max-level 0x7ff, bl_ctrl_dcs with dcs-type-ss-ea): DCS 0x51 with two bytes,
++ * high first (mipi_dsi_dcs_set_display_brightness_ss), sent the way the vendor's SDE driver sends a
++ * short command through DSI0 (0xae94000) without memory: the test pattern generator's DMA FIFO
++ * (dsi_ctrl_hw_cmn_kickoff_fifo_command), after the display engine's command stream is idle
++ * (dsi_ctrl_hw_cmn_wait_for_cmd_mode_mdp_idle). The controller is as the boot loader left it;
++ * nothing is done if it is not on.
++ */
++#define DSI0_PA                 0x0ae94000u
++#define DSI_CTRL_R              0x004u
++#define DSI_STATUS_R            0x008u
++#define DSI_CMD_DMA_CTRL_R      0x03Cu
++#define DSI_DMA_CMD_LENGTH_R    0x04Cu
++#define DSI_DMA_SW_TRIGGER_R    0x090u
++#define DSI_INT_CTRL_R          0x110u
++#define DSI_TPG_CTRL_R          0x15Cu
++#define DSI_TPG_DMA_INIT_R      0x17Cu
++#define DSI_TPG_FIFO_RESET_R    0x1ECu
++int
++sweet_panel_brightness(uint32_t level)
++{
++	static vm_offset_t dsi;
++	static bool told;
++	uint32_t ctrl, reg, i, done = 0;
++	if (!dsi && !(dsi = ml_io_map(DSI0_PA, 0x400u))) {
++		return -1;
++	}
++	if (level > 0x7FFu) {
++		level = 0x7FFu;
++	}
++	ctrl = gpu_rd(dsi, DSI_CTRL_R);
++	if (!told) {
++		told = true;
++		printf("SWEET PANEL: DSI0 ctrl %#x status %#x cmd_dma_ctrl %#x int_ctrl %#x\n", ctrl, gpu_rd(dsi, DSI_STATUS_R),
++		    gpu_rd(dsi, DSI_CMD_DMA_CTRL_R), gpu_rd(dsi, DSI_INT_CTRL_R));
++	}
++	if (!(ctrl & 1u)) {
++		return -2;                              /* the controller is off */
++	}
++	for (i = 0; i < 20000u && (gpu_rd(dsi, DSI_STATUS_R) & (1u << 2)); i++) {   /* CMD_MODE_MDP_BUSY */
++		gmub_udelay(1);
++	}
++	gpu_wr(dsi, DSI_TPG_CTRL_R, (1u << 1) | (1u << 2) | (3u << 16));   /* CMD_DMA_TPG_EN, FIFO mode, custom pattern */
++	/* the packet as dsi_ctrl_copy_and_pad_cmd makes it: header {wc lo, wc hi, type, flags}, payload padded with 0xff;
++	 * DCS long write (0x39), 3 bytes; flags: last command (bit 7), long packet (bit 6) */
++	gpu_wr(dsi, DSI_TPG_DMA_INIT_R, 0x03u | 0x00u << 8 | 0x39u << 16 | 0xC0u << 24);
++	gpu_wr(dsi, DSI_TPG_DMA_INIT_R, 0x51u | (level >> 8) << 8 | (level & 0xFFu) << 16 | 0xFFu << 24);
++	reg = gpu_rd(dsi, DSI_CMD_DMA_CTRL_R);
++	reg &= ~((1u << 31) | (1u << 30));            /* not broadcast, not a master of two */
++	reg |= 1u << 28;                              /* embedded mode */
++	gpu_wr(dsi, DSI_CMD_DMA_CTRL_R, reg);
++	gpu_wr(dsi, DSI_DMA_CMD_LENGTH_R, 8u);
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_wr(dsi, DSI_DMA_SW_TRIGGER_R, 1u);
++	for (i = 0; i < 20000u; i++) {                /* CMD_MODE_DMA_DONE: status bit 0 of INT_CTRL */
++		if ((done = gpu_rd(dsi, DSI_INT_CTRL_R)) & 1u) {
++			break;
++		}
++		gmub_udelay(1);
++	}
++	if (done & 1u) {
++		gpu_wr(dsi, DSI_INT_CTRL_R, done);       /* (status bits are cleared by writing them) */
++	}
++	gpu_wr(dsi, DSI_TPG_CTRL_R, 0u);
++	gpu_wr(dsi, DSI_TPG_FIFO_RESET_R, 1u);
++	gmub_udelay(1);
++	gpu_wr(dsi, DSI_TPG_FIFO_RESET_R, 0u);
++	printf("SWEET PANEL: brightness %u: %s\n", level, (done & 1u) ? "sent" : "NO DMA DONE");
++	return (done & 1u) ? 0 : -3;
++}
 +static void
 +thermal_report(void)
 +{
@@ -4395,6 +4468,11 @@
 +			int e = gpu_set_level((uint32_t)gi->value, &o);
 +			gi->value = o;
 +			return e;
++		}
++		if (gi->info == 0x88u) {   /* private: the panel's brightness, 0..2047 (DCS 0x51); out: DMA done */
++			int e = sweet_panel_brightness((uint32_t)gi->value);
++			gi->value = (uint64_t)(e == 0);
++			return e == 0 ? 0 : EIO;
 +		}
 +		if (gi->info == MSM_INFO_IOS_REBOOT) {   /* dev loop: reboot into fastboot (see sweet_reboot_fastboot) */
 +			return sweet_reboot_fastboot((uint32_t)gi->value) == 0 ? 0 : EIO;

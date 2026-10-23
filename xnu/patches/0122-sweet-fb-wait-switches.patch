@@ -1,0 +1,34 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index aa1800f..742c3a4 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -673,7 +673,13 @@ AppleCLCD::presentPending(void)
+ 	if (have) {
+ 		uint32_t flips = fFlips;
+ 		uint64_t now = mach_absolute_time(), ns = 0, until = 0;
+-		if (fScanning && fMdp != 0) {
++		static int latch_wait = -1;     /* boot-arg sweetfb_latchwait=0: flipped over one not taken yet (a test) */
++		if (latch_wait < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("sweetfb_latchwait", &v, sizeof(v));
++			latch_wait = v != 0;
++		}
++		if (latch_wait && fScanning && fMdp != 0) {
+ 			volatile uint32_t *r = (volatile uint32_t *)fMdp;
+ 			clock_interval_to_deadline(20, kMillisecondScale, &until);
+ 			while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0 && mach_absolute_time() < until) {
+@@ -1159,7 +1165,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0, args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
+ 			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0);
+ 		}
+-		if (args->scalarInputCount >= 1) {
++		static int wait = -1;           /* boot-arg sweetfb_swapwait=0: answered at once, as before 0103 (a test) */
++		if (wait < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("sweetfb_swapwait", &v, sizeof(v));
++			wait = v != 0;
++		}
++		if (wait && args->scalarInputCount >= 1) {
+ 			fFB->swapShown((uint32_t)args->scalarInput[0], 50);
+ 		}
+ 		break;

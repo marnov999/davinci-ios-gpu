@@ -1,0 +1,60 @@
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..08cd33f 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -99,6 +99,7 @@
+ #include <kern/restartable.h>
+ #include <kern/sched.h>
+ #include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
+ #include <kern/sfi.h>
+ #include <kern/syscall_subr.h>
+ #include <kern/task.h>
+@@ -5032,6 +5033,47 @@ choose_processor(
+ 
+ 	assert(thread->sched_pri <= MAXPRI);
+ 
++#if defined(SWEET)
++	{
++		/*
++		 * SWEET (SM7150: cpu0-5 Cortex-A55, cpu6-7 Cortex-A76, all in one processor set here, so
++		 * the scheduler takes them for the same): what draws -- threads at UI priority and above,
++		 * below realtime, CoreAnimation's render thread among them -- gets a big core first: an
++		 * idle one, else one running something less urgent (which is preempted). Spread over
++		 * whichever core was idle, the render thread ran 91% of its time on the little cores,
++		 * 2-3 times slower, and a frame took ~20 ms of it. Boot-args: sweetbig=0 off,
++		 * sweetbig_cpu=N the first big core (6).
++		 */
++		static int big_first = -1;
++		static uint32_t big_cpu = 6;
++		if (big_first < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("sweetbig", &v, sizeof(v));
++			(void)PE_parse_boot_argn("sweetbig_cpu", &big_cpu, sizeof(big_cpu));
++			big_first = v != 0;
++		}
++		if (big_first && thread->sched_pri >= 46 && thread->sched_pri < BASEPRI_RTQUEUES) {
++			processor_t busy = PROCESSOR_NULL;
++			for (uint32_t cpu = big_cpu; cpu < MAX_SCHED_CPUS; cpu++) {
++				processor_t p = processor_array[cpu];
++				if (p == PROCESSOR_NULL || p->processor_set != pset || !p->is_recommended) {
++					continue;
++				}
++				if (p->state == PROCESSOR_IDLE) {
++					return p;
++				}
++				if ((p->state == PROCESSOR_RUNNING || p->state == PROCESSOR_DISPATCHING) && p->current_pri < thread->sched_pri &&
++				    (busy == PROCESSOR_NULL || p->current_pri < busy->current_pri)) {
++					busy = p;
++				}
++			}
++			if (busy != PROCESSOR_NULL) {
++				return busy;
++			}
++		}
++	}
++#endif
++
+ 	/*
+ 	 * Prefer the hinted processor, when appropriate.
+ 	 */

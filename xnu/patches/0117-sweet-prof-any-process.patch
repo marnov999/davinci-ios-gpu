@@ -1,0 +1,29 @@
+diff --git a/bsd/dev/sweet_prof.c b/bsd/dev/sweet_prof.c
+index 6425ebe..31a5c74 100644
+--- a/bsd/dev/sweet_prof.c
++++ b/bsd/dev/sweet_prof.c
+@@ -141,7 +141,23 @@ sweet_prof_file(void)
+ 			secs = secs * 10 + (*c - '0');
+ 		}
+ 		if (secs >= 1 && secs <= 30) {
+-			printf("PRF asked by /tmp/prof_go: %d s\n", secs);
++			/* "SECONDS [NAME] ...": a process to sample other than boot-arg sweetprof_name's */
++			const char *c = now;
++			while (*c >= '0' && *c <= '9') {
++				c++;
++			}
++			while (*c == ' ') {
++				c++;
++			}
++			if ((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z')) {
++				size_t n = 0;
++				while (c[n] != 0 && c[n] != ' ' && c[n] != '\n' && n + 1 < sizeof(sweet_prof_name)) {
++					n++;
++				}
++				memcpy(sweet_prof_name, c, n);
++				sweet_prof_name[n] = 0;
++			}
++			printf("PRF asked by /tmp/prof_go: %d s of %s\n", secs, sweet_prof_name);
+ 			sweet_prof_seconds = secs;
+ 		}
+ 	}

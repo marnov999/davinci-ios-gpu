@@ -1,0 +1,134 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0382a7a..9d10533 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -155,6 +155,9 @@ public:
+ 	uint32_t      fFlips;
+ 	volatile uint32_t fShownSwap;   /* the id of the last swap shown (SwapWait waits for it) */
+ 	volatile uint64_t fLatchAt;     /* when the display engine last took a flip: a panel frame's start */
++	IOLock       *fPresentLock;     /* one present at a time (the tick's, SwapEnd's) */
++	bool          fImmediate;       /* boot-arg sweetfb_immediate (default 1): SwapEnd flips at once */
++	void          presentPending(void);
+ 	bool          swapShown(uint32_t id, uint64_t timeoutMS);
+ 	/* the frame rate, per second (boot-arg sweetfb_fps=1): swaps from backboardd, frames shown, of
+ 	 * which scanned out, and gaps of more than 20 ms between shown frames */
+@@ -267,6 +270,12 @@ AppleCLCD::start(IOService *provider)
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
++	{
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetfb_immediate", &v, sizeof(v));
++		fImmediate = v != 0;
++	}
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -416,34 +425,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL && fb->fHasEarly) {
+-			memcpy(rec, fb->fEarly, SWEET_FB_SWAP_REC_SIZE);   /* (the latest stays for the next tick) */
+-			fb->fHasEarly = false;
+-		} else if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-		}
+-	}
+ 	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		uint32_t flips = fb->fFlips;
+-		uint64_t now = mach_absolute_time(), ns = 0;
+-		fb->present(rec);
+-		IOLockLock(fb->fLock);
+-		memcpy((void *)&fb->fShownSwap, rec + 0x50, sizeof(uint32_t));   /* (the swap's id, +0x50) */
+-		IOLockWakeup(fb->fLock, (event_t)&fb->fShownSwap, false);
+-		IOLockUnlock(fb->fLock);
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+-		fb->fRateShown++;
+-		fb->fRateFlips += fb->fFlips - flips;
+-		if (fb->fLastShown != 0) {
+-			absolutetime_to_nanoseconds(now - fb->fLastShown, &ns);
+-			fb->fRateLate += ns > 20000000ull;
+-		}
+-		fb->fLastShown = now;
++	if (flush) {
++		fb->presentPending();
+ 	}
+ 	{
+ 		static int want = -1;
+@@ -540,6 +524,59 @@ static uint64_t sweet_fb_swap_count;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/*
++ * Show the swap waiting to be shown (the earlier of two first). From the vsync tick, and with
++ * scanout from SwapEnd itself (fImmediate): CoreAnimation waits for each swap to be on the
++ * panel before it draws the next (SwapWait), so a swap kept for the next tick of a timer that
++ * is not the panel's cost it up to a frame every frame. Flipped at once, the display engine
++ * takes it at the start of the panel's next frame, as a phone's display does. A flip the
++ * engine has not taken yet is waited for first (not overwritten: that frame would be lost).
++ */
++void
++AppleCLCD::presentPending(void)
++{
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		return;
++	}
++	IOLockLock(fPresentLock);
++	IOLockLock(fLock);
++	bool have = fDirty;
++	if (have && fHasEarly) {
++		memcpy(rec, fEarly, SWEET_FB_SWAP_REC_SIZE);   /* (the latest stays for the next) */
++		fHasEarly = false;
++	} else if (have) {
++		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = false;
++	}
++	IOLockUnlock(fLock);
++	if (have) {
++		uint32_t flips = fFlips;
++		uint64_t now = mach_absolute_time(), ns = 0, until = 0;
++		if (fScanning && fMdp != 0) {
++			volatile uint32_t *r = (volatile uint32_t *)fMdp;
++			clock_interval_to_deadline(20, kMillisecondScale, &until);
++			while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0 && mach_absolute_time() < until) {
++				IODelay(100);
++			}
++		}
++		present(rec);
++		IOLockLock(fLock);
++		memcpy((void *)&fShownSwap, rec + 0x50, sizeof(uint32_t));   /* (the swap's id, +0x50) */
++		IOLockWakeup(fLock, (event_t)&fShownSwap, false);
++		IOLockUnlock(fLock);
++		fRateShown++;
++		fRateFlips += fFlips - flips;
++		if (fLastShown != 0) {
++			absolutetime_to_nanoseconds(now - fLastShown, &ns);
++			fRateLate += ns > 20000000ull;
++		}
++		fLastShown = now;
++	}
++	IOLockUnlock(fPresentLock);
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+@@ -558,6 +595,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	fDirty = true;
+ 	fRateSwaps++;
+ 	IOLockUnlock(fLock);
++	if (fImmediate && fScanout > 0) {
++		presentPending();
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}

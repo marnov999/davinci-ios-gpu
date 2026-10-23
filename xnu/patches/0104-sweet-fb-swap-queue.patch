@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3020a44..7e20a24 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -144,6 +144,8 @@ public:
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	uint8_t       fEarly[SWEET_FB_SWAP_REC_SIZE];       /* the one before it, not shown yet either: */
++	bool          fHasEarly;                            /* shown first, at the next tick */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	int           fScanout;       /* boot-arg sweetfb_scanout: the display engine fetches the surface itself */
+@@ -416,7 +418,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
++		if (rec != NULL && fb->fHasEarly) {
++			memcpy(rec, fb->fEarly, SWEET_FB_SWAP_REC_SIZE);   /* (the latest stays for the next tick) */
++			fb->fHasEarly = false;
++		} else if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
+ 		}
+@@ -520,6 +525,16 @@ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	IOLockLock(fLock);
++	/*
++	 * Two swaps within one tick (CoreAnimation's frames do not come exactly 16.7 ms apart): the
++	 * first is kept and shown at the next tick, the second at the one after -- not the first
++	 * dropped and the next tick left with nothing new, a frame missed in a steady motion (the
++	 * "micro lags"). A third before either is shown drops the oldest.
++	 */
++	if (fDirty && fFlushTicks == 1) {
++		memcpy(fEarly, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fHasEarly = true;
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	fRateSwaps++;

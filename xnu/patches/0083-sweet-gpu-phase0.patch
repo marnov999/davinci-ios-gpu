@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4875 @@
+@@ -0,0 +1,4883 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -4802,6 +4802,14 @@
 +		gpu_nodes_register();
 +		if (delay_s != 0) {
 +			gpu_sleep(delay_s);
++		}
++	}
++	{       /* boot-arg sweetgpu_armfb=1: before anything risky, a reset of any kind from here lands in
++		 * fastboot (the PON spare's "bootloader" reason, as `reboot bootloader` leaves it), not in a
++		 * boot that hangs at the MIUI logo; ABL clears it when it takes it */
++		uint32_t arm = 0;
++		if (PE_parse_boot_argn("sweetgpu_armfb", &arm, sizeof(arm)) && arm) {
++			printf("SWEET GPU: armed for fastboot: %d\n", sweet_reboot_fastboot(0));
 +		}
 +	}
 +	gpu_probe();

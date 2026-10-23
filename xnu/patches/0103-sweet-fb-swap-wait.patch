@@ -1,0 +1,89 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b61ca88..3020a44 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -151,6 +151,8 @@ public:
+ 	bool          fScanning;      /* VIG0 is on a surface of iOS's, not on the boot framebuffer */
+ 	SweetSurface *fShown[2];      /* the surface on screen, and the one before it (still fetched for a frame) */
+ 	uint32_t      fFlips;
++	volatile uint32_t fShownSwap;   /* the id of the last swap shown (SwapWait waits for it) */
++	bool          swapShown(uint32_t id, uint64_t timeoutMS);
+ 	/* the frame rate, per second (boot-arg sweetfb_fps=1): swaps from backboardd, frames shown, of
+ 	 * which scanned out, and gaps of more than 20 ms between shown frames */
+ 	uint32_t      fRateSwaps, fRateShown, fRateFlips, fRateLate;
+@@ -424,6 +426,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		uint32_t flips = fb->fFlips;
+ 		uint64_t now = mach_absolute_time(), ns = 0;
+ 		fb->present(rec);
++		IOLockLock(fb->fLock);
++		memcpy((void *)&fb->fShownSwap, rec + 0x50, sizeof(uint32_t));   /* (the swap's id, +0x50) */
++		IOLockWakeup(fb->fLock, (event_t)&fb->fShownSwap, false);
++		IOLockUnlock(fb->fLock);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 		fb->fRateShown++;
+ 		fb->fRateFlips += fb->fFlips - flips;
+@@ -567,6 +573,44 @@ AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride)
+ 	return true;
+ }
+ 
++/*
++ * SwapWait: until the swap is on the panel. CoreAnimation asks this before it draws into the
++ * buffer that swap replaced; answered at once, as before, it drew into the buffer the display
++ * engine was still fetching -- tearing, and frames run ahead of the panel then bunched. On the
++ * panel means: shown at a tick (or a later swap was), and when it was scanned out, the display
++ * engine has taken the new address -- CTL0's flush bits read back set until the engine latches
++ * them at the start of the panel's next frame.
++ */
++bool
++AppleCLCD::swapShown(uint32_t id, uint64_t timeoutMS)
++{
++	static uint32_t told;
++	uint64_t began = mach_absolute_time(), deadline, ns = 0;
++	bool shown = true;
++	clock_interval_to_deadline((uint32_t)timeoutMS, kMillisecondScale, &deadline);
++	IOLockLock(fLock);
++	while ((int32_t)(fShownSwap - id) < 0 && id <= fSwapID) {
++		if (IOLockSleepDeadline(fLock, (event_t)&fShownSwap, *(AbsoluteTime *)&deadline, THREAD_UNINT) == THREAD_TIMED_OUT) {
++			shown = false;
++			break;
++		}
++	}
++	IOLockUnlock(fLock);
++	if (shown && fScanning && fMdp != 0) {
++		volatile uint32_t *r = (volatile uint32_t *)fMdp;
++		while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0 && mach_absolute_time() < deadline) {
++			IODelay(100);
++		}
++	}
++	if (told < 12) {
++		told++;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		IOLog("SWEET FB: swap wait for %u (shown %u, last begun %u): %s after %llu us\n", id, fShownSwap, fSwapID,
++		    shown ? "on the panel" : "timed out", ns / 1000ull);
++	}
++	return shown;
++}
++
+ void
+ AppleCLCD::scanBack(void)
+ {
+@@ -820,6 +864,19 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		fFB->swap(rec);
+ 		break;
+ 	}
++	case kSweetFBSwapWait: {
++		static uint32_t told;
++		if (told < 6) {
++			told++;
++			IOLog("SWEET FB: SwapWait in %u: %#llx %#llx %#llx\n", args->scalarInputCount,
++			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0, args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0);
++		}
++		if (args->scalarInputCount >= 1) {
++			fFB->swapShown((uint32_t)args->scalarInput[0], 50);
++		}
++		break;
++	}
+ 	case kSweetFBGetID:
+ 		out[0] = 0;
+ 		outCount = 1;

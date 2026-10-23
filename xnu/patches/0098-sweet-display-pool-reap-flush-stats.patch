@@ -1,0 +1,118 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 49ccaa9..7fedeb6 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3256,7 +3256,7 @@ static uint64_t g_bo_bytes;
+ 
+ /* What the last seconds' work was, for one log line every five (RedwoodGPU gGPUStat). */
+ static struct {
+-	uint64_t since, flushed;
++	uint64_t since, flushed, flushed_whole;    /* (whole: first use, or memory without page bits) */
+ 	uint32_t submissions, commands, buffers, surfaces, made, given_again, closed, left_now;
+ } g_stat;
+ 
+@@ -3384,10 +3384,11 @@ gpu_reap(void)
+ /* Reclaim contexts/BOs whose owning process has exited (pid no longer resolves), at most once
+  * a second: leaked GPU state of dead processes (a SIGKILLed backboardd) is given back the
+  * same way a close gives it back -- never under a GPU that may still use it. With the lock held. */
++static uint64_t g_reaped_last;      /* (0: whenever asked) */
++#define last g_reaped_last
+ static void
+ kgsl_reap_dead(void)
+ {
+-	static uint64_t last;
+ 	uint64_t now = mach_absolute_time(), second;
+ 	unsigned i, nctx = 0, nbo = 0;
+ 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+@@ -3416,6 +3417,26 @@ kgsl_reap_dead(void)
+ 	gpu_reap();
+ 	if (nctx || nbo) { printf("SWEET DRM: reaped %u dead ctx, %u dead bo\n", nctx, nbo); }
+ }
++#undef last
++
++/*
++ * SweetSurface.cpp, when the display pool is empty: a window server started again makes its
++ * full-screen surfaces while the buffers of the one that died still hold its own (the reaping
++ * above comes at the next allocation, too late) -- and then every other frame is copied, not
++ * scanned out. Those buffers given back now.
++ */
++void sweet_gpu_reap_dead_now(void);
++void
++sweet_gpu_reap_dead_now(void)
++{
++	if (g_gpu_mtx == NULL || !g_kgsl_ready) {
++		return;
++	}
++	gpu_lock();
++	g_reaped_last = 0;
++	kgsl_reap_dead();
++	gpu_unlock();
++}
+ 
+ static int
+ kgsl_do_drawctxt_create(uint32_t flags, uint32_t *out_id)
+@@ -3993,6 +4014,7 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 			if (written < 0) {
+ 				sweet_surface_gpu_flush(b->surf);
+ 				written = (int64_t)b->mmapsize;
++				g_stat.flushed_whole += b->mmapsize;
+ 			}
+ 			g_stat.flushed += (uint64_t)written;
+ 		}
+@@ -4039,10 +4061,10 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 		}
+ 		g_gpu_ticks = 0;
+ 		g_gpu_timed = 0;
+-		printf("SWEET DRM: %u submissions in %llu ms (%u IBs, %u buffers named, %llu KB of surfaces out of the cache); "
++		printf("SWEET DRM: %u submissions in %llu ms (%u IBs, %u buffers named, %llu KB of surfaces out of the cache, %llu KB of it whole); "
+ 		    "fence %u done %u; buffers: %u made, %u kept ones given again, %u given back, %u left, %llu MB kept; "
+ 		    "%u buffers %llu MB; %u waits of %llu us; va %llu MB in %u, %u holes (%u most), %llu KB lost, %u refused\n",
+-		    g_stat.submissions, nanos / NSEC_PER_MSEC, g_stat.commands, g_stat.buffers, g_stat.flushed >> 10,
++		    g_stat.submissions, nanos / NSEC_PER_MSEC, g_stat.commands, g_stat.buffers, g_stat.flushed >> 10, g_stat.flushed_whole >> 10,
+ 		    g_fence, *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF),
+ 		    g_stat.made, g_stat.given_again, g_stat.closed, g_left_count, g_kept_bytes >> 20,
+ 		    g_bo_count, g_bo_bytes >> 20, g_waits, g_waits ? waiting / NSEC_PER_USEC / g_waits : 0,
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index b583655..b25b83d 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -29,6 +29,7 @@
+ extern "C" boolean_t pmap_is_modified(ppnum_t pn);
+ extern "C" void pmap_clear_modify(ppnum_t pn);
+ extern "C" boolean_t pmap_valid_page(ppnum_t pn);
++extern "C" void sweet_gpu_reap_dead_now(void);       /* bsd/dev/sweet_gpu.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -86,7 +87,7 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+  * piece is not to be had once the system has run a while -- so three are made at the start, while
+  * memory is whole, and a full-screen surface takes a free one (it goes back when the surface goes).
+  */
+-#define SWEET_DISPLAY_POOL      3
++#define SWEET_DISPLAY_POOL      4       /* two shown (SweetFramebuffer holds them) and two being drawn */
+ #define SWEET_DISPLAY_W         1125u
+ #define SWEET_DISPLAY_H         2436u
+ #define SWEET_DISPLAY_BPR       4608u
+@@ -383,6 +384,11 @@ sweet_surface_push_written(SweetSurface *s)
+ 	}
+ 	for (uint32_t i = 0; i < s->pageCount; i++) {
+ 		if (list[i] == 0) {
++			static uint32_t told;
++			if (told++ < 8) {
++				IOLog("SWEET SURF: surface %u %ux%u: page %u of %u is not the VM's: pushed out whole\n", s->id, s->width,
++				    s->height, i, s->pageCount);
++			}
+ 			return -1;
+ 		}
+ 		if (!pmap_is_modified(list[i])) {
+@@ -1138,6 +1144,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			if (s->width == SWEET_DISPLAY_W && s->height == SWEET_DISPLAY_H && s->pixelFormat == 'BGRA' &&
+ 			    s->planeCount == 0 && s->bytesPerRow == SWEET_DISPLAY_BPR) {
+ 				mem = sweet_display_take(s->allocSize, &s->poolSlot);
++				if (mem == NULL) {
++					sweet_gpu_reap_dead_now();      /* (a dead window server's buffers may hold them) */
++					mem = sweet_display_take(s->allocSize, &s->poolSlot);
++				}
+ 				if (mem == NULL) {
+ 					static uint32_t told;
+ 					if (told++ < 4) {

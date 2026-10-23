@@ -1,0 +1,129 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7052e81..913307d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_dpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_dpu.c b/bsd/dev/sweet_dpu.c
+new file mode 100644
+index 0000000..ca276b3
+--- /dev/null
++++ b/bsd/dev/sweet_dpu.c
+@@ -0,0 +1,81 @@
++/*
++ * The display engine (MDSS MDP / "DPU", dt qcom,mdss_mdp@ae00000), step 1 of scanning iOS's frames
++ * out directly instead of copying them into the boot loader's framebuffer: what the boot loader
++ * left programmed, read and printed. Reads only.
++ *
++ * Block offsets from davinci's dt (qcom,sde-*-off); register layout from the vendor's SDE driver
++ * (drivers/gpu/drm/msm/sde: sde_hw_sspp.c, sde_hw_ctl.c, sde_hw_lm.c, sde_hw_pingpong.c,
++ * sde_hw_intf.c). Every block is printed as its non-zero words, so what is live stands out: the
++ * pipe that fetches the framebuffer (its address, stride, format, sizes), the mixer and control
++ * path it goes through, the pingpong's tear check and autorefresh (a command-mode panel), and the
++ * DSI interface.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <mach/memory_object_types.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO 0x7u
++#endif
++
++void sweet_dpu_survey(void);
++
++#define MDP_PA    0x0ae00000u
++#define MDP_SIZE  0x90000u
++
++static const struct {
++	const char *name;
++	uint32_t off, len;
++} dpu_blocks[] = {
++	{ "top", 0x1000u, 0x460u },
++	{ "ctl0", 0x2000u, 0x100u }, { "ctl1", 0x2200u, 0x100u }, { "ctl2", 0x2400u, 0x100u },
++	{ "ctl3", 0x2600u, 0x100u }, { "ctl4", 0x2800u, 0x100u }, { "ctl5", 0x2a00u, 0x100u },
++	{ "vig0", 0x5000u, 0x80u }, { "vig1", 0x7000u, 0x80u },
++	{ "dma0", 0x25000u, 0x80u }, { "dma1", 0x27000u, 0x80u }, { "dma2", 0x29000u, 0x80u },
++	{ "lm0", 0x45000u, 0x60u }, { "lm1", 0x46000u, 0x60u }, { "lm2", 0x47000u, 0x60u }, { "lm3", 0x48000u, 0x60u },
++	{ "intf1(dsi)", 0x6b800u, 0x2c0u }, { "intf2(dsi)", 0x6c000u, 0x2c0u },
++	{ "pp0", 0x71000u, 0x40u }, { "pp1", 0x71800u, 0x40u }, { "pp2", 0x72000u, 0x40u }, { "pp3", 0x72800u, 0x40u },
++};
++
++void
++sweet_dpu_survey(void)
++{
++	static bool done;
++	vm_offset_t mdp;
++	unsigned b;
++	if (done) {
++		return;
++	}
++	done = true;
++	mdp = ml_io_map_unmappable(MDP_PA, MDP_SIZE, VM_WIMG_IO);
++	if (!mdp) {
++		printf("SWEET DPU: cannot map the MDP\n");
++		return;
++	}
++	printf("SWEET DPU: [1] the display engine as the boot loader left it (non-zero words; reads only)\n");
++	for (b = 0; b < sizeof(dpu_blocks) / sizeof(dpu_blocks[0]); b++) {
++		char line[320];
++		int at = 0;
++		unsigned nz = 0;
++		for (uint32_t o = 0; o < dpu_blocks[b].len; o += 4u) {
++			uint32_t v = *(volatile uint32_t *)(mdp + dpu_blocks[b].off + o);
++			if (v == 0) {
++				continue;
++			}
++			nz++;
++			if (at > (int)sizeof(line) - 24) {
++				printf("SWEET DPU: %s:%s\n", dpu_blocks[b].name, line);
++				at = 0;
++			}
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " %03x=%x", o, v);
++		}
++		if (nz) {
++			printf("SWEET DPU: %s:%s\n", dpu_blocks[b].name, line);
++		}
++	}
++	printf("SWEET DPU: [1] done\n");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a4613f3..7163eca 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSSerialize.h>
+ extern "C" int sweet_panel_power(int on);
++extern "C" void sweet_dpu_survey(void);
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -691,6 +692,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
++			uint32_t dpu = 0;
+ 			bool off = args->scalarInput[0] == 0;
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+@@ -702,6 +704,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			/* the panel dark while iOS has the display off (it still shows the last frame, and iOS
+ 			 * takes no touches then: it looked frozen), its brightness back when on */
+ 			IOLog("SWEET FB: display %s (panel %d)\n", off ? "off" : "on", sweet_panel_power(off ? 0 : 1));
++			if (!off && PE_parse_boot_argn("sweetdpu", &dpu, sizeof(dpu)) && dpu) {
++				sweet_dpu_survey();       /* once: the display engine as the boot loader left it */
++			}
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:

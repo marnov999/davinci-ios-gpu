@@ -1,0 +1,73 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index df4244b..0751ae8 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -29,6 +29,7 @@
+ extern "C" boolean_t pmap_is_modified(ppnum_t pn);
+ extern "C" void pmap_clear_modify(ppnum_t pn);
+ extern "C" boolean_t pmap_valid_page(ppnum_t pn);
++extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
+ extern "C" void sweet_gpu_reap_dead_now(void);       /* bsd/dev/sweet_gpu.c */
+ 
+ #if defined(SWEET)
+@@ -156,9 +157,8 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL && !kernelMapFailed) {
+-		/* (memory an application lent only for reading -- kIODirectionOut -- maps read-only) */
+-		kernelMap = memory->map(kIOMapWriteCombineCache | (memory->getDirection() == kIODirectionOut ? kIOMapReadOnly : 0));
+-		kernelMapFailed = kernelMap == NULL;
++		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMapFailed = kernelMap == NULL;   /* (memory an application lent for reading only) */
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -363,6 +363,7 @@ sweet_surface_pages(SweetSurface *s)
+ 		}
+ 		list[count].off = (uint32_t)off;
+ 		list[count].len = (uint32_t)len;
++		list[count].poff = (uint32_t)(pa & PAGE_MASK);
+ 		off += len;
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+@@ -385,7 +386,6 @@ static int64_t
+ sweet_surface_push_written(SweetSurface *s)
+ {
+ 	struct sweet_surface_page *list = sweet_surface_pages(s);
+-	uintptr_t va = 0;
+ 	int64_t pushed = 0;
+ 	uint32_t pages = 0;
+ 	if (list == NULL) {
+@@ -403,15 +403,10 @@ sweet_surface_push_written(SweetSurface *s)
+ 		if (!pmap_is_modified(list[i].pn)) {
+ 			continue;
+ 		}
+-		if (va == 0) {
+-			IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+-			va = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
+-			if (va == 0) {
+-				return -1;
+-			}
+-		}
+ 		pmap_clear_modify(list[i].pn);
+-		for (uintptr_t line = (va + list[i].off) & ~(uintptr_t)63, end = va + list[i].off + list[i].len; line < end; line += 64) {
++		/* by the kernel's own (cached) view of all memory: no mapping to make, none of a different kind */
++		uintptr_t at = (uintptr_t)ml_static_ptovirt((vm_offset_t)ptoa(list[i].pn)) + list[i].poff;
++		for (uintptr_t line = at & ~(uintptr_t)63, end = at + list[i].len; line < end; line += 64) {
+ 			__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
+ 		}
+ 		pushed += list[i].len;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 1563d8c..de57d77 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -27,7 +27,8 @@ struct sweet_surface_plane {
+ /* One physical page of a surface's memory: which, and the bytes of the memory that are in it. */
+ struct sweet_surface_page {
+ 	ppnum_t  pn;            /* 0: not a page the VM keeps "modified" bits for */
+-	uint32_t off, len;
++	uint32_t off, len;      /* the memory's bytes [off, off + len) ... */
++	uint32_t poff;          /* ... are at this offset in the page */
+ };
+ 
+ class SweetSurface : public OSObject {

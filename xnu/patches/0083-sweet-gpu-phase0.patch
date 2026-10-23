@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5362 @@
+@@ -0,0 +1,5381 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -80,6 +80,25 @@
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);   /* write-combine (framebuffer) */
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++/*
++ * Every mapping of this file goes into kernel_map, not io_submap. io_submap is 8 MB in all and
++ * what ml_io_map() puts there is KMA_PERMANENT: the GPU's 256 KB core window three times, the ring,
++ * render targets, SPMI windows at each reboot request, a 16 KB page more for every four page tables
++ * the GPU's address space grows (gpu_pt_table), the 2 MB shared memory area of the Wi-Fi survey --
++ * and when it was full, an unlock that grew the GPU's tables panicked in io_map:
++ * "kmem_alloc(io_submap, 16384, 0x100021 = PERMANENT|PAGEABLE|NOFAIL): failed with 3 (NO_SPACE)".
++ * ml_io_map_unmappable() is the same mapping (same memory type) from kernel_map, as HackiOS maps
++ * its shared memory (redwood_wifi.c smem_peek).
++ */
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO                0x7u   /* arm/memory_types.h: COHERENT | NOT_CACHEABLE | GUARDED */
++#endif
++#ifndef VM_WIMG_WCOMB
++#define VM_WIMG_WCOMB             0x6u   /* NOT_CACHEABLE | COHERENT */
++#endif
++#define ml_io_map(pa, size)       ml_io_map_unmappable((vm_offset_t)(pa), (vm_size_t)(size), VM_WIMG_IO)
++#define ml_io_map_wcomb(pa, size) ml_io_map_unmappable((vm_offset_t)(pa), (vm_size_t)(size), VM_WIMG_WCOMB)
 +extern kern_return_t thread_terminate(thread_t);
 +void sweet_gpu_init(void);
 +

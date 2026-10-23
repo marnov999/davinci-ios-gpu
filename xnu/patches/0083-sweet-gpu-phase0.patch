@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4966 @@
+@@ -0,0 +1,5023 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2961,6 +2961,59 @@
 +	return g_fence;
 +}
 +
++/*
++ * The temperatures, as the phone's own thermal zones read them (dt: tsens0 @0xc263000 sensors 0-14,
++ * tsens1 @0xc265000 0-9; TSENS v2: TM_SN_STATUS(n) at +0xa0 + 4n, bits 11:0 signed tenths of a
++ * degree, bit 21 valid). Reads only.
++ */
++static int
++tsens_read(vm_offset_t tm, unsigned n, int *deci)
++{
++	uint32_t v = gpu_rd(tm, 0xA0u + 4u * n);
++	if (!(v & (1u << 21))) {
++		return -1;
++	}
++	*deci = (int)((v & 0xFFFu) ^ 0x800u) - 0x800;
++	return 0;
++}
++static void
++thermal_report(void)
++{
++	static vm_offset_t t0, t1;
++	static const char *const name0[15] = { "aoss0", "cpu0", "cpu1", "cpu2", "cpu3", "cpu4", "cpu5", "cpuss0", "cpuss1",
++		"big0", "big1", "big2", "big3", "gpu0", "gpu1" };
++	static const char *const name1[10] = { "aoss1", "wlan", "audio", "ddr", "hvx", "camera", "mdm", "mdmdsp", "npu", "video" };
++	char line[400];
++	int at = 0, d, little = -1000, big = -1000;
++	unsigned i;
++	if (!t0) {
++		t0 = ml_io_map(0x0c263000u, 0x1000u);
++		t1 = ml_io_map(0x0c265000u, 0x1000u);
++		if (!t0 || !t1) {
++			return;
++		}
++	}
++	for (i = 1; i <= 6u; i++) {
++		if (tsens_read(t0, i, &d) == 0 && d > little) little = d;
++	}
++	for (i = 9; i <= 12u; i++) {
++		if (tsens_read(t0, i, &d) == 0 && d > big) big = d;
++	}
++	at += snprintf(line + at, sizeof(line) - (size_t)at, "little %d.%d big %d.%d", little / 10, little % 10, big / 10, big % 10);
++	for (i = 13; i <= 14u; i++) {
++		if (tsens_read(t0, i, &d) == 0) {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s %d.%d", name0[i], d / 10, (d < 0 ? -d : d) % 10);
++		}
++	}
++	for (i = 0; i < 10u && at < (int)sizeof(line) - 24; i++) {
++		if ((i == 3u || i == 6u || i == 0u) && tsens_read(t1, i, &d) == 0) {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s %d.%d", name1[i], d / 10, (d < 0 ? -d : d) % 10);
++		}
++	}
++	(void)name0;
++	printf("SWEET THERMAL: %s (C)\n", line);
++}
++
 +/* redwood gpu_times: add up what the core spent on the submissions done since the last look. */
 +static void
 +gpu_times(void)
@@ -3899,6 +3952,7 @@
 +		uint64_t waiting;
 +		absolutetime_to_nanoseconds(g_waiting, &waiting);
 +		gpu_times();
++		thermal_report();
 +		{
 +			volatile uint64_t *tm = (volatile uint64_t *)(g_res_nc + GPU_TIMES_OFF);
 +			uint32_t last = *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF) % GPU_TIMES;
@@ -4823,8 +4877,11 @@
 +{
 +	unsigned polls;
 +	uint32_t info = 0, ret;
-+	if (!g_kgsl_ready || !gpu_gmu || level >= g_gpu_nlevels) {
++	if (!g_kgsl_ready || !gpu_gmu || g_gpu_nlevels == 0) {
 +		return EINVAL;
++	}
++	if (level >= g_gpu_nlevels) {           /* past the bin's slowest (7 on an 825 bin): the slowest */
++		level = g_gpu_nlevels - 1u;
 +	}
 +	if (!g_hfi_up) {                        /* without the table of speeds the GMU faults on DCVS */
 +		return ENODEV;

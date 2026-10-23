@@ -1,0 +1,147 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index d652e7f..6b24fe9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2998,8 +2998,16 @@ static int panel_dcs_brightness(uint32_t level);
+ int
+ sweet_panel_brightness(uint32_t level)
+ {
+-	if (level > 0x7FFu) {
+-		level = 0x7FFu;
++	static uint32_t most = 0;       /* boot-arg sweetbl_max=N: no brighter than N (0..2047), whatever iOS asks */
++	if (most == 0) {
++		most = 0x7FFu;
++		(void)PE_parse_boot_argn("sweetbl_max", &most, sizeof(most));
++		if (most == 0 || most > 0x7FFu) {
++			most = 0x7FFu;
++		}
++	}
++	if (level > most) {
++		level = most;
+ 	}
+ 	g_panel_level = level;
+ 	return g_panel_off ? 0 : panel_dcs_brightness(level);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 11843a6..aa1800f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -70,6 +70,9 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBSupportedFrameInfo      = 74,
++	kSweetFBGetCurrentAbsoluteTime  = 77,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -232,6 +235,7 @@ public:
+ 	IOLock       *fPresentLock;     /* one present at a time (the tick's, SwapEnd's) */
+ 	bool          fImmediate;       /* boot-arg sweetfb_immediate (default 1): SwapEnd flips at once */
+ 	void          presentPending(void);
++	void          publishModes(void);
+ 	bool          swapShown(uint32_t id, uint64_t timeoutMS);
+ 	/* the frame rate, per second (boot-arg sweetfb_fps=1): swaps from backboardd, frames shown, of
+ 	 * which scanned out, and gaps of more than 20 ms between shown frames */
+@@ -343,6 +347,7 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	publishModes();
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();
+ 	{
+@@ -818,6 +823,68 @@ AppleCLCD::swapShown(uint32_t id, uint64_t timeoutMS)
+ 	return shown;
+ }
+ 
++/*
++ * The display's modes, as CoreAnimation reads them (HackiOS MiniIOMobileFramebuffer publishModes):
++ * TimingElements and ColorElements, one timing of the presented size at 60 Hz (16.16), one colour
++ * mode, 8-bit RGB; GetBlock 0x40 answers with their identifiers as "the current mode". Without
++ * them CoreAnimation had no refresh rate from the display to plan its frames by.
++ */
++#define SWEET_FB_TIMING_ID 1
++#define SWEET_FB_COLOR_ID  1
++static void
++sweet_fb_set_number(OSDictionary *d, const char *key, uint64_t v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 64);
++	if (n != NULL) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++void
++AppleCLCD::publishModes(void)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8), *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4), *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1), *colors = OSArray::withCapacity(1);
++	const uint64_t rate = 60ull << 16;
++	if (timing && horizontal && vertical && color && timings && colors) {
++		sweet_fb_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_fb_set_number(color, "PixelEncoding", 0);
++		sweet_fb_set_number(color, "Depth", 8);
++		sweet_fb_set_number(color, "Colorimetry", 1);
++		sweet_fb_set_number(color, "EOTF", 1);
++		sweet_fb_set_number(color, "DynamicRange", 0);
++		sweet_fb_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_fb_set_number(horizontal, "Active", fLogicalW);
++		sweet_fb_set_number(horizontal, "Total", fLogicalW);
++		sweet_fb_set_number(horizontal, "SyncRate", rate);
++		sweet_fb_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_fb_set_number(vertical, "Active", fLogicalH);
++		sweet_fb_set_number(vertical, "Total", fLogicalH);
++		sweet_fb_set_number(vertical, "SyncRate", rate);
++		sweet_fb_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_fb_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_fb_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		setProperty("TimingElements", timings);
++		setProperty("ColorElements", colors);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ void
+ AppleCLCD::scanBack(void)
+ {
+@@ -1097,6 +1164,24 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	}
++	case kSweetFBSupportedFrameInfo:        /* in: type; out: how many, and their tags: none */
++		out[0] = 0;
++		outCount = 1;
++		break;
++	case kSweetFBGetCurrentAbsoluteTime:
++		out[0] = mach_absolute_time();
++		outCount = 1;
++		break;
++	case kSweetFBGetBlock:                  /* in: which block; out: its bytes (0x40: the current mode) */
++		if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++			bzero(args->structureOutput, args->structureOutputSize);
++			if (args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 && args->structureOutputSize >= 12) {
++				uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++				memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++			}
++			return kIOReturnSuccess;    /* (not zeroed again below) */
++		}
++		break;
+ 	case kSweetFBGetID:
+ 		out[0] = 0;
+ 		outCount = 1;

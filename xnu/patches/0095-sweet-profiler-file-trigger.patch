@@ -1,0 +1,109 @@
+diff --git a/bsd/dev/sweet_prof.c b/bsd/dev/sweet_prof.c
+index 86c3b0e..3d16f80 100644
+--- a/bsd/dev/sweet_prof.c
++++ b/bsd/dev/sweet_prof.c
+@@ -26,6 +26,8 @@
+ #include <mach/task_info.h>
+ #include <vm/vm_map.h>
+ #include <pexpert/pexpert.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
+ #include <os/atomic_private.h>
+ 
+ struct sweet_prof_sample {
+@@ -42,7 +44,8 @@ extern vm_map_t get_task_map(task_t);
+ extern kern_return_t vm_map_read_user(vm_map_t map, vm_map_address_t src_addr, void *dst_p, vm_size_t size);
+ extern int hz;
+ 
+-static int sweet_prof_seconds;          /* asked for, 0: nothing to do */
++static int sweet_prof_seconds;
++static void sweet_prof_thread(void *arg, wait_result_t wr);          /* asked for, 0: nothing to do */
+ static int sweet_prof_busy;
+ static char sweet_prof_name[32] = "backboardd";
+ 
+@@ -106,6 +109,53 @@ sweet_prof_images(task_t task)
+ 	}
+ }
+ 
++/* The other way to ask (the sysctl may not be there): /tmp/prof_go = "<seconds> <anything>", a change of it starts one. */
++extern vnode_t rootvnode;
++static void
++sweet_prof_file(void)
++{
++	static char last[32];
++	char now[32];
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx;
++	int resid = 0;
++	if (rootvnode == NULLVP) {
++		return;
++	}
++	ctx = vfs_context_kernel();
++	if (vnode_lookup("/tmp/prof_go", 0, &vp, ctx) != 0) {
++		return;
++	}
++	bzero(now, sizeof(now));
++	(void)vn_rdwr(UIO_READ, vp, (caddr_t)now, sizeof(now) - 1, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	vnode_put(vp);
++	if (now[0] != 0 && strncmp(now, last, sizeof(last)) != 0) {
++		int secs = 0;
++		strlcpy(last, now, sizeof(last));
++		for (const char *c = now; *c >= '0' && *c <= '9'; c++) {
++			secs = secs * 10 + (*c - '0');
++		}
++		if (secs >= 1 && secs <= 30) {
++			printf("PRF asked by /tmp/prof_go: %d s\n", secs);
++			sweet_prof_seconds = secs;
++		}
++	}
++}
++
++void sweet_prof_start(void);
++void
++sweet_prof_start(void)
++{
++	if (!sweet_prof_busy) {
++		thread_t t;
++		sweet_prof_busy = 1;
++		if (kernel_thread_start(sweet_prof_thread, NULL, &t) == KERN_SUCCESS) {
++			thread_deallocate(t);
++		}
++	}
++}
++
+ static void
+ sweet_prof_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -117,7 +167,8 @@ sweet_prof_thread(__unused void *arg, __unused wait_result_t wr)
+ 		uint32_t n;
+ 		int secs;
+ 		while (sweet_prof_seconds == 0) {
+-			(void)tsleep(&chan, PZERO, "sweetprf", hz / 4);
++			(void)tsleep(&chan, PZERO, "sweetprf", hz / 2);
++			sweet_prof_file();
+ 		}
+ 		secs = sweet_prof_seconds;
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_prof_proc, &f, NULL, NULL);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 03421a5..b61ca88 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <libkern/c++/OSSerialize.h>
+ extern "C" int sweet_panel_power(int on);
+ extern "C" void sweet_dpu_survey(void);
++extern "C" void sweet_prof_start(void);
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -863,6 +864,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			/* the panel dark while iOS has the display off (it still shows the last frame, and iOS
+ 			 * takes no touches then: it looked frozen), its brightness back when on */
+ 			IOLog("SWEET FB: display %s (panel %d)\n", off ? "off" : "on", sweet_panel_power(off ? 0 : 1));
++			if (!off) {
++				sweet_prof_start();       /* (once) the profiler's thread, asked by /tmp/prof_go */
++			}
+ 			if (!off && PE_parse_boot_argn("sweetdpu", &dpu, sizeof(dpu)) && dpu) {
+ 				sweet_dpu_survey();       /* once: the display engine as the boot loader left it */
+ 			}

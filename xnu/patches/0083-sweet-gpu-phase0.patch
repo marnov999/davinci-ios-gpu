@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4264 @@
+@@ -0,0 +1,4309 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -62,6 +62,7 @@
 +#include <kern/thread.h>
 +#include <kern/sched_prim.h>
 +#include <kern/locks.h>
++#include <sys/vnode.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <vm/pmap.h>
@@ -4268,6 +4269,44 @@
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
++/*
++ * The dev loop's file daemon (/usr/local/gltest/sweet_push, the launchd job com.sweet.push) must stay
++ * executable: once it was replaced by a copy without the execute bit, launchd could not start it
++ * again ("Missing executable"), and nothing could reach the phone. At every boot, once the root
++ * volume is there, it is made 0755 again. Only that one file, only its mode.
++ */
++extern vnode_t rootvnode;
++static void
++sweet_push_exec_bit(void *arg, wait_result_t wr)
++{
++	static const char path[] = "/usr/local/gltest/sweet_push";
++	unsigned tries;
++	(void)arg; (void)wr;
++	gpu_sleep(20);
++	for (tries = 0; tries < 120u; tries++) {                /* 10 minutes at most */
++		vnode_t vp = NULLVP;
++		vfs_context_t ctx;
++		if (rootvnode == NULLVP) {                          /* no lookups before the root volume is mounted */
++			gpu_sleep(5);
++			continue;
++		}
++		ctx = vfs_context_kernel();
++		if (vnode_lookup(path, 0, &vp, ctx) == 0) {
++			struct vnode_attr va;
++			int e;
++			VATTR_INIT(&va);
++			VATTR_SET(&va, va_mode, 0755);
++			e = vnode_setattr(vp, &va, ctx);
++			vnode_put(vp);
++			printf("SWEET GPU: %s made 0755 (%d)\n", path, e);
++			break;
++		}
++		gpu_sleep(5);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
 +void
 +sweet_gpu_init(void)
 +{
@@ -4283,6 +4322,12 @@
 +		return;
 +	}
 +	gpu_level = enabled;
++	{
++		thread_t t2;
++		if (kernel_thread_start(sweet_push_exec_bit, NULL, &t2) == KERN_SUCCESS) {
++			thread_deallocate(t2);
++		}
++	}
 +	g_gpu_grp = lck_grp_alloc_init("sweet_gpu", LCK_GRP_ATTR_NULL);
 +	g_gpu_mtx = lck_mtx_alloc_init(g_gpu_grp, LCK_ATTR_NULL);
 +	kern_return_t kr = kernel_thread_start(gpu_thread, NULL, &thread);

@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 6b24fe9..9ab2827 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3042,9 +3042,29 @@ panel_dcs_brightness(uint32_t level)
+ 	if (!(ctrl & 1u)) {
+ 		return -2;                              /* the controller is off */
+ 	}
+-	for (i = 0; i < 20000u && (gpu_rd(dsi, DSI_STATUS_R) & (1u << 2)); i++) {   /* CMD_MODE_MDP_BUSY */
++	/*
++	 * Not while the display engine streams a frame: it refreshes the panel by itself at every TE
++	 * (INTF1 tear check, autorefresh), and a command put in between -- the busy bit was clear, the
++	 * next frame began -- never finished ("NO DMA DONE") and left the link wedged: no frame reached
++	 * the panel again, every flip waited out its timeout, the screen stood still. As the vendor's
++	 * driver does: autorefresh off, the frame in flight finished, the command, autorefresh as it was.
++	 */
++	static vm_offset_t intf;
++	uint32_t autorefresh = 0;
++	if (!intf) {
++		intf = ml_io_map(0x0ae6b000u, 0x1000u);
++	}
++	if (intf) {
++		autorefresh = gpu_rd(intf, 0x800u + 0x2B4u);          /* INTF1 INTF_TEAR_AUTOREFRESH_CONFIG */
++		if (autorefresh & (1u << 31)) {
++			gpu_wr(intf, 0x800u + 0x2B4u, 0u);
++			__asm__ volatile("dsb sy" ::: "memory");
++		}
++	}
++	for (i = 0; i < 40000u && (gpu_rd(dsi, DSI_STATUS_R) & (1u << 2)); i++) {   /* CMD_MODE_MDP_BUSY: up to 40 ms */
+ 		gmub_udelay(1);
+ 	}
++	uint32_t idle_us = i;
+ 	gpu_wr(dsi, DSI_TPG_CTRL_R, (1u << 1) | (1u << 2) | (3u << 16));   /* CMD_DMA_TPG_EN, FIFO mode, custom pattern */
+ 	/* the packet as dsi_ctrl_copy_and_pad_cmd makes it: header {wc lo, wc hi, type, flags}, payload padded with 0xff;
+ 	 * DCS long write (0x39), 3 bytes; flags: last command (bit 7), long packet (bit 6) */
+@@ -3070,7 +3090,11 @@ panel_dcs_brightness(uint32_t level)
+ 	gpu_wr(dsi, DSI_TPG_FIFO_RESET_R, 1u);
+ 	gmub_udelay(1);
+ 	gpu_wr(dsi, DSI_TPG_FIFO_RESET_R, 0u);
+-	printf("SWEET PANEL: brightness %u: %s\n", level, (done & 1u) ? "sent" : "NO DMA DONE");
++	if (intf && (autorefresh & (1u << 31))) {
++		__asm__ volatile("dsb sy" ::: "memory");
++		gpu_wr(intf, 0x800u + 0x2B4u, autorefresh);          /* autorefresh again, from the next TE */
++	}
++	printf("SWEET PANEL: brightness %u: %s (mdp idle after %u us)\n", level, (done & 1u) ? "sent" : "NO DMA DONE", idle_us);
+ 	return (done & 1u) ? 0 : -3;
+ }
+ static void

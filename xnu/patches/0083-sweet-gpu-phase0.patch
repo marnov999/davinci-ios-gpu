@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5381 @@
+@@ -0,0 +1,5404 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -3017,8 +3017,31 @@
 +#define DSI_TPG_CTRL_R          0x15Cu
 +#define DSI_TPG_DMA_INIT_R      0x17Cu
 +#define DSI_TPG_FIFO_RESET_R    0x1ECu
++static uint32_t g_panel_level = 0x218u;    /* what the panel is to show when on (dt bl-default-level) */
++static bool     g_panel_off;               /* the display is off (IOMFB RequestPowerChange 0) */
++static int panel_dcs_brightness(uint32_t level);
++
++/* The brightness asked for: remembered, and shown unless the display is off. */
 +int
 +sweet_panel_brightness(uint32_t level)
++{
++	if (level > 0x7FFu) {
++		level = 0x7FFu;
++	}
++	g_panel_level = level;
++	return g_panel_off ? 0 : panel_dcs_brightness(level);
++}
++
++/* The display off and on (IOMFB RequestPowerChange from backboardd): dark at level 0, then back. */
++int
++sweet_panel_power(int on)
++{
++	g_panel_off = !on;
++	return panel_dcs_brightness(on ? g_panel_level : 0u);
++}
++
++static int
++panel_dcs_brightness(uint32_t level)
 +{
 +	static vm_offset_t dsi;
 +	static bool told;

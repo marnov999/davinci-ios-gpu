@@ -1,0 +1,103 @@
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+index 15e644a..7031302 100644
+--- a/iokit/Kernel/arm/SweetBacklight.cpp
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -26,6 +26,8 @@ extern "C" int sweet_panel_brightness(uint32_t level);
+ #define SWEET_BL_PANEL  2047u           /* the panel's own maximum */
+ #define SWEET_BL_START  0x218u          /* dt qcom,mdss-dsi-bl-default-level */
+ 
++/* The class is called what CoreBrightness matches (CBDisplayContaineriOS: IOServiceMatching("AppleARMBacklight")). */
++#define SweetBacklight AppleARMBacklight
+ class SweetBacklight : public IOService {
+ 	OSDeclareDefaultStructors(SweetBacklight);
+ public:
+@@ -121,6 +123,10 @@ SweetBacklight::setProperties(OSObject *properties)
+ 	if (!dict) {
+ 		return kIOReturnBadArgument;
+ 	}
++	if (sweet_bl_number(dict->getObject("IOMFBBrightnessLevel"), &value)) {   /* CoreBrightness Display.m */
++		take(value, "IOMFBBrightnessLevel");
++		return kIOReturnSuccess;
++	}
+ 	if (sweet_bl_number(dict->getObject("brightness"), &value)) {
+ 		take(value, "brightness");
+ 		return kIOReturnSuccess;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 39d7e7f..a4613f3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -52,6 +52,8 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <kern/thread.h>
+ #include <sys/proc.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <libkern/c++/OSSerialize.h>
++extern "C" int sweet_panel_power(int on);
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -145,6 +147,7 @@ public:
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -153,6 +156,33 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * What iOS sets on the framebuffer (logged, the first forty times): CoreBrightness's Display.m
++ * names IOMFBBrightnessLevel among the panel's properties; a number under it goes to the panel as
++ * on SweetBacklight (AppleARMBacklight), on a 0..65536 scale.
++ */
++extern "C" int sweet_panel_brightness(uint32_t level);
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	static unsigned logged;
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSNumber *n = dict ? OSDynamicCast(OSNumber, dict->getObject("IOMFBBrightnessLevel")) : NULL;
++	if (logged < 40) {
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		logged++;
++		if (s && properties->serialize(s)) {
++			IOLog("SWEET FB: set %.400s\n", s->text());
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (n) {
++		uint32_t v = n->unsigned32BitValue(), level = (uint32_t)(((uint64_t)(v > 65536u ? 65536u : v) * 2047u) / 65536u);
++		IOLog("SWEET FB: IOMFBBrightnessLevel %u -> panel %u: %d\n", v, level, sweet_panel_brightness(level ? level : (v ? 1 : 0)));
++	}
++	return kIOReturnSuccess;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -669,7 +699,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			/* the panel dark while iOS has the display off (it still shows the last frame, and iOS
++			 * takes no touches then: it looked frozen), its brightness back when on */
++			IOLog("SWEET FB: display %s (panel %d)\n", off ? "off" : "on", sweet_panel_power(off ? 0 : 1));
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 3f12a90..88c8b0f 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -83,7 +83,7 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+     "   {"
+-    "     'IOClass'         = SweetBacklight;"
++    "     'IOClass'         = AppleARMBacklight;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBacklight;"
+     "   },"

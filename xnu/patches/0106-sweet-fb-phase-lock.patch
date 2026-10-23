@@ -1,0 +1,52 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index af7f022..0382a7a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -154,6 +154,7 @@ public:
+ 	SweetSurface *fShown[2];      /* the surface on screen, and the one before it (still fetched for a frame) */
+ 	uint32_t      fFlips;
+ 	volatile uint32_t fShownSwap;   /* the id of the last swap shown (SwapWait waits for it) */
++	volatile uint64_t fLatchAt;     /* when the display engine last took a flip: a panel frame's start */
+ 	bool          swapShown(uint32_t id, uint64_t timeoutMS);
+ 	/* the frame rate, per second (boot-arg sweetfb_fps=1): swaps from backboardd, frames shown, of
+ 	 * which scanned out, and gaps of more than 20 ms between shown frames */
+@@ -471,6 +472,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fNextTick = now;
+ 		}
+ 		fb->fNextTick += period;
++		if (fb->fLatchAt != 0 && now - fb->fLatchAt < period * 60u) {
++			/*
++			 * In step with the panel: the display engine takes a flip at the start of the panel's
++			 * frame (its own timing, not this timer's), and SwapWait waits for that. A tick just
++			 * before a frame starts has its flip on the panel at once, and CoreAnimation the whole
++			 * frame for the next; one just after waited a whole frame, and the next swap came late.
++			 * Each tick moves at most 1 ms towards LEAD before the panel's frame start.
++			 */
++			uint64_t lead = 0, step = 0;
++			nanoseconds_to_absolutetime(2500000ull, &lead);
++			nanoseconds_to_absolutetime(1000000ull, &step);
++			int64_t off = (int64_t)((fb->fNextTick + lead - fb->fLatchAt) % period);   /* past a frame start */
++			if (off > (int64_t)period / 2) {
++				off -= (int64_t)period;
++			}
++			off = off > (int64_t)step ? (int64_t)step : off < -(int64_t)step ? -(int64_t)step : off;
++			fb->fNextTick -= off;
++		}
+ 		if (fb->fNextTick <= now) {
+ 			fb->fNextTick = now + period;   /* fell behind (a long GPU wait): start again from here */
+ 		}
+@@ -613,9 +632,14 @@ AppleCLCD::swapShown(uint32_t id, uint64_t timeoutMS)
+ 	IOLockUnlock(fLock);
+ 	if (shown && fScanning && fMdp != 0) {
+ 		volatile uint32_t *r = (volatile uint32_t *)fMdp;
++		bool pending = false;
+ 		while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0 && mach_absolute_time() < deadline) {
++			pending = true;
+ 			IODelay(100);
+ 		}
++		if (pending) {
++			fLatchAt = mach_absolute_time();   /* (seen to change: within 0.1 ms of the frame's start) */
++		}
+ 	}
+ 	if (told < 12) {
+ 		told++;

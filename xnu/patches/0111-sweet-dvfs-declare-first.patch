@@ -1,0 +1,20 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index c9fadc3..572a3ae 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2863,6 +2863,7 @@ extern void     sweet_surface_gpu_unref(void *surface);
+ extern uint32_t sweet_surface_gpu_seed(void *surface);
+ extern void     sweet_surface_gpu_flush(void *surface);
+ extern int64_t  sweet_surface_gpu_push_written(void *surface);   /* bytes, -1: push it all out */
++void sweet_dvfs_kick(void);     /* the clock governor (sweet_cpufreq's): something is being drawn */
+ 
+ /*
+  * One lock around everything that is the GPU's: the ring, the fence, the address space and
+@@ -4445,7 +4446,6 @@ drm_do_read_panel(user_addr_t ubuf, uint32_t gw, uint32_t gh)
+ #define MSM_PREP_NOSYNC 0x04u
+ #define MSM_INFO_IOS_GPU_LEVEL 0x87u   /* private: value = GPU perf level 0 (825 MHz) .. 7 (180 MHz); out: DCVS return */
+ static int gpu_set_level(uint32_t level, uint64_t *out);
+-void sweet_dvfs_kick(void);     /* the clock governor (sweet_cpufreq's): something is being drawn */
+ static int g_level_quiet;       /* (the clock governor's changes: no measuring, no line) */
+ #define MSM_INFO_IOS_REBOOT 0x86u      /* private: value 0 = set the PMIC reboot reason "bootloader" and
+                                          * report; 1 = set it and reset (-> fastboot) */

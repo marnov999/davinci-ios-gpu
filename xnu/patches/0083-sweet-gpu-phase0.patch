@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4883 @@
+@@ -0,0 +1,4950 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -1496,6 +1496,16 @@
 +	{ 0x80u, 6, { 610, 565, 430, 355, 267, 180 } },
 +};
 +static uint32_t g_gpu_nlevels;               /* the bin's levels: 0 the fastest */
++static uint32_t g_bw_levels = 1;             /* levels of the bus table sent (1: "off" only) */
++/* dt qcom,gpu-pwrlevel qcom,bus-freq, the same for every bin by speed; the index into grp3d's
++ * qcom,msm-bus,vectors-KBps, whose ib values (KB/s) are g_bus_kbps */
++static uint32_t
++bus_level(uint32_t mhz)
++{
++	return mhz >= 700 ? 11 : mhz >= 650 ? 10 : mhz >= 565 ? 9 : mhz >= 430 ? 8 : mhz >= 355 ? 7 : mhz >= 267 ? 6 : 4;
++}
++static const uint32_t g_bus_kbps[12] = { 0, 400000, 800000, 1200000, 1804000, 2188000, 2724000, 3296000, 4068000,
++	5412000, 6220000, 7216000 };
 +static uint16_t g_gpu_mhz[8];
 +
 +static uint32_t
@@ -1532,6 +1542,7 @@
 +}
 +
 +/* An entry of cmd-db by name: its RPMh address and (if asked) its list of levels. */
++static unsigned g_cmddb_auxwords;            /* the last entry's aux data, in 16-bit words */
 +static int
 +cmddb_find(const char *name, uint32_t *addr, uint16_t *vals, unsigned *nvals)
 +{
@@ -1574,6 +1585,7 @@
 +			if (vals) {
 +				uint16_t l = *(volatile uint16_t *)(ent + 20), off = *(volatile uint16_t *)(ent + 22);
 +				unsigned c = l >> 1, n = 1;
++				g_cmddb_auxwords = c;
 +				if (c > 16u) {
 +					c = 16u;
 +				}
@@ -1659,6 +1671,58 @@
 +	g_bw[25] = mc0;
 +	g_bw[26] = acv;
 +	g_bw[32] = g_bw[33] = g_bw[34] = 0x40000000u;  /* ddr_cmd_data[0][0..2] */
++	/* boot-arg sweetgpu_bw=1: the GPU's own votes for DDR, one level per entry of grp3d's bus table, as
++	 * the vendor sends them (build_bwtable_cmd_cache); the votes computed as Linux does from cmd-db
++	 * (a6xx_gmu_rpmh_bw_votes_init: SH0 over a 16-byte bus, MC0 over 4, ACV fixed with perfmode bit 3) */
++	{
++		uint32_t want = 0;
++		(void)PE_parse_boot_argn("sweetgpu_bw", &want, sizeof(want));
++		if (want) {
++			static const char *const bcm[3] = { "SH0", "MC0", "ACV" };
++			static const uint32_t buswidth[3] = { 16, 4, 0 };
++			uint16_t aux[16];
++			uint32_t unit[3], width[3], vcd[3], lv, j;
++			unsigned na = 0;
++			bool ok = true;
++			for (j = 0; j < 3u && ok; j++) {
++				ok = cmddb_find(bcm[j], &a, aux, &na) == 0 && g_cmddb_auxwords >= 4u;
++				if (ok) {
++					unit[j] = (uint32_t)aux[0] | (uint32_t)aux[1] << 16;
++					width[j] = aux[2];
++					vcd[j] = aux[3] & 0xFFu;
++					ok = unit[j] != 0;
++				}
++			}
++			if (!ok) {
++				printf("SWEET GMU: [T] no BCM data for %s: the bus table stays \"off\" only\n", bcm[j - 1u]);
++			} else {
++				for (lv = 0; lv < 12u; lv++) {
++					for (j = 0; j < 3u; j++) {
++						uint32_t commit = (j == 2u || vcd[j] != vcd[j + 1u]) ? 1u : 0u, vote;
++						uint64_t peak;
++						if (g_bus_kbps[lv] == 0) {
++							g_bw[32 + 8 * lv + j] = commit << 30;
++						} else if (j == 2u) {
++							g_bw[32 + 8 * lv + j] = commit << 30 | 1u << 29 | (1u << 3);
++						} else {
++							peak = (uint64_t)g_bus_kbps[lv] * width[j] / buswidth[j] * 1000u / unit[j];
++							vote = peak < 1u ? 1u : peak > 0x3FFFu ? 0x3FFFu : (uint32_t)peak;
++							g_bw[32 + 8 * lv + j] = commit << 30 | 1u << 29 | vote;
++						}
++					}
++				}
++				g_bw[1] = 12;
++				g_bw[5] = 0;
++				for (j = 0; j < 3u; j++) {
++					g_bw[5] |= (g_bw[32 + j] >> 30 & 1u) << j;
++				}
++				g_bw_levels = 12;
++				printf("SWEET GMU: [T] bus table: 12 levels; SH0 unit %u width %u vcd %u, MC0 unit %u width %u vcd %u, "
++				    "ACV vcd %u; top votes %#x %#x %#x\n", unit[0], width[0], vcd[0], unit[1], width[1], vcd[1], vcd[2],
++				    g_bw[32 + 88], g_bw[33 + 88], g_bw[34 + 88]);
++			}
++		}
++	}
 +	g_tables = true;
 +	printf("SWEET GMU: [T] speed bin %#x: %u levels, %u..%u MHz; votes 0:%#x 1:%#x top:%#x; gmu %#x; boot gx %u mx %u; "
 +	    "SH0 %#x MC0 %#x ACV %#x CN0 %#x\n", bin, g_gpu_nlevels, g_gpu_mhz[g_gpu_nlevels - 1u], g_gpu_mhz[0], g_perf[3],
@@ -4765,7 +4829,10 @@
 +	/* the GMU's index into the table it was sent: ascending, 0 the 0 Hz level (vendor gmu_dcvs_set:
 +	 * num_gpupwrlevels - pwrlevel - 1); CLKSET_OPTION_ATLEAST; the bus vote left as it is (0xFF) */
 +	gmub_wr(GMUB_DCVS_PERF_SETTING, (3u << 28) | (g_gpu_nlevels - level));
-+	gmub_wr(GMUB_DCVS_BW_SETTING, (0xFFu << 12) | 0xFFu);
++	{       /* vendor BW_VOTE(idx); 0xFF: leave the bus as it is (only "off" in the table) */
++		uint32_t bw = g_bw_levels > 1u ? bus_level(g_gpu_mhz[level]) : 0xFFu;
++		gmub_wr(GMUB_DCVS_BW_SETTING, (bw << 12) | bw);
++	}
 +	__asm__ volatile("dsb osh" ::: "memory");
 +	gmub_wr(GMUB_HOST2GMU_INTR_SET, GMUB_OOB_DCVS_SET);
 +	for (polls = 0; polls < 10000u; polls++) {             /* 100 ms */

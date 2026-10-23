@@ -1,0 +1,242 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7163eca..6a79bec 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -145,6 +145,13 @@ public:
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
++	int           fScanout;       /* boot-arg sweetfb_scanout: the display engine fetches the surface itself */
++	vm_offset_t   fMdp;           /* MDP registers: CTL0 and VIG0 */
++	bool          fScanning;      /* VIG0 is on a surface of iOS's, not on the boot framebuffer */
++	SweetSurface *fShown[2];      /* the surface on screen, and the one before it (still fetched for a frame) */
++	uint32_t      fFlips;
++	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride);
++	void scanBack(void);
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -210,6 +217,7 @@ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
++	fScanout = -1;
+ 	PE_Video video;
+ 
+ 	if (!IOService::start(provider)) {
+@@ -453,6 +461,65 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * Scanning out (boot-arg sweetfb_scanout=1), as Android's composer has the display engine do: no
++ * copy, the engine fetches iOS's surface itself. The boot loader leaves pipe VIG0 fetching its
++ * framebuffer (SRC0_ADDR 0x9c000000, 1080x2340, stride 4320; dt qcom,sde-sspp-off: vig0 0x5000)
++ * through CTL0 to INTF1, whose tear check refreshes the command-mode panel by itself every frame
++ * (INTF_TEAR autorefresh, sweet_dpu.c's survey). A swap writes the surface's address and stride
++ * into VIG0 and VIG0's flush bit into CTL0 (sde_hw_ctl: SSPP_VIG0 = bit 0): the engine takes the
++ * double-buffered registers at the next frame's start, so there is no tearing. The surface has to
++ * be one physical piece below 4 GB (SweetSurface allocates CoreAnimation's full-screen ones so);
++ * anything else is copied as before, with VIG0 back on the boot framebuffer.
++ */
++#define SWEET_MDP_PA            0x0ae00000u
++#define SWEET_MDP_CTL0_FLUSH    (0x2000u + 0x018u)
++#define SWEET_MDP_VIG0_ADDR     (0x5000u + 0x014u)
++#define SWEET_MDP_VIG0_STRIDE   (0x5000u + 0x024u)
++#define SWEET_MDP_FLUSH_VIG0    0x1u
++extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++
++bool
++AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride)
++{
++	if (fMdp == 0 && (fMdp = ml_io_map_unmappable(SWEET_MDP_PA, 0x6000u, 0x7u /* VM_WIMG_IO */)) == 0) {
++		return false;
++	}
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	r[SWEET_MDP_VIG0_ADDR / 4] = (uint32_t)pa;
++	r[SWEET_MDP_VIG0_STRIDE / 4] = (r[SWEET_MDP_VIG0_STRIDE / 4] & 0xffff0000u) | (stride & 0xffffu);
++	__asm__ volatile("dsb sy" ::: "memory");
++	r[SWEET_MDP_CTL0_FLUSH / 4] = SWEET_MDP_FLUSH_VIG0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (s != fShown[0]) {
++		OSSafeReleaseNULL(fShown[1]);        /* two flips old: no longer fetched */
++		fShown[1] = fShown[0];
++		s->retain();
++		fShown[0] = s;
++	}
++	if (!fScanning || fFlips < 4) {
++		IOLog("SWEET FB: scanning out surface %u at %#llx, stride %u (flip %u)\n", s->id, pa, stride, fFlips);
++	}
++	fScanning = true;
++	fFlips++;
++	return true;
++}
++
++void
++AppleCLCD::scanBack(void)
++{
++	if (!fScanning) {
++		return;
++	}
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	r[SWEET_MDP_VIG0_ADDR / 4] = (uint32_t)fPhys;
++	r[SWEET_MDP_VIG0_STRIDE / 4] = (r[SWEET_MDP_VIG0_STRIDE / 4] & 0xffff0000u) | (fRowBytes & 0xffffu);
++	__asm__ volatile("dsb sy" ::: "memory");
++	r[SWEET_MDP_CTL0_FLUSH / 4] = SWEET_MDP_FLUSH_VIG0;
++	fScanning = false;
++	IOLog("SWEET FB: back on the boot framebuffer\n");
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -545,6 +612,24 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (fScanout < 0) {
++			int v = 0;
++			fScanout = PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0;
++		}
++		if (fScanout && src != 0 && bpe == 4 && mask == 1u && dx == 0 && dy == 0 &&
++		    w == (int32_t)fWidth && h == (int32_t)fHeight) {
++			uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++			uint64_t need = (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4;
++			IOByteCount seg = 0;
++			addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++			if (pa != 0 && seg >= need && pa + need <= 0x100000000ull && scanOut(s, pa, s->bytesPerRow)) {
++				s->release();
++				continue;
++			}
++		}
++		if (fScanning) {
++			scanBack();
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			RowJob job;
+ 			job.src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 4eec4ff..88f330c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -499,6 +499,39 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 		}
+ 		s->planeCount = planes->getCount();
++	} else if (!sweet_fmt_subst && s->width != 0 && s->height != 0) {
++		/* two-plane YCbCr asked for without plane info: luma, then interleaved chroma (MiniIOSurface
++		 * biplanarLayout); *2 for the 10-bit ones, in 16 bits */
++		uint32_t hs = 0, vs = 0, wide = 0, f = s->pixelFormat;
++		if (f == '420v' || f == '420f') { hs = 2; vs = 2; }
++		else if (f == '422v' || f == '422f') { hs = 2; vs = 1; }
++		else if (f == '444v' || f == '444f') { hs = 1; vs = 1; }
++		else if (f == 'x420' || f == 'xf20') { hs = 2; vs = 2; wide = 1; }
++		else if (f == 'x422' || f == 'xf22') { hs = 2; vs = 1; wide = 1; }
++		else if (f == 'x444' || f == 'xf44') { hs = 1; vs = 1; wide = 1; }
++		if (hs != 0) {
++			struct sweet_surface_plane *y = &s->planes[0], *c = &s->planes[1];
++			bzero(y, sizeof(*y));
++			bzero(c, sizeof(*c));
++			y->width = s->width;
++			y->height = s->height;
++			y->bytesPerElement = wide ? 2 : 1;
++			y->elementWidth = y->elementHeight = 1;
++			y->bytesPerRow = sweet_row_bytes(y->width, 1, y->bytesPerElement);
++			y->offset = 0;
++			y->size = y->bytesPerRow * y->height;
++			c->width = sweet_div_up(s->width, hs);
++			c->height = sweet_div_up(s->height, vs);
++			c->bytesPerElement = wide ? 4 : 2;
++			c->elementWidth = c->elementHeight = 1;
++			c->bytesPerRow = sweet_row_bytes(c->width, 1, c->bytesPerElement);
++			c->offset = y->size;
++			c->size = c->bytesPerRow * c->height;
++			s->planeCount = 2;
++			if ((uint64_t)c->offset + c->size > end) {
++				end = (uint64_t)c->offset + c->size;
++			}
++		}
+ 	}
+ 
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+@@ -748,17 +781,52 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put32(out, 0x44, s->cacheMode);
+ 	put32(out, 0x50, s->parentID);
+ 	put32(out, 0x54, 1);
+-	for (uint32_t i = 0; i < s->planeCount; i++) {
++	/*
++	 * The planes, as IOSurface.framework reads them (HackiOS MiniIOSurface.h struct minisurf_plane):
++	 * width 0x00, height 0x04, offset 0x0c, bytes per row 0x10 (it was written at 0x08, a reserved
++	 * word: every IOSurfaceGetBytesPerRowOfPlane() answered 0, and VideoToolbox's decodes into
++	 * planes came out empty -- the wallpaper's HEIC pictures were all zero), size 0x14, element
++	 * 0x18..0x1b, components 0x1c..0x34. A surface without planes still has its one plane described
++	 * here (MiniIOSurface resultSize: at least one), the header's count staying 0.
++	 */
++	uint32_t described = s->planeCount ? s->planeCount : 1;
++	for (uint32_t i = 0; i < described && i < SWEET_SURFACE_MAX_PLANES; i++) {
+ 		uint8_t *p = out + 0x68 + i * 0x80;
++		struct sweet_surface_plane one;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
++		if (s->planeCount == 0) {
++			bzero(&one, sizeof(one));
++			one.width = s->width;
++			one.height = s->height;
++			one.bytesPerRow = s->bytesPerRow;
++			one.offset = 0;
++			one.size = s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++			one.bytesPerElement = s->bytesPerElement;
++			one.elementWidth = s->elementWidth;
++			one.elementHeight = s->elementHeight;
++			pl = &one;
++		}
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+ 		p[0x1a] = pl->elementWidth;
+ 		p[0x1b] = pl->elementHeight;
++		if (s->planeCount == 0 && (s->pixelFormat == 'BGRA' || s->pixelFormat == 'RGBA')) {
++			/* MiniIOSurface describeComponents: in memory order; names 1 alpha 2 red 3 green 4 blue */
++			static const uint8_t bgra[4] = { 4, 3, 2, 1 }, rgba[4] = { 2, 3, 4, 1 };
++			const uint8_t *names = s->pixelFormat == 'BGRA' ? bgra : rgba;
++			p[0x1c] = 4;
++			for (unsigned c = 0; c < 4; c++) {
++				p[0x20 + c] = 8;                   /* bit depth */
++				p[0x24 + c] = (uint8_t)(8 * c);    /* bit offset */
++				p[0x28 + c] = names[c];
++				p[0x2c + c] = 1;                   /* unsigned integer */
++				p[0x30 + c] = 1;                   /* full range */
++			}
++		}
+ 	}
+ }
+ 
+@@ -925,8 +993,23 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			/* boot-arg sweetfb_scanout=1: a full-screen BGRA surface (what CoreAnimation presents,
++			 * 1125x2436) in one physically contiguous piece below 4 GB, so that the display
++			 * engine can fetch it as it is (SweetFramebuffer scanOut); else as any other */
++			static int scanout = -1;
++			if (scanout < 0) {
++				int v = 0;
++				scanout = PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0;
++			}
++			if (scanout && s->width == 1125 && s->height == 2436 && s->pixelFormat == 'BGRA' && s->planeCount == 0) {
++				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize,
++				    0x00000000FFFFF000ull);
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);

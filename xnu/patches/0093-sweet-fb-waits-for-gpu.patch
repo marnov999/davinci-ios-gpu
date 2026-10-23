@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e043d29..03421a5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -229,6 +229,13 @@ AppleCLCD::start(IOService *provider)
+ 			sweet_surface_display_pool_init();    /* early: while memory is in one piece */
+ 		}
+ 	}
++	/*
++	 * present() waits for the GPU to be done with a surface before it shows it (sweet_gpu_surface_wait,
++	 * on the vsync timer's thread): said so for the GL bridge (HackiOS eagl.c display_waits), which
++	 * then no longer glFinish()es every frame -- the window server goes on with its next frame while
++	 * the GPU draws this one, instead of waiting for it (3-14 ms of every frame).
++	 */
++	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
+ 	PE_Video video;
+ 
+ 	if (!IOService::start(provider)) {

@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5516 @@
+@@ -0,0 +1,5597 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5414,6 +5414,81 @@
 +	wifi_mailbox_survey();
 +}
 +
++/*
++ * The CPU's clock (boot-arg sweetcpufreq=1), as HackiOS's redwood_cpufreq.c does it on its EPSS: the
++ * boot loader leaves each cluster at a modest frequency and expects the OS to ask for more; the
++ * hardware ("OSM" on this SoC, dt qcom,cpucc@18321000 qcom,clk-cpu-osm-sdmmagpie) has each
++ * cluster's table of frequencies and switches clock source and supply by itself when told which
++ * row is wanted. Register layout: the vendor's drivers/clk/qcom/clk-cpu-osm.c. Every core of every
++ * cluster is asked for its top row; the cluster's hardware limits (qcom,msm-hw-limits) still
++ * throttle it when hot. The real frequency is measured before and after from OSM's own cycle
++ * counters.
++ */
++#define OSM_FREQ_REG(r)      (0x110u + 32u * (r))
++#define OSM_CORE_DCVS_CTRL   0xBCu
++#define OSM_PERF_STATE(n)    (0x920u + 4u * (n))
++#define OSM_CYCLES(n)        (0x9C0u + 4u * (n))
++static const struct { uint32_t pa; unsigned cores; const char *name; } osm_clusters[3] = {
++	{ 0x18321000u, 1, "L3" }, { 0x18323000u, 6, "little (cpu0-5)" }, { 0x18325800u, 2, "big (cpu6-7)" },
++};
++
++static uint32_t
++osm_row_khz(uint32_t data)
++{
++	return (data >> 30) ? 19200u * (data & 0xFFu) : 300000u;
++}
++
++static uint32_t
++osm_measured_mhz(vm_offset_t base, unsigned n)
++{
++	uint32_t c0 = gpu_rd(base, OSM_CYCLES(n)), c1;
++	uint64_t t0 = mach_absolute_time(), ns;
++	delay_for_interval(10, NSEC_PER_MSEC);
++	c1 = gpu_rd(base, OSM_CYCLES(n));
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns ? (uint32_t)((uint64_t)(c1 - c0) * 1000u / ns) : 0;
++}
++
++static void
++sweet_cpufreq(void)
++{
++	unsigned c, r, n;
++	for (c = 0; c < 3u; c++) {
++		vm_offset_t base = ml_io_map(osm_clusters[c].pa, 0x1000u);
++		uint32_t top = 0, top_khz = 0, ctrl, was, before;
++		char line[300];
++		int at = 0;
++		bool per_core;
++		if (!base) {
++			continue;
++		}
++		for (r = 0; r < 40u; r++) {
++			uint32_t khz = osm_row_khz(gpu_rd(base, OSM_FREQ_REG(r)));
++			if (r > 0 && khz <= top_khz) {
++				break;                                      /* the table ends by repeating its last row */
++			}
++			top = r;
++			top_khz = khz;
++			if (at < (int)sizeof(line) - 8) {
++				at += snprintf(line + at, sizeof(line) - (size_t)at, " %u", khz / 1000u);
++			}
++		}
++		ctrl = gpu_rd(base, OSM_CORE_DCVS_CTRL);
++		per_core = (ctrl & 1u) != 0;
++		was = gpu_rd(base, OSM_PERF_STATE(0));
++		before = osm_measured_mhz(base, 0);
++		printf("SWEET CPUFREQ: %s: table (MHz):%s; row %u now, measured %u MHz; per-core %d\n", osm_clusters[c].name,
++		    line, was, before, per_core);
++		for (n = 0; n < (per_core ? osm_clusters[c].cores : 1u); n++) {
++			gpu_wr(base, OSM_PERF_STATE(n), top);
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		delay_for_interval(20, NSEC_PER_MSEC);
++		printf("SWEET CPUFREQ: %s: row %u (%u MHz) asked; measured %u MHz\n", osm_clusters[c].name, top, top_khz / 1000u,
++		    osm_measured_mhz(base, 0));
++	}
++}
++
 +static void
 +gpu_thread(void *arg, wait_result_t wr)
 +{
@@ -5437,6 +5512,12 @@
 +		uint32_t arm = 0;
 +		if (PE_parse_boot_argn("sweetgpu_armfb", &arm, sizeof(arm)) && arm) {
 +			printf("SWEET GPU: armed for fastboot: %d\n", sweet_reboot_fastboot(0));
++		}
++	}
++	{
++		uint32_t f = 0;
++		if (PE_parse_boot_argn("sweetcpufreq", &f, sizeof(f)) && f) {
++			sweet_cpufreq();
 +		}
 +	}
 +	{

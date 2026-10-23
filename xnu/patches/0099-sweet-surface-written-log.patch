@@ -1,0 +1,19 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index b25b83d..ef29845 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -401,8 +401,14 @@ sweet_surface_push_written(SweetSurface *s)
+ 		pushed += PAGE_SIZE;
+ 	}
+ 	if (pushed != 0) {
++		static uint32_t looks;
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		OSBitOrAtomic(1u, &s->cpuWritten);
++		if (looks++ % 400u < 3u) {
++			/* (which surfaces are written by a processor, how much of them: the first of every 400) */
++			IOLog("SWEET SURF: surface %u %ux%u (display buffer %u): %lld of %u pages written since the last look\n", s->id,
++			    s->width, s->height, s->poolSlot, pushed / PAGE_SIZE, s->pageCount);
++		}
+ 	}
+ 	return pushed;
+ }

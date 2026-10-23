@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6a79bec..032d050 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -626,6 +626,19 @@ AppleCLCD::present(const uint8_t *rec)
+ 				s->release();
+ 				continue;
+ 			}
++			{
++				static uint32_t told;
++				if (told++ < 6) {
++					IOLog("SWEET FB: not scanned out: surface %u pa %#llx, %llu of %llu bytes in one piece\n", s->id,
++					    (unsigned long long)pa, (unsigned long long)seg, (unsigned long long)need);
++				}
++			}
++		} else if (fScanout) {
++			static uint32_t told;
++			if (told++ < 6) {
++				IOLog("SWEET FB: not scanned out: mask %#x src %d bpe %u at %d,%d %dx%d (panel %ux%u)\n", mask, src != 0, bpe,
++				    dx, dy, w, h, fWidth, fHeight);
++			}
+ 		}
+ 		if (fScanning) {
+ 			scanBack();
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 88f330c..2ee031c 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1005,6 +1005,17 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize,
+ 				    0x00000000FFFFF000ull);
++				if (mem == NULL) {      /* (perhaps not with kIOMemoryKernelUserShared) */
++					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++					    kIODirectionInOut | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000FFFFF000ull);
++				}
++				{
++					IOByteCount seg = 0;
++					addr64_t pa = mem ? mem->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
++					IOLog("SWEET SURF: full-screen surface %u: %s, pa %#llx, %llu of %u bytes in one piece\n", s->id,
++					    mem ? "contiguous asked" : "NO contiguous memory", (unsigned long long)pa,
++					    (unsigned long long)seg, s->allocSize);
++				}
+ 			}
+ 			if (mem == NULL) {
+ 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,

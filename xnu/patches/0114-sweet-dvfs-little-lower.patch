@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 572a3ae..8f87e34 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -5549,8 +5549,18 @@ osm_set(unsigned c, uint32_t row)
+ static void
+ dvfs_apply(int mode)
+ {
+-	/* rows: L3 768/1132/top, little 768/1324/top, big 652/1209/top (tables in the CPUFREQ lines) */
+-	static const uint32_t rows[3][3] = { { 99, 99, 99 }, { 3, 2, 1 }, { 6, 5, 5 } };
++	/*
++	 * rows: L3 768/1132/top, little 768/1324/1497, big 652/1209/top (tables in the CPUFREQ lines).
++	 * Fast: the big cluster at its top -- what draws runs there (sched_prim.c choose_processor) --
++	 * and the little cluster lower (boot-arg sweetdvfs_little=ROW, 6 = 1497 MHz; its clock is the
++	 * cluster's, not a core's): less heat and power for what runs there now, background work.
++	 */
++	static uint32_t rows[3][3] = { { 99, 6, 99 }, { 3, 2, 1 }, { 6, 5, 5 } };
++	static int once;
++	if (!once) {
++		once = 1;
++		(void)PE_parse_boot_argn("sweetdvfs_little", &rows[0][1], sizeof(rows[0][1]));
++	}
+ 	uint32_t level = mode == 0 ? 0u : mode == 1 ? (g_gpu_nlevels ? g_gpu_nlevels - 1u : 7u) : g_gpu_nlevels / 2u;
+ 	uint64_t o = 0;
+ 	for (unsigned c = 0; c < 3u; c++) {

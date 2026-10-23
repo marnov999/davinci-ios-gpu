@@ -1,0 +1,151 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 032d050..16e12e8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -218,6 +218,12 @@ bool
+ AppleCLCD::start(IOService *provider)
+ {
+ 	fScanout = -1;
++	{
++		int v = 0;
++		if (PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0) {
++			sweet_surface_display_pool_init();    /* early: while memory is in one piece */
++		}
++	}
+ 	PE_Video video;
+ 
+ 	if (!IOService::start(provider)) {
+@@ -616,7 +622,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			int v = 0;
+ 			fScanout = PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0;
+ 		}
+-		if (fScanout && src != 0 && bpe == 4 && mask == 1u && dx == 0 && dy == 0 &&
++		if (fScanout && src != 0 && bpe == 4 && (mask & 0xfu) == 1u && dx == 0 && dy == 0 &&
+ 		    w == (int32_t)fWidth && h == (int32_t)fHeight) {
+ 			uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+ 			uint64_t need = (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 2ee031c..6cb1711 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -77,6 +77,50 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/*
++ * The display pool (boot-arg sweetfb_scanout=1): CoreAnimation's full-screen surfaces have to be one
++ * physical piece for the display engine to fetch them (SweetFramebuffer scanOut), and 11 MB in one
++ * piece is not to be had once the system has run a while -- so three are made at the start, while
++ * memory is whole, and a full-screen surface takes a free one (it goes back when the surface goes).
++ */
++#define SWEET_DISPLAY_POOL      3
++#define SWEET_DISPLAY_W         1125u
++#define SWEET_DISPLAY_H         2436u
++#define SWEET_DISPLAY_BPR       4608u
++static IOBufferMemoryDescriptor *sweet_display_pool[SWEET_DISPLAY_POOL];
++bool sweet_display_busy[SWEET_DISPLAY_POOL];
++
++void
++sweet_surface_display_pool_init(void)
++{
++	vm_size_t size = round_page((vm_size_t)SWEET_DISPLAY_BPR * SWEET_DISPLAY_H);
++	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
++		IOByteCount seg = 0;
++		if (sweet_display_pool[i] != NULL) {
++			continue;
++		}
++		sweet_display_pool[i] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000FFFFF000ull);
++		addr64_t pa = sweet_display_pool[i] ? sweet_display_pool[i]->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
++		IOLog("SWEET SURF: display buffer %u: %s at %#llx, %llu of %lu bytes in one piece\n", i,
++		    sweet_display_pool[i] ? "made" : "NOT MADE", (unsigned long long)pa, (unsigned long long)seg, (unsigned long)size);
++	}
++}
++
++static IOBufferMemoryDescriptor *
++sweet_display_take(uint32_t size, uint32_t *slot)
++{
++	for (unsigned i = 0; i < SWEET_DISPLAY_POOL; i++) {
++		if (sweet_display_pool[i] != NULL && !sweet_display_busy[i] && sweet_display_pool[i]->getLength() >= size) {
++			sweet_display_busy[i] = true;
++			sweet_display_pool[i]->retain();
++			*slot = i + 1;
++			return sweet_display_pool[i];
++		}
++	}
++	return NULL;
++}
++
+ void
+ SweetSurface::free()
+ {
+@@ -86,6 +130,10 @@ SweetSurface::free()
+ 	if (wrapped && memory != NULL) {
+ 		memory->complete();   /* balance the prepare() from the IOSurfaceAddress wrap */
+ 	}
++	if (poolSlot != 0) {
++		extern bool sweet_display_busy[];
++		sweet_display_busy[poolSlot - 1] = false;   /* the pool keeps its own reference */
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -994,27 +1042,16 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+ 			/* boot-arg sweetfb_scanout=1: a full-screen BGRA surface (what CoreAnimation presents,
+-			 * 1125x2436) in one physically contiguous piece below 4 GB, so that the display
+-			 * engine can fetch it as it is (SweetFramebuffer scanOut); else as any other */
+-			static int scanout = -1;
+-			if (scanout < 0) {
+-				int v = 0;
+-				scanout = PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0;
+-			}
+-			if (scanout && s->width == 1125 && s->height == 2436 && s->pixelFormat == 'BGRA' && s->planeCount == 0) {
+-				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize,
+-				    0x00000000FFFFF000ull);
+-				if (mem == NULL) {      /* (perhaps not with kIOMemoryKernelUserShared) */
+-					mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-					    kIODirectionInOut | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000FFFFF000ull);
+-				}
+-				{
+-					IOByteCount seg = 0;
+-					addr64_t pa = mem ? mem->getPhysicalSegment(0, &seg, kIOMemoryMapperNone) : 0;
+-					IOLog("SWEET SURF: full-screen surface %u: %s, pa %#llx, %llu of %u bytes in one piece\n", s->id,
+-					    mem ? "contiguous asked" : "NO contiguous memory", (unsigned long long)pa,
+-					    (unsigned long long)seg, s->allocSize);
++			 * 1125x2436) gets a buffer of the display pool, one physical piece below 4 GB, so that
++			 * the display engine can fetch it as it is (SweetFramebuffer scanOut); else as any other */
++			if (s->width == SWEET_DISPLAY_W && s->height == SWEET_DISPLAY_H && s->pixelFormat == 'BGRA' &&
++			    s->planeCount == 0 && s->bytesPerRow == SWEET_DISPLAY_BPR) {
++				mem = sweet_display_take(s->allocSize, &s->poolSlot);
++				if (mem == NULL) {
++					static uint32_t told;
++					if (told++ < 4) {
++						IOLog("SWEET SURF: no display buffer free for a full-screen surface\n");
++					}
+ 				}
+ 			}
+ 			if (mem == NULL) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 469b72a..e346167 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,6 +40,7 @@ public:
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	bool                      wrapped;      /* backing is the creator's OWN memory (IOSurfaceAddress wrap) */
++	uint32_t                  poolSlot;     /* 1 + the display pool buffer it has, 0: none */
+ 	task_t                    clientTask;   /* task whose VA clientAddress lives in (for complete()) */
+ 	uint64_t                  clientAddress;
+ 
+@@ -58,6 +59,8 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+  * retained surface that stays in the id table until released by the caller
+  * and every user.
+  */
++/* boot-arg sweetfb_scanout=1: physically contiguous full-screen buffers, made early (AppleCLCD::start) */
++void sweet_surface_display_pool_init(void);
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 

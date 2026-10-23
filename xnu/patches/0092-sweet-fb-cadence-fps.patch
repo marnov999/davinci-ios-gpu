@@ -1,0 +1,78 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 16e12e8..e043d29 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -150,6 +150,11 @@ public:
+ 	bool          fScanning;      /* VIG0 is on a surface of iOS's, not on the boot framebuffer */
+ 	SweetSurface *fShown[2];      /* the surface on screen, and the one before it (still fetched for a frame) */
+ 	uint32_t      fFlips;
++	/* the frame rate, per second (boot-arg sweetfb_fps=1): swaps from backboardd, frames shown, of
++	 * which scanned out, and gaps of more than 20 ms between shown frames */
++	uint32_t      fRateSwaps, fRateShown, fRateFlips, fRateLate;
++	uint64_t      fRateSince, fLastShown;
++	uint64_t      fNextTick;      /* the timer's next deadline: a fixed 60 Hz cadence, not 16.7 ms after the work */
+ 	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride);
+ 	void scanBack(void);
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -408,10 +413,52 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint32_t flips = fb->fFlips;
++		uint64_t now = mach_absolute_time(), ns = 0;
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		fb->fRateShown++;
++		fb->fRateFlips += fb->fFlips - flips;
++		if (fb->fLastShown != 0) {
++			absolutetime_to_nanoseconds(now - fb->fLastShown, &ns);
++			fb->fRateLate += ns > 20000000ull;
++		}
++		fb->fLastShown = now;
++	}
++	{
++		static int want = -1;
++		uint64_t now = mach_absolute_time(), ns = 0;
++		if (want < 0) {
++			int v = 0;
++			want = PE_parse_boot_argn("sweetfb_fps", &v, sizeof(v)) && v != 0;
++		}
++		if (fb->fRateSince == 0) {
++			fb->fRateSince = now;
++		}
++		absolutetime_to_nanoseconds(now - fb->fRateSince, &ns);
++		if (ns >= 1000000000ull) {
++			if (want && fb->fRateSwaps != 0) {
++				IOLog("SWEET FPS: %u swaps, %u shown (%u scanned out), %u late, in %llu ms\n", fb->fRateSwaps,
++				    fb->fRateShown, fb->fRateFlips, fb->fRateLate, ns / 1000000ull);
++			}
++			fb->fRateSwaps = fb->fRateShown = fb->fRateFlips = fb->fRateLate = 0;
++			fb->fRateSince = now;
++		}
++		/* re-armed for the next 1/60 s from the last deadline, not from now: re-armed after the
++		 * work (which waits for the GPU) every tick was longer than 16.7 ms and "60 Hz" ran at 40-50 */
++		uint64_t period = 0;
++		nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000ull, &period);
++		if (fb->fNextTick == 0) {
++			fb->fNextTick = now;
++		}
++		fb->fNextTick += period;
++		if (fb->fNextTick <= now) {
++			fb->fNextTick = now + period;   /* fell behind (a long GPU wait): start again from here */
++		}
++		AbsoluteTime deadline;
++		*(uint64_t *)&deadline = fb->fNextTick;
++		sender->wakeAtTime(deadline);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+@@ -461,6 +508,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fRateSwaps++;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);

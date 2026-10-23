@@ -1,0 +1,278 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index bc682a9..49ccaa9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2862,6 +2862,7 @@ extern void    *sweet_surface_gpu_ref(uint32_t id);
+ extern void     sweet_surface_gpu_unref(void *surface);
+ extern uint32_t sweet_surface_gpu_seed(void *surface);
+ extern void     sweet_surface_gpu_flush(void *surface);
++extern int64_t  sweet_surface_gpu_push_written(void *surface);   /* bytes, -1: push it all out */
+ 
+ /*
+  * One lock around everything that is the GPU's: the ring, the fence, the address space and
+@@ -3934,9 +3935,10 @@ drm_do_get_param(uint32_t param, uint64_t *out)
+ 
+ /* GEM_SUBMIT (port of HackiOS RedwoodGPU::submit). With the lock held.
+  *  - each CMD_BUF resolved to its BO's address, checked to lie inside the BO;
+- *  - every IOSurface the submission names pushed out of this processor's cache when its seed
+- *    says it has changed, and in any case once in GPU_PUSH_AGAIN_MS (not everybody who draws
+- *    into a surface says so): the GPU reads memory, uncached;
++ *  - every IOSurface the submission names looked at when its seed says it has changed, and in
++ *    any case once in GPU_PUSH_AGAIN_MS (not everybody who draws into a surface says so), and
++ *    the pages a processor wrote pushed out of its cache (all of it the first time, or when
++ *    its pages say nothing): the GPU reads memory, uncached;
+  *  - the submission put in the ring, not waited for;
+  *  - every BO it names given its fence: a BO given back before that fence is done keeps its
+  *    memory and addresses until it is (gpu_bo_release), and the display waits for a surface's
+@@ -3981,13 +3983,18 @@ drm_do_gem_submit(struct drm_msm_gem_submit *s, uint32_t *out_fence)
+ 		for (j = 0; j < m; j++) {
+ 			struct kgsl_bo_ent *b = kgsl_bo_find(chunk[j].handle);
+ 			uint32_t seed;
++			int64_t written;
+ 			if (b == NULL || b->surf == NULL) { continue; }
+ 			seed = sweet_surface_gpu_seed(b->surf);
+ 			if (seed == b->seed && began - b->pushed < again) { continue; }
++			written = b->pushed != 0 ? sweet_surface_gpu_push_written(b->surf) : -1;
+ 			b->seed = seed;
+ 			b->pushed = began;
+-			sweet_surface_gpu_flush(b->surf);
+-			g_stat.flushed += b->mmapsize;
++			if (written < 0) {
++				sweet_surface_gpu_flush(b->surf);
++				written = (int64_t)b->mmapsize;
++			}
++			g_stat.flushed += (uint64_t)written;
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");             /* and what was written last is in memory */
+@@ -4178,6 +4185,7 @@ drm_do_ios_import(uint32_t surf_id, uint32_t *out_handle)
+ 	b->surf_id = surf_id;
+ 	b->surf = surf;
+ 	b->seed = sweet_surface_gpu_seed(surf) - 1u;   /* pushed out of the cache before its first use */
++	b->pushed = 0;                                 /* (all of it) */
+ 	g_bo_count++;
+ 	g_bo_bytes += b->mmapsize;
+ 	kgsl_bo_hint(b);
+diff --git a/bsd/dev/sweet_prof.c b/bsd/dev/sweet_prof.c
+index 3d16f80..6e2620a 100644
+--- a/bsd/dev/sweet_prof.c
++++ b/bsd/dev/sweet_prof.c
+@@ -10,6 +10,7 @@
+  *   PRF begin <name>[<pid>] <n> samples in <ms> ms
+  *   SMP ...                  the shared cache's slide and every thread (sweet_sample_task)
+  *   PRF img <load> <path>    every image outside the shared cache (dyld's list in the task)
++ *   PRF kslide <slide>       the kernel's slide (samples with cpu bit 31 were in the kernel)
+  *   PRF s <pc> <lr> <tid> <cpu>
+  *   PRF end
+  * for tools/sweet-prof.py to put names to (the shared cache with its slide; our dylibs by load
+@@ -43,6 +44,7 @@ extern task_t proc_task(proc_t);
+ extern vm_map_t get_task_map(task_t);
+ extern kern_return_t vm_map_read_user(vm_map_t map, vm_map_address_t src_addr, void *dst_p, vm_size_t size);
+ extern int hz;
++extern vm_offset_t vm_kernel_slide;
+ 
+ static int sweet_prof_seconds;
+ static void sweet_prof_thread(void *arg, wait_result_t wr);          /* asked for, 0: nothing to do */
+@@ -187,6 +189,7 @@ sweet_prof_thread(__unused void *arg, __unused wait_result_t wr)
+ 		delay(2000);                    /* (an interrupt that saw the target may still be writing) */
+ 		printf("PRF begin %s[%d] %u samples in %llu ms\n", sweet_prof_name, f.pid, n, ns / 1000000ull);
+ 		sweet_sample_task(sweet_prof_name, f.pid, f.task);
++		printf("PRF kslide 0x%lx\n", (unsigned long)vm_kernel_slide);
+ 		sweet_prof_images(f.task);
+ 		for (uint32_t i = 0; i < n; i++) {
+ 			printf("PRF s %llx %llx %u %u\n", sweet_prof_buf[i].pc, sweet_prof_buf[i].lr, sweet_prof_buf[i].tid,
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index c2b62a9..b583655 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -28,6 +28,7 @@
+ #include "SweetSurface.h"
+ extern "C" boolean_t pmap_is_modified(ppnum_t pn);
+ extern "C" void pmap_clear_modify(ppnum_t pn);
++extern "C" boolean_t pmap_valid_page(ppnum_t pn);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -136,6 +137,9 @@ SweetSurface::free()
+ 		extern bool sweet_display_busy[];
+ 		sweet_display_busy[poolSlot - 1] = false;   /* the pool keeps its own reference */
+ 	}
++	if (pages != NULL) {
++		IOFree(pages, pageCount * sizeof(pages[0]));
++	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+@@ -319,6 +323,91 @@ sweet_surface_gpu_flush(void *surface)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * Only what a processor wrote, pushed out of the cache: XNU sets a page's "modified" bit at the
++ * first write after the bit was cleared (the clear makes every mapping of it read-only again),
++ * so the pages with it set are the ones whose lines may be in the cache. Each is cleared, then
++ * pushed out (a write between the two faults and sets the bit again). Pushing out the whole of
++ * every surface a submission named was 500 MB a second of cache maintenance in the window
++ * server; it draws almost everything with the GPU. Returns the bytes pushed out, or -1 when the
++ * memory is not pages the VM keeps bits for (the panel's): then the caller pushes out all of it.
++ */
++static ppnum_t *
++sweet_surface_pages(SweetSurface *s)
++{
++	ppnum_t *list = s->pages;
++	uint32_t count;
++	if (list != NULL || s->memory == NULL) {
++		return list;
++	}
++	count = (uint32_t)((s->memory->getLength() + PAGE_SIZE - 1) / PAGE_SIZE);
++	list = (ppnum_t *)IOMalloc(count * sizeof(list[0]));
++	if (list == NULL) {
++		return NULL;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		IOByteCount len = 0;
++		addr64_t pa = s->memory->getPhysicalSegment((IOByteCount)i * PAGE_SIZE, &len, kIOMemoryMapperNone);
++		list[i] = (ppnum_t)(pa >> PAGE_SHIFT);
++		if (pa == 0 || !pmap_valid_page(list[i])) {
++			list[i] = 0;
++		}
++	}
++	IOLockLock(sweet_surface_lock);
++	if (s->pages == NULL) {
++		s->pageCount = count;
++		s->pages = list;
++		list = NULL;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	if (list != NULL) {
++		IOFree(list, count * sizeof(list[0]));
++	}
++	return s->pages;
++}
++
++static int64_t
++sweet_surface_push_written(SweetSurface *s)
++{
++	IOBufferMemoryDescriptor *bmd;
++	ppnum_t *list = sweet_surface_pages(s);
++	uintptr_t va;
++	int64_t pushed = 0;
++	if (list == NULL) {
++		return -1;
++	}
++	bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	va = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
++	if (va == 0) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < s->pageCount; i++) {
++		if (list[i] == 0) {
++			return -1;
++		}
++		if (!pmap_is_modified(list[i])) {
++			continue;
++		}
++		pmap_clear_modify(list[i]);
++		for (uintptr_t line = va + (uintptr_t)i * PAGE_SIZE, end = line + PAGE_SIZE; line < end; line += 64) {
++			__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
++		}
++		pushed += PAGE_SIZE;
++	}
++	if (pushed != 0) {
++		__asm__ volatile ("dsb sy" ::: "memory");
++		OSBitOrAtomic(1u, &s->cpuWritten);
++	}
++	return pushed;
++}
++
++extern "C" int64_t
++sweet_surface_gpu_push_written(void *surface)
++{
++	SweetSurface *s = (SweetSurface *)surface;
++	return s != NULL && s->memory != NULL ? sweet_surface_push_written(s) : -1;
++}
++
+ /* The table lock; the framebuffer may publish a surface before the root starts. */
+ static void
+ sweet_surface_init_lock(void)
+@@ -1156,23 +1245,17 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		 * into; not every writer moves the seed, so it added up all their memory every frame --
+ 		 * 15% of the window server's processor time. The pages know: XNU keeps a "modified" bit
+ 		 * per page, set by the first write after it was cleared. Asked here and cleared, a page
+-		 * at a time; out: 1 written, 0 not.
++		 * at a time; out: 1 written, 0 not. The GPU's submissions read the same bits (they push
++		 * out of the cache only the written pages) and leave cpuWritten set for this.
+ 		 */
+ 		SweetSurface *s = sweet_surface_copy((uint32_t)arg0);
+-		uint64_t dirty = 0;
++		uint64_t dirty;
+ 		if (s == NULL || s->memory == NULL || args->scalarOutputCount < 1) {
+ 			OSSafeReleaseNULL(s);
+ 			return kIOReturnNotFound;
+ 		}
+-		for (uint64_t off = 0; off < s->allocSize; off += PAGE_SIZE) {
+-			IOByteCount len = 0;
+-			addr64_t pa = s->memory->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
+-			ppnum_t pn = (ppnum_t)(pa >> PAGE_SHIFT);
+-			if (pa != 0 && pmap_is_modified(pn)) {
+-				dirty = 1;
+-				pmap_clear_modify(pn);
+-			}
+-		}
++		dirty = sweet_surface_push_written(s) < 0 ? 1 : 0;
++		dirty |= OSBitAndAtomic(0u, &s->cpuWritten) & 1u;
+ 		args->scalarOutput[0] = dirty;
+ 		args->scalarOutputCount = 1;
+ 		s->release();
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index e346167..e600dc9 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -43,8 +43,11 @@ public:
+ 	uint32_t                  poolSlot;     /* 1 + the display pool buffer it has, 0: none */
+ 	task_t                    clientTask;   /* task whose VA clientAddress lives in (for complete()) */
+ 	uint64_t                  clientAddress;
++	ppnum_t                  *pages;        /* the pixels' pages (made on first need), 0 = not VM pages */
++	uint32_t                  pageCount;
++	volatile UInt32           cpuWritten;   /* a processor wrote a page since selector 200 last asked */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; clientTask = NULL; clientAddress = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; clientTask = NULL; clientAddress = 0; pages = NULL; pageCount = 0; cpuWritten = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 995c05a..e64efe6 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1850,9 +1850,9 @@ handle_simd_trap(arm_saved_state_t *state, uint32_t esr)
+ #if defined(SWEET)
+ /*
+  * The SWEET profiler (bsd/dev/sweet_prof.c): while a task is named here, every interrupt that comes
+- * while one of its threads runs in user mode notes where it was (pc, lr, which thread) -- where
+- * that task spends its processor time, as kperf's timer sampling would say. Nothing is noted
+- * otherwise.
++ * while one of its threads runs notes where it was (pc, lr, which thread; cpu with bit 31 set:
++ * it was in the kernel, for it) -- where that task spends its processor time, as kperf's timer
++ * sampling would say. Nothing is noted otherwise.
+  */
+ struct sweet_prof_sample {
+ 	uint64_t pc, lr;
+@@ -1867,7 +1867,7 @@ static inline void
+ sweet_prof_irq(arm_saved_state_t *state)
+ {
+ 	uint32_t i;
+-	if (!PSR64_IS_USER(get_saved_state_cpsr(state)) || current_task() != sweet_prof_target) {
++	if (current_task() != sweet_prof_target || sweet_prof_target == TASK_NULL) {
+ 		return;
+ 	}
+ 	i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
+@@ -1875,7 +1875,7 @@ sweet_prof_irq(arm_saved_state_t *state)
+ 		sweet_prof_buf[i].pc = get_saved_state_pc(state);
+ 		sweet_prof_buf[i].lr = get_saved_state_lr(state);
+ 		sweet_prof_buf[i].tid = (uint32_t)thread_tid(current_thread());
+-		sweet_prof_buf[i].cpu = (uint32_t)cpu_number();
++		sweet_prof_buf[i].cpu = (uint32_t)cpu_number() | (PSR64_IS_USER(get_saved_state_cpsr(state)) ? 0u : 0x80000000u);
+ 	}
+ }
+ #endif

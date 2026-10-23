@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5023 @@
+@@ -0,0 +1,5284 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2976,6 +2976,7 @@
 +	*deci = (int)((v & 0xFFFu) ^ 0x800u) - 0x800;
 +	return 0;
 +}
++static void battery_report(void);
 +static void
 +thermal_report(void)
 +{
@@ -3954,6 +3955,12 @@
 +		gpu_times();
 +		thermal_report();
 +		{
++			static unsigned every;
++			if (every++ % 6u == 0) {
++				battery_report();
++			}
++		}
++		{
 +			volatile uint64_t *tm = (volatile uint64_t *)(g_res_nc + GPU_TIMES_OFF);
 +			uint32_t last = *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF) % GPU_TIMES;
 +			uint64_t mhz = g_gpu_nlevels ? g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : g_gpu_nlevels - 1u] : 180u;
@@ -4722,6 +4729,85 @@
 +	return -1;
 +}
 +
++/* One byte of a PMIC register by the observer (EE 0) channel, as spmi_pon_read: reads only. */
++static vm_offset_t g_spmi_core, g_spmi_cfg, g_spmi_obs;
++static unsigned g_spmi_count;
++static int
++spmi_rd8(unsigned sid, unsigned addr, uint8_t *out)
++{
++	unsigned i, apid = 0xffffu, ppid = (sid << 8) | (addr >> 8);
++	if (!g_spmi_core) {
++		g_spmi_core = ml_io_map(SPMI_CORE_PA, 0x2000u);
++		g_spmi_cfg = ml_io_map(SPMI_CFG_PA, 0x1000u);
++		g_spmi_obs = ml_io_map(SPMI_OBS_PA, 0x10000u);
++		if (!g_spmi_core || !g_spmi_cfg || !g_spmi_obs) {
++			g_spmi_core = 0;
++			return -1;
++		}
++		g_spmi_count = (*(volatile uint32_t *)(g_spmi_core + 4)) & 0x7ffu;
++	}
++	for (i = 0; i < g_spmi_count && i < 512u; ++i) {
++		uint32_t map = *(volatile uint32_t *)(g_spmi_core + 0x900u + 4u * i);
++		if (!map || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		if (apid == 0xffffu || ((*(volatile uint32_t *)(g_spmi_cfg + 0x700u + 4u * i)) & 7u) == 0u) {
++			apid = i;
++		}
++	}
++	if (apid == 0xffffu) {
++		return -2;
++	}
++	*(volatile uint32_t *)(g_spmi_obs + 0x80u * apid) = (1u << 27) | ((addr & 0xffu) << 4);
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < 1000u; ++i) {
++		uint32_t st = *(volatile uint32_t *)(g_spmi_obs + 0x80u * apid + 0x08u);
++		if (st & 1u) {
++			if (st & 0x0eu) {
++				return -3;
++			}
++			*out = (uint8_t)*(volatile uint32_t *)(g_spmi_obs + 0x80u * apid + 0x18u);
++			return 0;
++		}
++		gmub_udelay(1);
++	}
++	return -4;
++}
++
++/*
++ * What SweetBattery reads (patch 0062: PM6150 QG 0x48xx, charger 0x10xx/0x11xx, USB 0x13xx), raw,
++ * to see why it falls back to its static 100%: reads only.
++ */
++static void
++battery_report(void)
++{
++	static const uint16_t regs[] = { 0x4804, 0x4805, 0x4808, 0x48c0, 0x48c1, 0x48c2, 0x48c3, 0x1310, 0x110b,
++		0x1006, 0x1007, 0x100d, 0x1004, 0x1104, 0x1304 };
++	static bool listed;
++	char line[300];
++	int at = 0;
++	unsigned i;
++	for (i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		uint8_t v = 0;
++		int e = spmi_rd8(0, regs[i], &v);
++		at += snprintf(line + at, sizeof(line) - (size_t)at, e ? " %04x:e%d" : " %04x:%02x", regs[i], e ? -e : v);
++	}
++	printf("SWEET BATT RAW:%s\n", line);
++	if (!listed && g_spmi_core) {
++		listed = true;
++		for (unsigned sid = 0; sid <= 2u; sid += 2u) {
++			at = 0;
++			for (i = 0; i < g_spmi_count && i < 512u && at < (int)sizeof(line) - 6; i++) {
++				uint32_t map = *(volatile uint32_t *)(g_spmi_core + 0x900u + 4u * i);
++				if (map && ((map >> 16) & 0xfu) == sid) {
++					at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x", (map >> 8) & 0xffu);
++				}
++			}
++			printf("SWEET BATT SID%u peripherals:%s\n", sid, line);
++		}
++	}
++}
++
 +static int
 +spmi_set_pon_bootloader(void)
 +{
@@ -4927,6 +5013,175 @@
 +	return 0;
 +}
 +
++/*
++ * Wi-Fi, step 1 (boot-arg sweetwifi=1): the survey, reads only -- HackiOS redwood_wifi.c step_smem
++ * for davinci (WIFI-PLAN.md). The WCN3990's firmware runs in the modem, so the processor to look for is
++ * the modem (SMEM host 1): the shared memory area as the boot loader laid it out (dt: smem@86000000,
++ * 2 MB), the partition of us and the modem, and whether the modem has left its SMP2P item (428,
++ * qcom,smp2p-modem), its last words (421) or GLINK's descriptor (478) there: it has, if it ran since
++ * the phone was started. Nothing is written.
++ */
++#define WSMEM_PHYS      0x86000000u
++#define WSMEM_SIZE      0x00200000u
++#define WSMEM_US        0
++#define WSMEM_MODEM     1
++#define WSMEM_GLOBAL    0xfffe
++#define WSMEM_CANARY    0xa5a5
++struct wsmem_table_entry { uint32_t offset, size, flags; uint16_t host0, host1; uint32_t cacheline, reserved[7]; };
++struct wsmem_table { uint8_t magic[4]; uint32_t version, count, reserved[5]; };
++struct wsmem_partition { uint8_t magic[4]; uint16_t host0, host1; uint32_t size, free_uncached, free_cached, reserved[3]; };
++struct wsmem_entry { uint16_t canary, item; uint32_t size; uint16_t padding_data, padding_header; uint32_t reserved; };
++static volatile uint8_t *wsmem;
++
++static bool
++wsmem_peek(uint32_t off, void *to, uint32_t size)
++{
++	uint32_t i;
++	if (!wsmem) {
++		wsmem = (volatile uint8_t *)ml_io_map_wcomb(WSMEM_PHYS, WSMEM_SIZE);
++	}
++	if (!wsmem || (uint64_t)off + size > WSMEM_SIZE) {
++		return false;
++	}
++	for (i = 0; i < size; i++) {
++		((uint8_t *)to)[i] = wsmem[off + i];
++	}
++	return true;
++}
++
++static uint32_t
++wsmem_partition(uint16_t one, uint16_t other, uint32_t *cacheline, uint32_t *size)
++{
++	struct wsmem_table t;
++	struct wsmem_table_entry e;
++	struct wsmem_partition h;
++	uint32_t i;
++	if (!wsmem_peek(WSMEM_SIZE - 0x1000u, &t, sizeof(t)) || memcmp(t.magic, "$TOC", 4) || t.version != 1 || t.count > 64) {
++		return 0;
++	}
++	for (i = 0; i < t.count; i++) {
++		if (!wsmem_peek(WSMEM_SIZE - 0x1000u + (uint32_t)sizeof(t) + i * (uint32_t)sizeof(e), &e, sizeof(e)) || !e.offset ||
++		    !e.size || !((e.host0 == one && e.host1 == other) || (e.host0 == other && e.host1 == one))) {
++			continue;
++		}
++		if ((uint64_t)e.offset + e.size > WSMEM_SIZE - 0x1000u || !wsmem_peek(e.offset, &h, sizeof(h)) ||
++		    memcmp(h.magic, "$PRT", 4) || h.size != e.size) {
++			return 0;
++		}
++		*cacheline = e.cacheline;
++		*size = e.size;
++		return e.offset;
++	}
++	return 0;
++}
++
++/* The items of a partition into item/offset/size triples; how many. */
++static unsigned
++wsmem_items(uint32_t part, uint32_t cacheline, uint32_t (*found)[3], unsigned max)
++{
++	struct wsmem_partition h;
++	struct wsmem_entry e;
++	uint32_t at, back;
++	unsigned n = 0;
++	if (!part || !wsmem_peek(part, &h, sizeof(h)) || h.free_uncached > h.size || h.free_cached > h.size) {
++		return 0;
++	}
++	for (at = sizeof(h); at + sizeof(e) <= h.free_uncached;) {
++		if (!wsmem_peek(part + at, &e, sizeof(e)) || e.canary != WSMEM_CANARY || e.size > h.size) {
++			break;
++		}
++		if (n < max) {
++			found[n][0] = e.item;
++			found[n][1] = part + at + (uint32_t)sizeof(e) + e.padding_header;
++			found[n][2] = e.size - e.padding_data;
++		}
++		n++;
++		at += (uint32_t)sizeof(e) + e.padding_header + e.size;
++	}
++	if (cacheline == 0 || (cacheline & (cacheline - 1))) {
++		return n;
++	}
++	back = ((uint32_t)sizeof(e) + cacheline - 1) & ~(cacheline - 1);
++	for (at = h.size - back; at > h.free_cached && at < h.size;) {
++		if (!wsmem_peek(part + at, &e, sizeof(e)) || e.canary != WSMEM_CANARY || e.size > at) {
++			break;
++		}
++		if (n < max) {
++			found[n][0] = e.item;
++			found[n][1] = part + at - e.size;
++			found[n][2] = e.size - e.padding_data;
++		}
++		n++;
++		if (e.size + back > at) {
++			break;
++		}
++		at -= e.size + back;
++	}
++	return n;
++}
++
++static void
++wifi_survey(void)
++{
++	static uint32_t found[256][3];
++	static const struct { uint16_t one, other; const char *name; } parts[2] = {
++		{ WSMEM_US, WSMEM_MODEM, "us and the modem (0, 1)" }, { WSMEM_GLOBAL, WSMEM_GLOBAL, "the global one" } };
++	struct wsmem_table t;
++	struct wsmem_table_entry e;
++	uint32_t version = 0, i, p;
++	char line[320];
++
++	printf("SWEET WIFI: [1] the shared memory area at %#x, %#x bytes (reads only)\n", WSMEM_PHYS, WSMEM_SIZE);
++	if (!wsmem_peek(0x40u + 4u * 7u, &version, sizeof(version)) || !wsmem_peek(WSMEM_SIZE - 0x1000u, &t, sizeof(t))) {
++		printf("SWEET WIFI: [1] cannot map it\n");
++		return;
++	}
++	printf("SWEET WIFI: [1] boot loader's version word %#x; table %c%c%c%c version %u, %u partitions\n", version,
++	    t.magic[0], t.magic[1], t.magic[2], t.magic[3], t.version, t.count);
++	if (memcmp(t.magic, "$TOC", 4) || t.version != 1 || t.count > 64) {
++		return;
++	}
++	for (i = 0; i < t.count; i++) {
++		if (wsmem_peek(WSMEM_SIZE - 0x1000u + (uint32_t)sizeof(t) + i * (uint32_t)sizeof(e), &e, sizeof(e))) {
++			printf("SWEET WIFI: [1] partition %u: hosts %#x %#x at %#x, %#x bytes, flags %#x, cacheline %u\n", i, e.host0,
++			    e.host1, WSMEM_PHYS + e.offset, e.size, e.flags, e.cacheline);
++		}
++	}
++	for (p = 0; p < 2u; p++) {
++		uint32_t cl = 0, size = 0, part = wsmem_partition(parts[p].one, parts[p].other, &cl, &size);
++		unsigned n = wsmem_items(part, cl, found, 256), k = 0;
++		printf("SWEET WIFI: [1] partition of %s: %s, %u items\n", parts[p].name, part ? "there" : "NOT THERE", n);
++		while (k < n && k < 256u) {
++			int at = 0;
++			for (unsigned c = 0; c < 14u && k < n && k < 256u; c++, k++) {
++				at += snprintf(line + at, sizeof(line) - (size_t)at, " %u(%u)", found[k][0], found[k][2]);
++			}
++			printf("SWEET WIFI: [1]   items(bytes):%s\n", line);
++		}
++		for (k = 0; k < n && k < 256u; k++) {
++			if (found[k][0] == 428u) {         /* the modem's SMP2P: "$SMP", version, local/remote, counts, flags, entries */
++				uint32_t w[5] = { 0 };
++				char names[96];
++				int at = 0;
++				(void)wsmem_peek(found[k][1], w, sizeof(w));
++				for (unsigned x = 0; x < (w[3] >> 16) && x < 4u && at < (int)sizeof(names) - 24; x++) {
++					char nm[17] = { 0 };
++					uint32_t v = 0;
++					(void)wsmem_peek(found[k][1] + 20u + 20u * x, nm, 16);
++					(void)wsmem_peek(found[k][1] + 36u + 20u * x, &v, 4);
++					at += snprintf(names + at, sizeof(names) - (size_t)at, " %s=%#x", nm, v);
++				}
++				printf("SWEET WIFI: [1] THE MODEM'S SMP2P (428) is there: magic %#x version %#x hosts %#x counts %#x "
++				    "flags %#x:%s\n", w[0], w[1], w[2], w[3], w[4], at ? names : "");
++			} else if (found[k][0] == 421u && found[k][2]) {   /* its last words */
++				char text[81] = { 0 };
++				(void)wsmem_peek(found[k][1], text, found[k][2] < 80u ? found[k][2] : 80u);
++				printf("SWEET WIFI: [1] the modem's last words (421): \"%s\"\n", text);
++			}
++		}
++	}
++}
++
 +static void
 +gpu_thread(void *arg, wait_result_t wr)
 +{
@@ -4950,6 +5205,12 @@
 +		uint32_t arm = 0;
 +		if (PE_parse_boot_argn("sweetgpu_armfb", &arm, sizeof(arm)) && arm) {
 +			printf("SWEET GPU: armed for fastboot: %d\n", sweet_reboot_fastboot(0));
++		}
++	}
++	{
++		uint32_t w = 0;
++		if (PE_parse_boot_argn("sweetwifi", &w, sizeof(w)) && w >= 1u) {
++			wifi_survey();
 +		}
 +	}
 +	gpu_probe();

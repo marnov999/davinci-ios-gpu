@@ -1,0 +1,177 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index ef29845..df4244b 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -155,8 +155,10 @@ SweetSurface::kernelAddress()
+ 		return (uintptr_t)buffer->getBytesNoCopy();
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+-	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++	if (kernelMap == NULL && memory != NULL && !kernelMapFailed) {
++		/* (memory an application lent only for reading -- kIODirectionOut -- maps read-only) */
++		kernelMap = memory->map(kIOMapWriteCombineCache | (memory->getDirection() == kIODirectionOut ? kIOMapReadOnly : 0));
++		kernelMapFailed = kernelMap == NULL;
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -333,36 +335,48 @@ sweet_surface_gpu_flush(void *surface)
+  * server; it draws almost everything with the GPU. Returns the bytes pushed out, or -1 when the
+  * memory is not pages the VM keeps bits for (the panel's): then the caller pushes out all of it.
+  */
+-static ppnum_t *
++static struct sweet_surface_page *
+ sweet_surface_pages(SweetSurface *s)
+ {
+-	ppnum_t *list = s->pages;
+-	uint32_t count;
++	struct sweet_surface_page *list = s->pages;
++	uint64_t length, off;
++	uint32_t count = 0, most;
+ 	if (list != NULL || s->memory == NULL) {
+ 		return list;
+ 	}
+-	count = (uint32_t)((s->memory->getLength() + PAGE_SIZE - 1) / PAGE_SIZE);
+-	list = (ppnum_t *)IOMalloc(count * sizeof(list[0]));
++	/* by physical page, not by PAGE_SIZE steps of the memory: what an application lends starts
++	 * where its allocation does, anywhere in a page, and then every step lies in two pages */
++	length = s->memory->getLength();
++	most = (uint32_t)(length / PAGE_SIZE) + 2u;
++	list = (struct sweet_surface_page *)IOMalloc(most * sizeof(list[0]));
+ 	if (list == NULL) {
+ 		return NULL;
+ 	}
+-	for (uint32_t i = 0; i < count; i++) {
+-		IOByteCount len = 0;
+-		addr64_t pa = s->memory->getPhysicalSegment((IOByteCount)i * PAGE_SIZE, &len, kIOMemoryMapperNone);
+-		list[i] = (ppnum_t)(pa >> PAGE_SHIFT);
+-		if (pa == 0 || !pmap_valid_page(list[i])) {
+-			list[i] = 0;
++	for (off = 0; off < length && count < most; count++) {
++		IOByteCount seg = 0;
++		addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
++		uint64_t in_page = PAGE_SIZE - (pa & PAGE_MASK);
++		uint64_t len = in_page < length - off ? in_page : length - off;
++		list[count].pn = (ppnum_t)(pa >> PAGE_SHIFT);
++		if (pa == 0 || !pmap_valid_page(list[count].pn)) {
++			list[count].pn = 0;
+ 		}
++		list[count].off = (uint32_t)off;
++		list[count].len = (uint32_t)len;
++		off += len;
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (s->pages == NULL) {
+-		s->pageCount = count;
++		s->pageCount = most;            /* (the allocation's size, for IOFree) */
+ 		s->pages = list;
++		if (count < most) {
++			list[count].len = 0;    /* end */
++		}
+ 		list = NULL;
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	if (list != NULL) {
+-		IOFree(list, count * sizeof(list[0]));
++		IOFree(list, most * sizeof(list[0]));
+ 	}
+ 	return s->pages;
+ }
+@@ -370,35 +384,38 @@ sweet_surface_pages(SweetSurface *s)
+ static int64_t
+ sweet_surface_push_written(SweetSurface *s)
+ {
+-	IOBufferMemoryDescriptor *bmd;
+-	ppnum_t *list = sweet_surface_pages(s);
+-	uintptr_t va;
++	struct sweet_surface_page *list = sweet_surface_pages(s);
++	uintptr_t va = 0;
+ 	int64_t pushed = 0;
++	uint32_t pages = 0;
+ 	if (list == NULL) {
+ 		return -1;
+ 	}
+-	bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+-	va = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
+-	if (va == 0) {
+-		return -1;
+-	}
+-	for (uint32_t i = 0; i < s->pageCount; i++) {
+-		if (list[i] == 0) {
++	for (uint32_t i = 0; i < s->pageCount && list[i].len != 0; i++) {
++		if (list[i].pn == 0) {
+ 			static uint32_t told;
+ 			if (told++ < 8) {
+-				IOLog("SWEET SURF: surface %u %ux%u: page %u of %u is not the VM's: pushed out whole\n", s->id, s->width,
+-				    s->height, i, s->pageCount);
++				IOLog("SWEET SURF: surface %u %ux%u: page %u is not the VM's: pushed out whole\n", s->id, s->width,
++				    s->height, i);
+ 			}
+ 			return -1;
+ 		}
+-		if (!pmap_is_modified(list[i])) {
++		if (!pmap_is_modified(list[i].pn)) {
+ 			continue;
+ 		}
+-		pmap_clear_modify(list[i]);
+-		for (uintptr_t line = va + (uintptr_t)i * PAGE_SIZE, end = line + PAGE_SIZE; line < end; line += 64) {
++		if (va == 0) {
++			IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++			va = bmd != NULL ? (uintptr_t)bmd->getBytesNoCopy() : s->kernelAddress();
++			if (va == 0) {
++				return -1;
++			}
++		}
++		pmap_clear_modify(list[i].pn);
++		for (uintptr_t line = (va + list[i].off) & ~(uintptr_t)63, end = va + list[i].off + list[i].len; line < end; line += 64) {
+ 			__asm__ volatile ("dc civac, %0" : : "r" (line) : "memory");
+ 		}
+-		pushed += PAGE_SIZE;
++		pushed += list[i].len;
++		pages++;
+ 	}
+ 	if (pushed != 0) {
+ 		static uint32_t looks;
+@@ -406,8 +423,8 @@ sweet_surface_push_written(SweetSurface *s)
+ 		OSBitOrAtomic(1u, &s->cpuWritten);
+ 		if (looks++ % 400u < 3u) {
+ 			/* (which surfaces are written by a processor, how much of them: the first of every 400) */
+-			IOLog("SWEET SURF: surface %u %ux%u (display buffer %u): %lld of %u pages written since the last look\n", s->id,
+-			    s->width, s->height, s->poolSlot, pushed / PAGE_SIZE, s->pageCount);
++			IOLog("SWEET SURF: surface %u %ux%u (display buffer %u): %u pages written since the last look\n", s->id,
++			    s->width, s->height, s->poolSlot, pages);
+ 		}
+ 	}
+ 	return pushed;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index e600dc9..1563d8c 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -24,6 +24,12 @@ struct sweet_surface_plane {
+ 	uint8_t  elementWidth, elementHeight;
+ };
+ 
++/* One physical page of a surface's memory: which, and the bytes of the memory that are in it. */
++struct sweet_surface_page {
++	ppnum_t  pn;            /* 0: not a page the VM keeps "modified" bits for */
++	uint32_t off, len;
++};
++
+ class SweetSurface : public OSObject {
+ 	OSDeclareDefaultStructors(SweetSurface);
+ 
+@@ -43,11 +49,12 @@ public:
+ 	uint32_t                  poolSlot;     /* 1 + the display pool buffer it has, 0: none */
+ 	task_t                    clientTask;   /* task whose VA clientAddress lives in (for complete()) */
+ 	uint64_t                  clientAddress;
+-	ppnum_t                  *pages;        /* the pixels' pages (made on first need), 0 = not VM pages */
++	struct sweet_surface_page *pages;       /* the pixels' pages (made on first need) */
++	bool                      kernelMapFailed; /* (not to be tried again: every try printed a backtrace) */
+ 	uint32_t                  pageCount;
+ 	volatile UInt32           cpuWritten;   /* a processor wrote a page since selector 200 last asked */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; clientTask = NULL; clientAddress = 0; pages = NULL; pageCount = 0; cpuWritten = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; clientTask = NULL; clientAddress = 0; pages = NULL; pageCount = 0; cpuWritten = 0; kernelMapFailed = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */

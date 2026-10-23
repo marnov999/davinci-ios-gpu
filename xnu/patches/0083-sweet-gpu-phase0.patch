@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5404 @@
+@@ -0,0 +1,5516 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5153,6 +5153,116 @@
 +struct wsmem_entry { uint16_t canary, item; uint32_t size; uint16_t padding_data, padding_header; uint32_t reserved; };
 +static volatile uint8_t *wsmem;
 +
++/*
++ * Wi-Fi, step 2 (boot-arg sweetwifi=1, still reads only) -- HackiOS redwood_wifi.c step_mailbox and the
++ * doorbells, for davinci. Two always-on blocks, read as they are:
++ *   - the always-on processor's QMP mailbox (dt: qcom,qmp-aop@c300000, "msgram" 4 KB, 32-bit accesses):
++ *     it begins with a description of the two directions -- "their"/ucore = the AOP, "our"/mcore = us --
++ *     each with a link state, a channel state, the other side's acknowledgement, and where/how big its
++ *     mailbox is. The QMP protocol is SoC-independent, so the offsets are redwood's. We only read: the
++ *     magic tells whether this is the descriptor at all, and the link words whether a boot stage before
++ *     us has already brought the AOP channel up (UP 0x0000ffff / DOWN 0xffff0000 per direction).
++ *   - the one doorbell register that davinci rings every processor through (dt: syscon@17c0000c, the APCS
++ *     global IPC; 4 bytes). SM7150 is NOT redwood's IPCC@408000 (clients+signals): here each processor is
++ *     one bit of this single write-1-to-pulse register -- AOP = bit 0 (qcom,qmp-aop irq-reg-base+mask 1),
++ *     modem SMP2P = bit 14 (qcom,smp2p-modem ipc <..0 0xe>), modem GLINK = bit 12. Reading it only reports
++ *     the current latched word; nothing is written. This is the survey's last reads-only step before the
++ *     modem is ever loaded.
++ */
++#define WAOP_MSGRAM_PHYS   0x0c300000u            /* dt qcom,qmp-aop@c300000 reg[0] "msgram" */
++#define WAOP_MSGRAM_SIZE   0x00001000u            /* 4 KB (dt reg size); QMP descriptor + mailboxes */
++#define WAPCS_IPC_PHYS     0x17c0000cu            /* dt syscon@17c0000c: the APCS global IPC doorbell */
++/* QMP descriptor offsets (SoC-independent; redwood_wifi.c). "their" = AOP/ucore, "our" = us/mcore. */
++#define QMP_MAGIC          0x00
++#define QMP_MAGIC_VALUE    0x4d41494cu            /* "LIAM" / "MAIL" */
++#define QMP_VERSION        0x04
++#define QMP_FEATURES       0x08
++#define QMP_THEIR_LINK     0x0c
++#define QMP_THEIR_LINK_ACK 0x10
++#define QMP_THEIR_CHANNEL  0x14
++#define QMP_THEIR_CHAN_ACK 0x18
++#define QMP_THEIR_BOX_SIZE 0x1c
++#define QMP_THEIR_BOX      0x20
++#define QMP_OUR_LINK       0x24
++#define QMP_OUR_LINK_ACK   0x28
++#define QMP_OUR_CHANNEL    0x2c
++#define QMP_OUR_CHAN_ACK   0x30
++#define QMP_OUR_BOX_SIZE   0x34
++#define QMP_OUR_BOX        0x38
++#define QMP_UP             0x0000ffffu
++#define QMP_DOWN           0xffff0000u
++
++static uint32_t
++wmmio_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static const char *
++qmp_state(uint32_t v)
++{
++	return v == QMP_UP ? "UP" : v == QMP_DOWN ? "DOWN" : "?";
++}
++
++static void
++wifi_mailbox_survey(void)
++{
++	vm_offset_t aop, ipc;
++	uint32_t magic, ver, feat, boxsz, boxoff;
++
++	/* --- the always-on processor's QMP mailbox description (reads only) --- */
++	printf("SWEET WIFI: [2] the always-on processor's QMP mailbox at %#x, %#x bytes (reads only)\n",
++	    WAOP_MSGRAM_PHYS, WAOP_MSGRAM_SIZE);
++	aop = ml_io_map(WAOP_MSGRAM_PHYS, WAOP_MSGRAM_SIZE);
++	if (!aop) {
++		printf("SWEET WIFI: [2] cannot map the AOP mailbox\n");
++	} else {
++		magic  = wmmio_rd32(aop, QMP_MAGIC);
++		ver    = wmmio_rd32(aop, QMP_VERSION);
++		feat   = wmmio_rd32(aop, QMP_FEATURES);
++		printf("SWEET WIFI: [2] magic %#x (%s), version %#x, features %#x\n", magic,
++		    magic == QMP_MAGIC_VALUE ? "QMP descriptor" : "NOT a QMP descriptor", ver, feat);
++		if (magic != QMP_MAGIC_VALUE) {
++			printf("SWEET WIFI: [2] the mailbox has no description yet (AOP link not laid out from here)\n");
++		} else {
++			uint32_t tl = wmmio_rd32(aop, QMP_THEIR_LINK), tla = wmmio_rd32(aop, QMP_THEIR_LINK_ACK);
++			uint32_t tc = wmmio_rd32(aop, QMP_THEIR_CHANNEL), tca = wmmio_rd32(aop, QMP_THEIR_CHAN_ACK);
++			uint32_t ol = wmmio_rd32(aop, QMP_OUR_LINK), ola = wmmio_rd32(aop, QMP_OUR_LINK_ACK);
++			uint32_t oc = wmmio_rd32(aop, QMP_OUR_CHANNEL), oca = wmmio_rd32(aop, QMP_OUR_CHAN_ACK);
++			printf("SWEET WIFI: [2] their (AOP) link %#x (%s) ack %#x, channel %#x (%s) ack %#x\n",
++			    tl, qmp_state(tl), tla, tc, qmp_state(tc), tca);
++			printf("SWEET WIFI: [2] our link %#x (%s) ack %#x, channel %#x (%s) ack %#x\n",
++			    ol, qmp_state(ol), ola, oc, qmp_state(oc), oca);
++			boxsz  = wmmio_rd32(aop, QMP_OUR_BOX_SIZE);
++			boxoff = wmmio_rd32(aop, QMP_OUR_BOX);
++			printf("SWEET WIFI: [2] their box %#x/%#x bytes, our box %#x/%#x bytes\n",
++			    wmmio_rd32(aop, QMP_THEIR_BOX), wmmio_rd32(aop, QMP_THEIR_BOX_SIZE), boxoff, boxsz);
++			if (boxsz >= 68u && boxoff >= 0x3cu && (uint64_t)boxoff + boxsz <= WAOP_MSGRAM_SIZE) {
++				printf("SWEET WIFI: [2] length word in our box = %#x (0 = AOP has taken the last message)\n",
++				    wmmio_rd32(aop, boxoff));
++			}
++			if (tl == QMP_UP || ol == QMP_UP) {
++				printf("SWEET WIFI: [2] NOTE: a QMP link is already UP -- a stage before us opened the AOP\n");
++			}
++		}
++	}
++
++	/* --- the one APCS doorbell register davinci rings every processor through (reads only) --- */
++	printf("SWEET WIFI: [2] the APCS global IPC doorbell at %#x (reads only; bit 0 = AOP, 14 = modem SMP2P, 12 = modem GLINK)\n",
++	    WAPCS_IPC_PHYS);
++	ipc = ml_io_map(WAPCS_IPC_PHYS & ~0xfffu, PAGE_SIZE);
++	if (!ipc) {
++		printf("SWEET WIFI: [2] cannot map the APCS IPC register\n");
++	} else {
++		uint32_t d = wmmio_rd32(ipc, WAPCS_IPC_PHYS & 0xfffu);
++		printf("SWEET WIFI: [2] doorbell register = %#x (pending bits: AOP=%u SMP2P=%u GLINK=%u)\n",
++		    d, (d >> 0) & 1u, (d >> 14) & 1u, (d >> 12) & 1u);
++	}
++	printf("SWEET WIFI: [2] survey done, reads only -- modem has not been touched\n");
++}
++
 +static bool
 +wsmem_peek(uint32_t off, void *to, uint32_t size)
 +{
@@ -5300,6 +5410,8 @@
 +			}
 +		}
 +	}
++
++	wifi_mailbox_survey();
 +}
 +
 +static void

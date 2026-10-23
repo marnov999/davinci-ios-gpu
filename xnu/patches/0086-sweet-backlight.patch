@@ -1,0 +1,180 @@
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+new file mode 100644
+index 0000000..15e644a
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -0,0 +1,146 @@
++/*
++ * SweetBacklight: the panel's brightness for iOS. backboardd's CoreBrightness looks for a service
++ * with the property backlight-control (IOPropertyMatch, IOServiceNotificationUser) and, failing to
++ * find one, has nothing to send the brightness slider's value to. This is that service: it carries
++ * backlight-control and an IODisplayParameters "brightness" range, takes what is set on it
++ * (setProperties), and sends the panel DCS 0x51 through bsd/dev/sweet_gpu.c's
++ * sweet_panel_brightness() (davinci's Samsung AMOLED: 0..2047).
++ *
++ * What iOS sets, and how, is logged (the first sixty times), so the mapping can follow what
++ * CoreBrightness really does; a number under "brightness" (or IODisplayParameters.brightness.value)
++ * is taken on the published scale.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSerialize.h>
++
++extern "C" int sweet_panel_brightness(uint32_t level);
++
++#define SWEET_BL_SCALE  65536u          /* the published range: 0..65536 (IODisplayParameters, as on a Mac) */
++#define SWEET_BL_PANEL  2047u           /* the panel's own maximum */
++#define SWEET_BL_START  0x218u          /* dt qcom,mdss-dsi-bl-default-level */
++
++class SweetBacklight : public IOService {
++	OSDeclareDefaultStructors(SweetBacklight);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++private:
++	unsigned fLogged;
++	uint32_t fValue;                     /* on the published scale */
++	void publish(uint32_t value);
++	void take(uint32_t value, const char *how);
++};
++
++OSDefineMetaClassAndStructors(SweetBacklight, IOService);
++
++void
++SweetBacklight::publish(uint32_t value)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSNumber *min = OSNumber::withNumber(0ull, 32), *max = OSNumber::withNumber(SWEET_BL_SCALE, 32),
++	    *cur = OSNumber::withNumber(value, 32);
++	if (params && brightness && min && max && cur) {
++		brightness->setObject("min", min);
++		brightness->setObject("max", max);
++		brightness->setObject("value", cur);
++		params->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", params);
++		setProperty("brightness", cur);
++	}
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(cur);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(params);
++}
++
++void
++SweetBacklight::take(uint32_t value, const char *how)
++{
++	uint32_t level;
++	if (value > SWEET_BL_SCALE) {
++		value = SWEET_BL_SCALE;
++	}
++	level = (uint32_t)(((uint64_t)value * SWEET_BL_PANEL + SWEET_BL_SCALE / 2) / SWEET_BL_SCALE);
++	if (level == 0 && value != 0) {
++		level = 1;                       /* the slider's bottom is dim, not black */
++	}
++	fValue = value;
++	publish(value);
++	IOLog("SWEET BACKLIGHT: %s %u/%u -> panel %u: %d\n", how, value, SWEET_BL_SCALE, level, sweet_panel_brightness(level));
++}
++
++bool
++SweetBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	fValue = (uint32_t)(((uint64_t)SWEET_BL_START * SWEET_BL_SCALE) / SWEET_BL_PANEL);
++	setProperty("backlight-control", kOSBooleanTrue);
++	publish(fValue);
++	registerService();
++	IOLog("SWEET BACKLIGHT: published (backlight-control), brightness %u/%u\n", fValue, SWEET_BL_SCALE);
++	return true;
++}
++
++static bool
++sweet_bl_number(OSObject *o, uint32_t *out)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, o);
++	if (n) {
++		*out = n->unsigned32BitValue();
++		return true;
++	}
++	return false;
++}
++
++IOReturn
++SweetBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	uint32_t value = 0;
++	if (fLogged < 60) {
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		fLogged++;
++		if (s && properties->serialize(s)) {
++			IOLog("SWEET BACKLIGHT: set %.400s\n", s->text());
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (!dict) {
++		return kIOReturnBadArgument;
++	}
++	if (sweet_bl_number(dict->getObject("brightness"), &value)) {
++		take(value, "brightness");
++		return kIOReturnSuccess;
++	}
++	{
++		OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++		OSDictionary *b = params ? OSDynamicCast(OSDictionary, params->getObject("brightness")) : NULL;
++		if (b && sweet_bl_number(b->getObject("value"), &value)) {
++			take(value, "IODisplayParameters");
++			return kIOReturnSuccess;
++		}
++	}
++	return kIOReturnSuccess;                 /* accepted (and logged) */
++}
++
++IOReturn
++SweetBacklight::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++    IOUserClient **handler)
++{
++	IOLog("SWEET BACKLIGHT: a user client of type %u asked for\n", (unsigned)type);
++	return IOService::newUserClient(owningTask, securityID, type, properties, handler);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..3f12a90 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetBacklight;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetBacklight;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..5ba37a3 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp

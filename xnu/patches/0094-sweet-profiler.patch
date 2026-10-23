@@ -12,10 +12,10 @@ index 913307d..daf5386 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/sweet_prof.c b/bsd/dev/sweet_prof.c
 new file mode 100644
-index 0000000..16c2d8d
+index 0000000..86c3b0e
 --- /dev/null
 +++ b/bsd/dev/sweet_prof.c
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,178 @@
 +/*
 + * SWEET profiler: where does a process spend its processor time? (The window server draws 20-30
 + * frames a second on a phone that does 60 under Android; the profile says why.)
@@ -57,6 +57,7 @@ index 0000000..16c2d8d
 +extern void sweet_sample_task(const char *name, int pid, task_t task);   /* osfmk/kern/exception.c */
 +extern task_t proc_task(proc_t);
 +extern vm_map_t get_task_map(task_t);
++extern kern_return_t vm_map_read_user(vm_map_t map, vm_map_address_t src_addr, void *dst_p, vm_size_t size);
 +extern int hz;
 +
 +static int sweet_prof_seconds;          /* asked for, 0: nothing to do */

@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9d10533..6176315 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -71,6 +71,12 @@ enum {
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
++/* the display engine's registers (scanOut) */
++#define SWEET_MDP_PA            0x0ae00000u
++#define SWEET_MDP_CTL0_FLUSH    (0x2000u + 0x018u)
++#define SWEET_MDP_VIG0_ADDR     (0x5000u + 0x014u)
++#define SWEET_MDP_VIG0_STRIDE   (0x5000u + 0x024u)
++#define SWEET_MDP_FLUSH_VIG0    0x1u
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+@@ -614,11 +620,6 @@ AppleCLCD::swap(const uint8_t *rec)
+  * be one physical piece below 4 GB (SweetSurface allocates CoreAnimation's full-screen ones so);
+  * anything else is copied as before, with VIG0 back on the boot framebuffer.
+  */
+-#define SWEET_MDP_PA            0x0ae00000u
+-#define SWEET_MDP_CTL0_FLUSH    (0x2000u + 0x018u)
+-#define SWEET_MDP_VIG0_ADDR     (0x5000u + 0x014u)
+-#define SWEET_MDP_VIG0_STRIDE   (0x5000u + 0x024u)
+-#define SWEET_MDP_FLUSH_VIG0    0x1u
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ 
+ bool

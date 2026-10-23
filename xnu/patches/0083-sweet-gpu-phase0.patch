@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4258 @@
+@@ -0,0 +1,4264 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -3277,8 +3277,14 @@
 +		uint64_t waiting;
 +		absolutetime_to_nanoseconds(g_waiting, &waiting);
 +		gpu_times();
-+		printf("SWEET DRM: the GPU worked %llu us on each of %u submissions (%llu ms in all), level %u\n",
-+		    g_gpu_timed ? g_gpu_ticks * 10 / 192 / g_gpu_timed : 0, g_gpu_timed, g_gpu_ticks * 10 / 192 / 1000, g_gpu_level);
++		{
++			volatile uint64_t *tm = (volatile uint64_t *)(g_res_nc + GPU_TIMES_OFF);
++			uint32_t last = *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF) % GPU_TIMES;
++			printf("SWEET DRM: the GPU worked %llu us on each of %u submissions (%llu ms in all), level %u; "
++			    "last slot %u begin %#llx end %#llx\n",
++			    g_gpu_timed ? g_gpu_ticks * 10 / 192 / g_gpu_timed : 0, g_gpu_timed, g_gpu_ticks * 10 / 192 / 1000,
++			    g_gpu_level, last, tm[2 * last], tm[2 * last + 1]);
++		}
 +		g_gpu_ticks = 0;
 +		g_gpu_timed = 0;
 +		printf("SWEET DRM: %u submissions in %llu ms (%u IBs, %u buffers named, %llu KB of surfaces out of the cache); "

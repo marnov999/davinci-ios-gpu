@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,4950 @@
+@@ -0,0 +1,4966 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -2202,6 +2202,7 @@
 +		/* group b: CP ROQ/pool, PC_DBG, AHB, perfctr cntl */
 +		CW(0x8C2u, 0x010000C0u); CW(0x8C1u, 0x8040362Cu); CW(0x8C3u, 128u);
 +		CW(0x9E00u, 0x00180000u); CW(0x98Du, 0x1u); CW(0x500u, 0x1u);
++		CW(0x8D0u, 0x0u);                  /* CP_PERFCTR_CP_SEL_0 = PERF_CP_ALWAYS_COUNT: RBBM_PERFCTR_CP_0 counts core clocks */
 +		__asm__ volatile("dsb osh" ::: "memory");
 +		printf("SWEET GMU: [Ib] CP ROQ/pool+PC_DBG+AHB written\n"); gmub_flush();
 +		/* group c: NC_MODE (RB/TPL1/SP) + UCHE_MODE + hang + client_pf */
@@ -2923,11 +2924,14 @@
 +#define GPU_SUBMIT_BOS     8192u
 +#define A6XX_CP_SCRATCH_REG2 0x885u
 +static uint32_t g_fence;            /* the last submission's number (redwood gpu_fence) */
-+/* redwood ring_time / gpu_times: the core writes CP_ALWAYS_ON_COUNTER (19.2 MHz) at both ends of
-+ * every submission into the result page, so what the GPU itself spends is known, not guessed. */
++/* redwood ring_time / gpu_times: the core writes a counter at both ends of every submission into the
++ * result page, so what the GPU itself spends is known, not guessed. Not CP_ALWAYS_ON_COUNTER: with a
++ * GMU it does not move here (frozen since the bring-up; kgsl reads the GMU's always-on counter
++ * instead), so RBBM_PERFCTR_CP_0 counting the core's own clocks (Linux's cpcycles), which also tells
++ * the clock the GMU really gave. */
 +#define GPU_TIMES_OFF      0x400u   /* 64 slots of { begin, end } u64 */
 +#define GPU_TIMES          64u
-+#define A6XX_CP_ALWAYS_ON_COUNTER 0x980u
++#define A6XX_CP_ALWAYS_ON_COUNTER 0x400u   /* (RBBM_PERFCTR_CP_0; the name kept for the ring code) */
 +static uint32_t g_timed;            /* the last fence whose times are added up */
 +static uint64_t g_gpu_ticks;
 +static uint32_t g_gpu_timed;
@@ -3898,10 +3902,11 @@
 +		{
 +			volatile uint64_t *tm = (volatile uint64_t *)(g_res_nc + GPU_TIMES_OFF);
 +			uint32_t last = *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF) % GPU_TIMES;
-+			printf("SWEET DRM: the GPU worked %llu us on each of %u submissions (%llu ms in all), level %u; "
-+			    "last slot %u begin %#llx end %#llx\n",
-+			    g_gpu_timed ? g_gpu_ticks * 10 / 192 / g_gpu_timed : 0, g_gpu_timed, g_gpu_ticks * 10 / 192 / 1000,
-+			    g_gpu_level, last, tm[2 * last], tm[2 * last + 1]);
++			uint64_t mhz = g_gpu_nlevels ? g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : g_gpu_nlevels - 1u] : 180u;
++			printf("SWEET DRM: the GPU worked %llu us on each of %u submissions (%llu ms in all, %llu Mcycles), level %u "
++			    "(%llu MHz); last slot %u begin %#llx end %#llx\n",
++			    g_gpu_timed ? g_gpu_ticks / mhz / g_gpu_timed : 0, g_gpu_timed, g_gpu_ticks / mhz / 1000,
++			    g_gpu_ticks / 1000000u, g_gpu_level, mhz, last, tm[2 * last], tm[2 * last + 1]);
 +		}
 +		g_gpu_ticks = 0;
 +		g_gpu_timed = 0;
@@ -4845,6 +4850,17 @@
 +	gmub_wr(GMUB_GMU2HOST_INTR_CLR, GMUB_OOB_DCVS_ACK);
 +	gmub_wr(GMUB_HOST2GMU_INTR_SET, GMUB_OOB_DCVS_ACK);     /* clear the OOB (legacy: bit 31) */
 +	ret = gmub_rd(GMUB_DCVS_RETURN);
++	if (g_core) {           /* the clock it really runs at: the core's cycle counter over 2 ms */
++		uint64_t c0, c1, t0, t1, ns;
++		c0 = (uint64_t)gpu_rd(g_core, 0x401u << 2) << 32 | gpu_rd(g_core, 0x400u << 2);
++		t0 = mach_absolute_time();
++		gmub_udelay(2000);
++		c1 = (uint64_t)gpu_rd(g_core, 0x401u << 2) << 32 | gpu_rd(g_core, 0x400u << 2);
++		t1 = mach_absolute_time();
++		absolutetime_to_nanoseconds(t1 - t0, &ns);
++		printf("SWEET GPU: measured %llu MHz (%llu cycles in %llu us)\n", ns ? (c1 - c0) * 1000u / ns : 0,
++		    c1 - c0, ns / 1000u);
++	}
 +	printf("SWEET GPU: level %u (%u MHz) asked: %s after %u polls (intr %#x), DCVS return %#x\n", level, g_gpu_mhz[level],
 +	    (info & GMUB_OOB_DCVS_ACK) ? "acked" : "NOT acked", polls, info, ret);
 +	if (info & GMUB_OOB_DCVS_ACK) {

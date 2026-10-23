@@ -1,0 +1,26 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f103b7d..11843a6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -467,10 +467,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		sweet_tl_tick[sweet_tl_nt] = sweet_tl_us();
+ 		sweet_tl_nt = sweet_tl_nt + 1;
+ 	}
++	/*
++	 * What a vsync says, as IOMobileFramebuffer says it (and HackiOS's MiniIOMobileFramebuffer):
++	 * three 64-bit numbers in six halves -- the time of this refresh, the same again (when it was
++	 * presented), and the count. This sent the count first and the time second: CoreAnimation took
++	 * the count for the refresh's time, long past, and planned its frames from that -- starting
++	 * each one ~11 ms after the tick, too late to be done by the next. The time is the tick's
++	 * deadline, not whenever this ran.
++	 */
++	uint64_t at = fb->fNextTick != 0 && fb->fNextTick <= now ? fb->fNextTick : now;
+ 	uint64_t values[6] = {
++		(uint32_t)at, (uint32_t)(at >> 32),
++		(uint32_t)at, (uint32_t)(at >> 32),
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
+ 	};
+ 
+ 	IOLockLock(fb->fLock);

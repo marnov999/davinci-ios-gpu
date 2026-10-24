@@ -1,0 +1,99 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e1a516d..be6ebc1 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2845,6 +2845,8 @@ struct kgsl_bo_ent  {
+ 	uint64_t pushed;    /* ... and when that was (mach_absolute_time) */
+ 	uint32_t fence;     /* the last submission that names it (0: none has) */
+ 	uint64_t kept_at;   /* used 3 (an IOSurface's buffer given back, kept): since when */
++	uint16_t hnext;     /* the next in its chain of the id hash (index + 1; 0: none), and */
++	uint8_t  hashed;    /* ... whether it is in one */
+ };
+ 
+ /* XNU process KPIs: reclaim GPU contexts/BOs whose owning process has died.
+@@ -2887,13 +2889,53 @@ static struct kgsl_ctx_ent *kgsl_ctx_find(uint32_t id)
+  * a hint per id hash is checked first, and the table searched when it misses) */
+ #define KGSL_BO_HINTS 8192u
+ static uint16_t g_bo_hint[KGSL_BO_HINTS];
+-static void kgsl_bo_hint(const struct kgsl_bo_ent *b) { g_bo_hint[b->id % KGSL_BO_HINTS] = (uint16_t)(b - g_bo); }
++/*
++ * A chained hash of the ids (4K-page offsets: the hash is id / 4). It was one hint per hash and,
++ * when the hint missed, a walk of the whole table -- 4096 entries of 112 bytes -- for every id not
++ * found as live, which is every buffer a submission names after it was given back or kept (used 2,
++ * 3): 4% of the render thread. A buffer is put in its chain when it is made (kgsl_bo_hint) and
++ * taken out when its entry is freed or made again (kgsl_bo_unhash). Boot-arg sweetgpu_bohash_verify=1:
++ * the table walked after a miss as well, and a buffer found so but not in its chain said.
++ */
++#define KGSL_BO_HASH(id) (((id) >> 2) % KGSL_BO_HINTS)
++static int g_bo_hash_verify = -1;
++static void kgsl_bo_hint(struct kgsl_bo_ent *b)
++{
++	unsigned h = KGSL_BO_HASH(b->id);
++	if (b->hashed) { return; }
++	b->hnext = g_bo_hint[h];
++	g_bo_hint[h] = (uint16_t)(b - g_bo + 1);
++	b->hashed = 1;
++}
++static void kgsl_bo_unhash(struct kgsl_bo_ent *b)
++{
++	uint16_t *link;
++	if (!b->hashed) { return; }
++	for (link = &g_bo_hint[KGSL_BO_HASH(b->id)]; *link != 0; link = &g_bo[*link - 1].hnext) {
++		if (&g_bo[*link - 1] == b) { *link = b->hnext; break; }
++	}
++	b->hnext = 0;
++	b->hashed = 0;
++}
+ static struct kgsl_bo_ent *kgsl_bo_find(uint32_t id)
+ {
+-	unsigned i = g_bo_hint[id % KGSL_BO_HINTS];
+-	if (i < KGSL_MAX_BO && g_bo[i].used == 1 && g_bo[i].id == id) { return &g_bo[i]; }
+-	for (i = 0; i < KGSL_MAX_BO; i++) {
+-		if (g_bo[i].used == 1 && g_bo[i].id == id) { kgsl_bo_hint(&g_bo[i]); return &g_bo[i]; }
++	unsigned i, steps = 0;
++	for (i = g_bo_hint[KGSL_BO_HASH(id)]; i != 0 && steps++ < KGSL_MAX_BO; i = g_bo[i - 1].hnext) {
++		if (g_bo[i - 1].used == 1 && g_bo[i - 1].id == id) { return &g_bo[i - 1]; }
++	}
++	if (g_bo_hash_verify < 0) {
++		int v = 0;
++		g_bo_hash_verify = PE_parse_boot_argn("sweetgpu_bohash_verify", &v, sizeof(v)) && v != 0;
++	}
++	if (g_bo_hash_verify) {
++		static unsigned told;
++		for (i = 0; i < KGSL_MAX_BO; i++) {
++			if (g_bo[i].used == 1 && g_bo[i].id == id) {
++				if (told++ < 20) { printf("SWEET DRM: buffer %u (entry %u) not in its hash chain\n", id, i); }
++				kgsl_bo_hint(&g_bo[i]);
++				return &g_bo[i];
++			}
++		}
+ 	}
+ 	return NULL;
+ }
+@@ -3417,6 +3459,7 @@ gpu_bo_release(struct kgsl_bo_ent *b)
+ 	g_bo_count--;
+ 	g_bo_bytes -= b->mmapsize;
+ 	g_stat.closed++;
++	kgsl_bo_unhash(b);
+ 	bzero(b, sizeof(*b));
+ }
+ 
+@@ -3644,6 +3687,7 @@ kgsl_do_gpumem_alloc(vm_size_t size, uint32_t flags, struct kgsl_bo_ent **out)
+ 	} else {
+ 		g_stat.made++;
+ 	}
++	kgsl_bo_unhash(b);
+ 	bzero(b, sizeof(*b));
+ 	b->used = 1;
+ 	b->id = g_mmap_page_next;                    /* id = 4K-page offset base (16K aligned) */
+@@ -4328,6 +4372,7 @@ drm_do_ios_import(uint32_t surf_id, uint32_t *out_handle)
+ 		printf("SWEET DRM: ios_import surf %u FAILED (map %u pages)\n", surf_id, npages);
+ 		return ENOMEM;
+ 	}
++	kgsl_bo_unhash(b);
+ 	bzero(b, sizeof(*b));
+ 	b->used = 1;
+ 	b->id = g_mmap_page_next;
+-- 
+2.43.0
+

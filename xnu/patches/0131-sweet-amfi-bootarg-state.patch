@@ -1,0 +1,35 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 58913bc..8b5695b 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -312,9 +312,27 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+  * "AMFI" the syscall returns ENOPOLICY, dyld zeroes its AMFI flags and prunes
+  * both. Answer 0x5a with the full allow set so library injection works.
+  */
++/*
++ * And 0x60, "query boot-arg state" (amfi_interface_query_bootarg_state() in libamfi): 64 bits of
++ * flags, one for each boot-arg that turns a part of AMFI off. ExtensionFoundation asks it before it
++ * reads the system's table of extension points (/System/Library/xpc/extensions.plist); with none
++ * of the bits 0x86 set it wants the table's signature (extensions.plist.sig) checked by AMFI's
++ * IOKit service, which this kernel has not got -- so the table was never read, MobileInstallation
++ * refused every application extension ("does not correspond to a known extension point"), and
++ * LaunchServices had no widget and no poster to give SpringBoard or PosterBoard (no wallpaper,
++ * widgets "Waiting..."). Nothing is enforced here, so that is the answer (as HackiOS's
++ * kern_minimac.c gives it; which bit is which boot-arg is not known, any of them will do).
++ */
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
++#define SWEET_AMFI_BOOTARGS_NOT_ENFORCING 0x86ull
++
+ static int
+ sweet_amfi_dyld_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ {
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_BOOTARGS_NOT_ENFORCING;
++		return arg == 0 ? EINVAL : copyout(&state, arg, sizeof(state));
++	}
+ 	if (call != 0x5a) {
+ 		return ENOSYS;
+ 	}
+-- 
+2.43.0
+

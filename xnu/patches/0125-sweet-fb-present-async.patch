@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 742c3a4..9867295 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <kern/thread_call.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -233,6 +234,8 @@ public:
+ 	volatile uint32_t fShownSwap;   /* the id of the last swap shown (SwapWait waits for it) */
+ 	volatile uint64_t fLatchAt;     /* when the display engine last took a flip: a panel frame's start */
+ 	IOLock       *fPresentLock;     /* one present at a time (the tick's, SwapEnd's) */
++	thread_call_t fPresentCall;     /* SwapEnd's present, on a thread of its own (not the caller's) */
++	static void   presentCallout(thread_call_param_t self, thread_call_param_t unused);
+ 	bool          fImmediate;       /* boot-arg sweetfb_immediate (default 1): SwapEnd flips at once */
+ 	void          presentPending(void);
+ 	void          publishModes(void);
+@@ -350,6 +353,7 @@ AppleCLCD::start(IOService *provider)
+ 	publishModes();
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();
++	fPresentCall = thread_call_allocate_with_priority(&AppleCLCD::presentCallout, this, THREAD_CALL_PRIORITY_HIGH);
+ 	{
+ 		int v = 1;
+ 		(void)PE_parse_boot_argn("sweetfb_immediate", &v, sizeof(v));
+@@ -703,6 +707,12 @@ AppleCLCD::presentPending(void)
+ 	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ }
+ 
++void
++AppleCLCD::presentCallout(thread_call_param_t self, __unused thread_call_param_t unused)
++{
++	((AppleCLCD *)self)->presentPending();
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+@@ -732,7 +742,16 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ 	IOLockUnlock(fLock);
+ 	if (fImmediate && fScanout > 0) {
+-		presentPending();
++		/*
++		 * Not on the caller's thread: a present waits for the GPU to be done with the frame (1.5-3
++		 * ms, sweet_gpu_surface_wait), and the caller is CoreAnimation's render thread, which could
++		 * be drawing the next frame meanwhile -- the heaviest frames missed their tick by that much.
++		 */
++		if (fPresentCall != NULL) {
++			thread_call_enter(fPresentCall);
++		} else {
++			presentPending();
++		}
+ 	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);

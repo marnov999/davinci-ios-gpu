@@ -1,0 +1,38 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 587d863..3f6b85d 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1304,6 +1304,30 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 201: {     /* SWEET: selector 200 for up to 64 surfaces at once (in: their ids, u32 each; out: a mask, 1 written) */
++		/* (one Mach message a frame instead of one a surface: each costs the window server's render thread a kmsg
++		   made, copied in and out, and an IOKit dispatch) */
++		const uint32_t *ids = (const uint32_t *)args->structureInput;
++		uint32_t n = args->structureInputSize / sizeof(uint32_t);
++		uint64_t mask = 0;
++		if (ids == NULL || n == 0 || n > 64 || args->scalarOutputCount < 1) {
++			return kIOReturnBadArgument;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			SweetSurface *s = sweet_surface_copy(ids[i]);
++			uint64_t dirty = 1;                     /* (a surface not found: as written, so it is copied and seen to) */
++			if (s != NULL && s->memory != NULL) {
++				dirty = sweet_surface_push_written(s) < 0 ? 1 : 0;
++				dirty |= OSBitAndAtomic(0u, &s->cpuWritten) & 1u;
++			}
++			OSSafeReleaseNULL(s);
++			mask |= dirty << i;
++		}
++		args->scalarOutput[0] = mask;
++		args->scalarOutputCount = 1;
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnSuccess;
++	}
+ 	case 6:         /* WrapClientImage: a surface around memory of the caller's own */
+ 	case 7:         /* WrapClientMemory */
+ 		/*
+-- 
+2.43.0
+

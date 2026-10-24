@@ -1,0 +1,59 @@
+diff --git a/osfmk/ipc/ipc_kmsg.c b/osfmk/ipc/ipc_kmsg.c
+index b4d1276..0cb4198 100644
+--- a/osfmk/ipc/ipc_kmsg.c
++++ b/osfmk/ipc/ipc_kmsg.c
+@@ -702,6 +702,27 @@ ikm_body_sig(
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: every message is signed when it is sent and the signature checked when it is received,
++ * a hardening against a corrupted kmsg. On a PAC device that is a few instructions; here (no
++ * ptrauth) it is a SHA-256 in software of the header, body and trailer, both ways -- 3% of the
++ * window server's render thread, which sends and receives a message for every IOSurface call.
++ * Off on this port; boot-arg sweetikmsig=1 has it back. (Decided once, the same for both ends.)
++ */
++#include <pexpert/pexpert.h>
++static int sweet_ikm_sig = -1;
++static bool
++sweet_ikm_signed(void)
++{
++	if (__improbable(sweet_ikm_sig < 0)) {
++		int v = 0;
++		sweet_ikm_sig = PE_parse_boot_argn("sweetikmsig", &v, sizeof(v)) && v != 0;
++	}
++	return sweet_ikm_sig != 0;
++}
++#endif
++
+ static void
+ ikm_sign(ipc_kmsg_t kmsg)
+ {
+@@ -709,6 +730,11 @@ ikm_sign(ipc_kmsg_t kmsg)
+ 	uintptr_t sig;
+ 
+ 	zone_require(ipc_kmsg_zone, kmsg);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (!sweet_ikm_signed()) {
++		return;
++	}
++#endif
+ 
+ 	ikm_init_sig(kmsg, &scratch);
+ 
+@@ -764,6 +790,11 @@ ikm_validate_sig_internal(
+ 	char *str;
+ 
+ 	zone_require(ipc_kmsg_zone, kmsg);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (!sweet_ikm_signed()) {
++		return;
++	}
++#endif
+ 
+ 	ikm_init_sig(kmsg, &scratch);
+ 
+-- 
+2.43.0
+

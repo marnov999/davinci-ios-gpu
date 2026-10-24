@@ -1,0 +1,38 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..c79b420 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,7 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	flush_dcache((vm_offset_t) pp << PAGE_SHIFT, PAGE_SIZE, TRUE);     /* (pp << PAGE_SHIFT) lost bit 32 of PAs above 4 GB */
+ }
+ 
+ #if CONFIG_COREDUMP
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index caf40ff..16a1382 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -379,9 +379,14 @@ sweet_untruncate_pa(pmap_paddr_t pa, const char *who, void *ret)
+ {
+ 	pmap_paddr_t fixed = pa | 0x100000000ULL;
+ 	if ((pa < gPhysBase) && (fixed >= gPhysBase) && ((fixed - gPhysBase) < real_phys_size)) {
+-		static int sweet_trunc_logged = 0;
+-		if (sweet_trunc_logged < 32) {
+-			sweet_trunc_logged++;
++		/* the first time from each caller (the bug's place; pmap_sync_page_attributes_phys is fixed) */
++		static void *sweet_trunc_callers[16];
++		static int sweet_trunc_n = 0;
++		int k;
++		for (k = 0; k < sweet_trunc_n && sweet_trunc_callers[k] != ret; k++) {
++		}
++		if (k == sweet_trunc_n && sweet_trunc_n < 16) {
++			sweet_trunc_callers[sweet_trunc_n++] = ret;
+ 			printf("SWEET %s: truncated PA 0x%llx -> 0x%llx caller %p\n",
+ 			    who, (unsigned long long)pa, (unsigned long long)fixed, ret);
+ 		}
+-- 
+2.43.0
+

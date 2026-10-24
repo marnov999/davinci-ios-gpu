@@ -1,0 +1,42 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9867295..7eaf536 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -95,7 +95,7 @@ struct sweet_tl_swap {
+ 	uint64_t arrive, gpu, flip, latch, win, wout;
+ };
+ #define SWEET_TL_SWAPS 600
+-#define SWEET_TL_TICKS 600
++#define SWEET_TL_TICKS 2000
+ static struct sweet_tl_swap sweet_tl[SWEET_TL_SWAPS];
+ static uint64_t sweet_tl_tick[SWEET_TL_TICKS];
+ static volatile uint32_t sweet_tl_on, sweet_tl_n, sweet_tl_nt;
+@@ -677,9 +677,9 @@ AppleCLCD::presentPending(void)
+ 	if (have) {
+ 		uint32_t flips = fFlips;
+ 		uint64_t now = mach_absolute_time(), ns = 0, until = 0;
+-		static int latch_wait = -1;     /* boot-arg sweetfb_latchwait=0: flipped over one not taken yet (a test) */
++		static int latch_wait = -1;     /* boot-arg sweetfb_latchwait=1: a flip waits for the last to be taken */
+ 		if (latch_wait < 0) {
+-			int v = 1;
++			int v = 0;
+ 			(void)PE_parse_boot_argn("sweetfb_latchwait", &v, sizeof(v));
+ 			latch_wait = v != 0;
+ 		}
+@@ -1184,9 +1184,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0, args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
+ 			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0);
+ 		}
+-		static int wait = -1;           /* boot-arg sweetfb_swapwait=0: answered at once, as before 0103 (a test) */
++		/*
++		 * Answered at once (boot-arg sweetfb_swapwait=1: until the swap is on the panel): waiting,
++		 * however short, put CoreAnimation in step with the panel's latches instead of the vsync
++		 * it is told of, 18.6 ms a frame; answered at once it draws every 16.7 (60 a second).
++		 */
++		static int wait = -1;
+ 		if (wait < 0) {
+-			int v = 1;
++			int v = 0;
+ 			(void)PE_parse_boot_argn("sweetfb_swapwait", &v, sizeof(v));
+ 			wait = v != 0;
+ 		}

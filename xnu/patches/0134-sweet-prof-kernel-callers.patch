@@ -1,0 +1,64 @@
+diff --git a/bsd/dev/sweet_prof.c b/bsd/dev/sweet_prof.c
+index 111bd69..ad53c1c 100644
+--- a/bsd/dev/sweet_prof.c
++++ b/bsd/dev/sweet_prof.c
+@@ -36,6 +36,7 @@ struct sweet_prof_sample {
+ 	uint64_t pc, lr;
+ 	uint32_t tid, cpu;
+ 	uint64_t when;          /* mach_absolute_time() */
++	uint64_t up[4];         /* a sample in the kernel: the return addresses of the four frames above */
+ };
+ #define SWEET_PROF_MAX 16384
+ extern task_t                    sweet_prof_target;
+@@ -239,8 +240,9 @@ sweet_prof_thread(__unused void *arg, __unused wait_result_t wr)
+ 			uint64_t us = 0;
+ 			absolutetime_to_nanoseconds(sweet_prof_buf[i].when, &us);
+ 			us /= 1000u;            /* (the frame timeline's clock: TL lines) */
+-			printf("PRF s %llx %llx %u %u %llu\n", sweet_prof_buf[i].pc, sweet_prof_buf[i].lr, sweet_prof_buf[i].tid,
+-			    sweet_prof_buf[i].cpu, us);
++			printf("PRF s %llx %llx %u %u %llu %llx %llx %llx %llx\n", sweet_prof_buf[i].pc, sweet_prof_buf[i].lr,
++			    sweet_prof_buf[i].tid, sweet_prof_buf[i].cpu, us, sweet_prof_buf[i].up[0], sweet_prof_buf[i].up[1],
++			    sweet_prof_buf[i].up[2], sweet_prof_buf[i].up[3]);
+ 			if ((i & 255u) == 255u) {
+ 				(void)tsleep(&chan, PZERO, "sweetprf", hz / 20);   /* (the USB log streams 100 ms at a time) */
+ 			}
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 9e83660..dbd8a69 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1858,6 +1858,7 @@ struct sweet_prof_sample {
+ 	uint64_t pc, lr;
+ 	uint32_t tid, cpu;
+ 	uint64_t when;          /* mach_absolute_time() */
++	uint64_t up[4];         /* a sample in the kernel: the return addresses of the four frames above */
+ };
+ #define SWEET_PROF_MAX 16384
+ task_t                    sweet_prof_target;
+@@ -1878,6 +1879,24 @@ sweet_prof_irq(arm_saved_state_t *state)
+ 		sweet_prof_buf[i].tid = (uint32_t)thread_tid(current_thread());
+ 		sweet_prof_buf[i].cpu = (uint32_t)cpu_number() | (PSR64_IS_USER(get_saved_state_cpsr(state)) ? 0u : 0x80000000u);
+ 		sweet_prof_buf[i].when = mach_absolute_time();
++		{
++			/* in the kernel: the frame pointer chain, as far as it stays on this thread's kernel stack */
++			uint64_t fp = get_saved_state_fp(state);
++			vm_offset_t lo = current_thread()->kernel_stack, hi = lo + kernel_stack_size;
++			for (int k = 0; k < 4; k++) {
++				sweet_prof_buf[i].up[k] = 0;
++			}
++			if (!PSR64_IS_USER(get_saved_state_cpsr(state))) {
++				for (int k = 0; k < 4 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; k++) {
++					uint64_t next = ((uint64_t *)fp)[0], ret = ((uint64_t *)fp)[1];
++					sweet_prof_buf[i].up[k] = ret;
++					if (next <= fp) {
++						break;
++					}
++					fp = next;
++				}
++			}
++		}
+ 	}
+ }
+ #endif
+-- 
+2.43.0
+

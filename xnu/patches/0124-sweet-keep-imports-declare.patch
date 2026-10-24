@@ -1,0 +1,12 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 55e8a5a..41348f9 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3421,6 +3421,7 @@ gpu_bo_release(struct kgsl_bo_ent *b)
+ }
+ 
+ static void gpu_import_expire(void);
++static void gpu_import_drop(struct kgsl_bo_ent *b);
+ /* RedwoodGPU reap: buffers given back early that the GPU is done with now. With the lock held. */
+ static void
+ gpu_reap(void)

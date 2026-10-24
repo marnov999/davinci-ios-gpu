@@ -1,0 +1,106 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7eaf536..a55193f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1075,6 +1075,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ }
+ 
++extern "C" task_t sweet_window_server_task;      /* osfmk/kern/sched_prim.c */
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+@@ -1082,6 +1084,14 @@ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID,
+ 		return false;
+ 	}
+ 	fTask = owningTask;
++	{
++		/* the window server: its threads get the big cores (osfmk/kern/sched_prim.c choose_processor) */
++		char name[32] = "";
++		proc_selfname(name, sizeof(name));
++		if (strcmp(name, "backboardd") == 0) {
++			sweet_window_server_task = owningTask;
++		}
++	}
+ 	return true;
+ }
+ 
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 08cd33f..b3cb385 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5022,6 +5022,10 @@ choose_next_pset(
+  *	The thread must be locked.  The pset must be locked,
+  *	and the resulting pset is locked on return.
+  */
++#if defined(SWEET)
++task_t sweet_window_server_task;        /* backboardd, once it opens the display (SweetFramebuffer.cpp) */
++#endif
++
+ processor_t
+ choose_processor(
+ 	processor_set_t         starting_pset,
+@@ -5047,13 +5051,37 @@ choose_processor(
+ 		static int big_first = -1;
+ 		static uint32_t big_cpu = 6;
+ 		if (big_first < 0) {
+-			int v = 1;
++			int v = 2;
+ 			(void)PE_parse_boot_argn("sweetbig", &v, sizeof(v));
+ 			(void)PE_parse_boot_argn("sweetbig_cpu", &big_cpu, sizeof(big_cpu));
+-			big_first = v != 0;
++			big_first = v;
++		}
++		/*
++		 * And (sweetbig=2, the default): the window server's threads are such whatever their
++		 * priority (CoreAnimation's thread that takes the applications' commits was on the little
++		 * cores half the time, holding what the render thread waited for), and such a thread waits
++		 * for a big core rather than run on a little one when both are taken by others as urgent:
++		 * the render thread spent a quarter of its time on the little cores, where a frame takes
++		 * 2.5 times as long -- the frames shown twice in the widget panel and in Settings. It goes
++		 * to the big core running the least urgent thread (preempting it if less urgent than
++		 * itself, else queued there). sweetbig=1: only an idle big core, or a less urgent one.
++		 */
++		bool window_server = sweet_window_server_task != TASK_NULL && get_threadtask(thread) == sweet_window_server_task;
++		if (window_server) {
++			static uint64_t told[24];
++			static uint32_t ntold;
++			uint64_t tid = thread_tid(thread);
++			uint32_t k;
++			for (k = 0; k < ntold && told[k] != tid; k++) {
++			}
++			if (k == ntold && ntold < 24) {
++				told[ntold++] = tid;
++				printf("SWEET SCHED: window server thread %llu priority %d (base %d)\n", tid, thread->sched_pri, thread->base_pri);
++			}
+ 		}
+-		if (big_first && thread->sched_pri >= 46 && thread->sched_pri < BASEPRI_RTQUEUES) {
+-			processor_t busy = PROCESSOR_NULL;
++		if (big_first && (thread->sched_pri >= 46 || (big_first == 2 && window_server && thread->sched_pri >= 20)) &&
++		    thread->sched_pri < BASEPRI_RTQUEUES) {
++			processor_t busy = PROCESSOR_NULL, least = PROCESSOR_NULL;
+ 			for (uint32_t cpu = big_cpu; cpu < MAX_SCHED_CPUS; cpu++) {
+ 				processor_t p = processor_array[cpu];
+ 				if (p == PROCESSOR_NULL || p->processor_set != pset || !p->is_recommended) {
+@@ -5066,10 +5094,17 @@ choose_processor(
+ 				    (busy == PROCESSOR_NULL || p->current_pri < busy->current_pri)) {
+ 					busy = p;
+ 				}
++				if ((p->state == PROCESSOR_RUNNING || p->state == PROCESSOR_DISPATCHING) &&
++				    (least == PROCESSOR_NULL || p->current_pri < least->current_pri)) {
++					least = p;
++				}
+ 			}
+ 			if (busy != PROCESSOR_NULL) {
+ 				return busy;
+ 			}
++			if (big_first == 2 && least != PROCESSOR_NULL && (window_server || thread->sched_pri >= 47)) {
++				return least;
++			}
+ 		}
+ 	}
+ #endif
+-- 
+2.43.0
+

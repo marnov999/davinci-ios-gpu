@@ -1,0 +1,43 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 3f6b85d..3a33ba5 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -28,6 +28,9 @@
+ #include "SweetSurface.h"
+ extern "C" boolean_t pmap_is_modified(ppnum_t pn);
+ extern "C" void pmap_clear_modify(ppnum_t pn);
++extern "C" void pmap_clear_refmod_options(ppnum_t pn, unsigned int mask, unsigned int options, void *arg);
++#define SWEET_VM_MEM_MODIFIED   0x01            /* osfmk/vm/pmap.h VM_MEM_MODIFIED */
++#define SWEET_PMAP_FF_WIRED     0x10000         /* osfmk/vm/pmap.h PMAP_OPTIONS_FF_WIRED */
+ extern "C" boolean_t pmap_valid_page(ppnum_t pn);
+ extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t);
+ extern "C" void sweet_gpu_reap_dead_now(void);       /* bsd/dev/sweet_gpu.c */
+@@ -403,7 +406,24 @@ sweet_surface_push_written(SweetSurface *s)
+ 		if (!pmap_is_modified(list[i].pn)) {
+ 			continue;
+ 		}
+-		pmap_clear_modify(list[i].pn);
++		/*
++		 * Wired mappings too (the applications' maps of their surfaces are wired): without
++		 * PMAP_OPTIONS_FF_WIRED the pmap leaves their write permission alone, the next write does
++		 * not fault, and "modified" was never cleared -- every surface was pushed out whole at
++		 * every submission, 160 MB in five seconds of the widget panel, in the flushes of the
++		 * window server's frames. Boot-arg sweetsurf_ffwired=0: as before.
++		 */
++		static int ff_wired = -1;
++		if (ff_wired < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("sweetsurf_ffwired", &v, sizeof(v));
++			ff_wired = v != 0;
++		}
++		if (ff_wired) {
++			pmap_clear_refmod_options(list[i].pn, SWEET_VM_MEM_MODIFIED, SWEET_PMAP_FF_WIRED, NULL);
++		} else {
++			pmap_clear_modify(list[i].pn);
++		}
+ 		/* by the kernel's own (cached) view of all memory: no mapping to make, none of a different kind */
+ 		uintptr_t at = (uintptr_t)ml_static_ptovirt((vm_offset_t)ptoa(list[i].pn)) + list[i].poff;
+ 		for (uintptr_t line = at & ~(uintptr_t)63, end = at + list[i].len; line < end; line += 64) {
+-- 
+2.43.0
+

@@ -1,0 +1,21 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 3e9147c..587d863 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1169,8 +1169,12 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			/* boot-arg sweetfb_scanout=1: a full-screen BGRA surface (what CoreAnimation presents,
+ 			 * 1125x2436) gets a buffer of the display pool, one physical piece below 4 GB, so that
+ 			 * the display engine can fetch it as it is (SweetFramebuffer scanOut); else as any other */
++			/* (only the window server's: PosterBoard makes a dozen full-screen BGRA surfaces of its own for
++			   the wallpaper, which took the pool, and the frames then went back to being copied, torn) */
++			char maker[32] = "";
++			proc_selfname(maker, sizeof(maker));
+ 			if (s->width == SWEET_DISPLAY_W && s->height == SWEET_DISPLAY_H && s->pixelFormat == 'BGRA' &&
+-			    s->planeCount == 0 && s->bytesPerRow == SWEET_DISPLAY_BPR) {
++			    s->planeCount == 0 && s->bytesPerRow == SWEET_DISPLAY_BPR && strcmp(maker, "backboardd") == 0) {
+ 				mem = sweet_display_take(s->allocSize, &s->poolSlot);
+ 				if (mem == NULL) {
+ 					sweet_gpu_reap_dead_now();      /* (a dead window server's buffers may hold them) */
+-- 
+2.43.0
+

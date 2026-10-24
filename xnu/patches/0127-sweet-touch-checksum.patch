@@ -1,0 +1,111 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 572d29a..b9583d2 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -45,6 +45,7 @@ void sweet_touch_init(void);
+ #define GOODIX_HEAD_LEN_NORMANDY  2u
+ static bool touch_normandy;
+ static unsigned touch_dumpcnt;
++static unsigned touch_dropped; /* polls with no frame since one was dropped (0 = none dropped) */
+ 
+ #define SE_STATUS       0x040u
+ #define SE_MCLK         0x048u
+@@ -407,38 +408,67 @@ touch_goodix(void)
+ 	uint16_t ereg = touch_normandy ? GOODIX_EVENT_REG_NORMANDY : GOODIX_EVENT_REG;
+ 	unsigned head = touch_normandy ? GOODIX_HEAD_LEN_NORMANDY : GOODIX_HEAD_LEN;
+ 	if (touch_normandy) {
+-		/* Read the whole worst-case frame (2 header + 10*8 + 2 csum) in one
+-		 * transaction; a second addressed read confused the IC. */
+-		int err = touch_read(0x5d, ereg, true, buf, 2u + TOUCH_MAX * 8u + 2u);
+-		if (err) {
+-			return err;
+-		}
+-		if (!(buf[0] & 0x80u)) {
+-			return 0; /* status bit7 clear: no new frame */
+-		}
+-		unsigned n = buf[1] & 15u;
+-		/* Diagnostic: dump the raw frame unconditionally before any checks. */
+-		if (touch_dumpcnt < 40u) {
+-			++touch_dumpcnt;
+-			char line[3u * 40u + 1u];
+-			for (unsigned j = 0; j < 40u; ++j) {
+-				(void)snprintf(line + j * 3u, 4, "%02x ", buf[j]);
++		unsigned n;
++		for (unsigned attempt = 0;; ++attempt) {
++			/* Read the whole worst-case frame (2 header + 10*8 + 2 csum) in one
++			 * transaction; a second addressed read confused the IC. */
++			int err = touch_read(0x5d, ereg, true, buf, 2u + TOUCH_MAX * 8u + 2u);
++			if (err) {
++				return err;
+ 			}
+-			printf("SWEET TOUCH: nraw st=%02x n=%u %s\n", buf[0], n, line);
+-		}
+-		if (n > TOUCH_MAX) {
+-			(void)touch_goodix_ack();
+-			return 0;
+-		}
+-		unsigned tot = 2u + n * 8u + 2u, sum = 0;
+-		for (unsigned i = 0; i < tot; ++i) {
+-			sum += buf[i];
+-		}
+-		if ((sum & 0xffu) != 0u && touch_dumpcnt < 40u) {
+-			printf("SWEET TOUCH: nchk bad sum=%02x tot=%u\n", sum & 0xffu, tot);
++			if (!(buf[0] & 0x80u)) {
++				/* The dropped one may have been the only "lifted" frame: the IC sends
++				 * frames all the time a finger is down, so 6 polls with none = up. */
++				if (touch_dropped && ++touch_dropped > 6u) {
++					touch_dropped = 0;
++					touch_report(0, x, y);
++				}
++				return 0; /* status bit7 clear: no new frame */
++			}
++			n = buf[1] & 15u;
++			/* Diagnostic: dump the raw frame unconditionally before any checks. */
++			if (touch_dumpcnt < 40u) {
++				++touch_dumpcnt;
++				char line[3u * 40u + 1u];
++				for (unsigned j = 0; j < 40u; ++j) {
++					(void)snprintf(line + j * 3u, 4, "%02x ", buf[j]);
++				}
++				printf("SWEET TOUCH: nraw st=%02x n=%u %s\n", buf[0], n, line);
++			}
++			if (n > TOUCH_MAX) {
++				(void)touch_goodix_ack();
++				return 0;
++			}
++			/* Sum covers status, header, n points, key byte and checksum
++			 * (Android goodix_touch_handler: checksum_u8(&buf[0], n*8+4)). */
++			unsigned tot = 2u + n * 8u + 2u, sum = 0;
++			for (unsigned i = 0; i < tot; ++i) {
++				sum += buf[i];
++			}
++			if ((sum & 0xffu) == 0u) {
++				touch_dropped = 0;
++				break;
++			}
++			if (touch_dumpcnt < 40u) {
++				printf("SWEET TOUCH: nchk bad sum=%02x tot=%u try=%u\n",
++				    sum & 0xffu, tot, attempt);
++			}
++			/* Torn read: we are polling, not reading on the IRQ edge, and caught
++			 * the IC rewriting the frame (bytes read 00 or stale). Never report
++			 * it (Android drops it too). Re-read before acking, so the frame
++			 * being written is not thrown away; give up after three tries. */
++			if (attempt == 2u) {
++				(void)touch_goodix_ack();
++				touch_dropped = 1;
++				return 0; /* drop; keep the previous contact state */
++			}
++			touch_wait(1);
+ 		}
+ 		for (unsigned i = 0; i < n; ++i) {
+ 			const uint8_t *p = buf + 2u + i * 8u;
++			if (p[0] & 0x80u) {
++				continue; /* pen record (Android: id >= 0x80); davinci has no pen */
++			}
+ 			unsigned id = p[0] & 0x0fu;
+ 			unsigned px = touch_le16(p + 1), py = touch_le16(p + 3);
+ 			/* davinci panel is 1080x2340, but the HID->display mapping
+-- 
+2.43.0
+

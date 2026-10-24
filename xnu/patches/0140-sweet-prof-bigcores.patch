@@ -1,0 +1,83 @@
+diff --git a/bsd/dev/sweet_prof.c b/bsd/dev/sweet_prof.c
+index 7675d35..20610cf 100644
+--- a/bsd/dev/sweet_prof.c
++++ b/bsd/dev/sweet_prof.c
+@@ -198,6 +198,37 @@ sweet_prof_thread(__unused void *arg, __unused wait_result_t wr)
+ 			sweet_prof_file();
+ 		}
+ 		secs = sweet_prof_seconds;
++		if (strcmp(sweet_prof_name, "BIGCORES") == 0) {
++			/* every interrupt on cpu 6-7, whatever task it comes in: "PRF b NAME PRIORITY TID CPU US KERNEL" */
++			extern volatile int sweet_prof_bigcores;
++			sweet_prof_n = 0;
++			sweet_fb_timeline(1);
++			sweet_prof_bigcores = 1;
++			(void)tsleep(&chan, PZERO, "sweetprf", secs * hz);
++			sweet_prof_bigcores = 0;
++			sweet_fb_timeline(0);
++			delay(2000);
++			n = sweet_prof_n < SWEET_PROF_MAX ? sweet_prof_n : SWEET_PROF_MAX;
++			printf("PRF begin BIGCORES %u samples in %d s\n", n, secs);
++			for (uint32_t i = 0; i < n; i++) {
++				char name[9];
++				uint64_t us = 0;
++				for (int k = 0; k < 8; k++) {
++					char c = (char)(sweet_prof_buf[i].pc >> (8 * k));
++					name[k] = c >= 0x21 && c < 0x7f ? c : (c == 0 ? 0 : '_');
++				}
++				name[8] = 0;
++				absolutetime_to_nanoseconds(sweet_prof_buf[i].when, &us);
++				printf("PRF b %s %u %u %u %llu %u\n", name[0] ? name : "?", (uint32_t)sweet_prof_buf[i].lr, sweet_prof_buf[i].tid,
++				    sweet_prof_buf[i].cpu, us / 1000u, (uint32_t)(sweet_prof_buf[i].lr >> 32));
++				if ((i & 255u) == 255u) {
++					(void)tsleep(&chan, PZERO, "sweetprf", hz / 20);
++				}
++			}
++			printf("PRF end\n");
++			sweet_prof_seconds = 0;
++			continue;
++		}
+ 		proc_iterate(PROC_ALLPROCLIST, sweet_prof_proc, &f, NULL, NULL);
+ 		if (f.task == TASK_NULL) {
+ 			printf("PRF no process named %s\n", sweet_prof_name);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 09b1441..a1cba58 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1866,10 +1866,33 @@ task_t                    sweet_prof_target;
+ volatile uint32_t         sweet_prof_n;
+ struct sweet_prof_sample  sweet_prof_buf[SWEET_PROF_MAX];
+ 
++/* "BIGCORES" (sweet_prof.c): whatever runs on cpu 6 and 7, any task -- its name, priority, thread */
++volatile int sweet_prof_bigcores;
++extern void *get_bsdtask_info(task_t);
++extern char *proc_name_address(void *p);
++
+ static inline void
+ sweet_prof_irq(arm_saved_state_t *state)
+ {
+ 	uint32_t i;
++	if (__improbable(sweet_prof_bigcores) && cpu_number() >= 6) {
++		void *bsd = get_bsdtask_info(current_task());
++		const char *name = bsd != NULL ? proc_name_address(bsd) : "?";
++		uint64_t comm = 0;
++		i = os_atomic_inc_orig(&sweet_prof_n, relaxed);
++		if (i < SWEET_PROF_MAX) {
++			for (int k = 0; k < 8 && name != NULL && name[k] != 0; k++) {
++				comm |= (uint64_t)(uint8_t)name[k] << (8 * k);
++			}
++			sweet_prof_buf[i].pc = comm;
++			sweet_prof_buf[i].lr = (uint64_t)(uint32_t)current_thread()->sched_pri |
++			    ((PSR64_IS_USER(get_saved_state_cpsr(state)) ? 0ull : 1ull) << 32);
++			sweet_prof_buf[i].tid = (uint32_t)thread_tid(current_thread());
++			sweet_prof_buf[i].cpu = (uint32_t)cpu_number();
++			sweet_prof_buf[i].when = mach_absolute_time();
++		}
++		return;
++	}
+ 	if (current_task() != sweet_prof_target || sweet_prof_target == TASK_NULL) {
+ 		return;
+ 	}
+-- 
+2.43.0
+

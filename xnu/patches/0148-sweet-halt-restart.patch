@@ -1,0 +1,119 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 9aa4286..aedeacf 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -5197,6 +5197,29 @@ spmi_pon_write_direct(unsigned apid, uint8_t val)
+ 	return -3;
+ }
+ 
++/* A PON register other than SOFT_RB_SPARE, by the same channel. */
++static int
++spmi_pon_wr(unsigned apid, uint8_t reg, uint8_t val)
++{
++	vm_offset_t ch = ml_io_map(SPMI_CHNLS_PA + 0x10000u * apid, 0x1000u);
++	unsigned i;
++	if (!ch) {
++		return -1;
++	}
++	*(volatile uint32_t *)(ch + 0x10u) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (0u << 27) | ((reg & 0xffu) << 4) | 0u;
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < 1000u; ++i) {
++		uint32_t st = *(volatile uint32_t *)(ch + 0x08u);
++		if (st & 1u) {
++			return (st & 0x0eu) ? -2 : 0;
++		}
++		gmub_udelay(1);
++	}
++	return -3;
++}
++
+ static int
+ sweet_reboot_fastboot(uint32_t mode)
+ {
+@@ -5242,6 +5265,70 @@ sweet_reboot_fastboot(uint32_t mode)
+ 	return -1;
+ }
+ 
++/*
++ * Power off and restart. Nothing set PE_halt_restart, so iOS's "slide to power off" and restart
++ * ended in halt_all_cpus()'s spin. As Linux's msm-poweroff and qpnp-power-on do it: the boot
++ * reason in SOFT_RB_SPARE cleared (sweetgpu_armfb leaves "bootloader" there, which would bring
++ * an intended restart up in fastboot), the PMIC's PS_HOLD reset type (PON 0x5a bits[3:0]; on
++ * this gen2 PON its enable, bit 7, is in 0x5b, cleared while the type changes) set to shutdown
++ * or hard reset, then PS_HOLD dropped: the PMIC does the rest. A restart tries PSCI
++ * SYSTEM_RESET first, as the fastboot reboot does. Panics keep the old path (fastboot when
++ * armed). Boot-arg sweethalt=0 leaves the hook unset.
++ */
++#define PON_PS_HOLD_RST_CTL     0x5au
++#define PON_PS_HOLD_RST_CTL2    0x5bu
++#define PON_RESET_EN            0x80u
++#define PON_TYPE_SHUTDOWN       0x04u
++#define PON_TYPE_HARD_RESET     0x07u
++enum { SWEET_PE_HALT = 0, SWEET_PE_RESTART = 1, SWEET_PE_UPS_HALT = 3 };   /* IOPlatformExpert.h kPE* */
++extern int (*PE_halt_restart)(unsigned int type);
++
++static int
++sweet_halt_restart(unsigned int type)
++{
++	bool off = (type == SWEET_PE_HALT || type == SWEET_PE_UPS_HALT);
++	vm_offset_t core, cfg, obs, ph;
++	unsigned count, apid = 0xffffu;
++	uint8_t spare = 0, ctl = 0, ctl2 = 0;
++	uint64_t r[4];
++
++	if (!off && type != SWEET_PE_RESTART) {
++		return -1;
++	}
++	core = ml_io_map(SPMI_CORE_PA, 0x2000u);
++	cfg = ml_io_map(SPMI_CFG_PA, 0x1000u);
++	obs = ml_io_map(SPMI_OBS_PA, 0x10000u);
++	count = core ? (*(volatile uint32_t *)(core + 4)) & 0x7ffu : 0;
++	if (cfg && obs && count && count <= 512 && spmi_pon_read(core, cfg, obs, count, &apid, &spare) == 0) {
++		int w0 = spmi_pon_wr(apid, PON_SOFT_RB_SPARE, (uint8_t)(spare & 0x01u));
++		(void)spmi_rd8(0, (PON_PERIPH << 8) | PON_PS_HOLD_RST_CTL, &ctl);
++		(void)spmi_rd8(0, (PON_PERIPH << 8) | PON_PS_HOLD_RST_CTL2, &ctl2);
++		int w1 = spmi_pon_wr(apid, PON_PS_HOLD_RST_CTL2, (uint8_t)(ctl2 & ~PON_RESET_EN));
++		gmub_udelay(500);               /* 10 sleep-clock cycles, with Linux's margin */
++		int w2 = spmi_pon_wr(apid, PON_PS_HOLD_RST_CTL,
++		    (uint8_t)((ctl & 0xf0u) | (off ? PON_TYPE_SHUTDOWN : PON_TYPE_HARD_RESET)));
++		int w3 = spmi_pon_wr(apid, PON_PS_HOLD_RST_CTL2, (uint8_t)(ctl2 | PON_RESET_EN));
++		printf("SWEET HALT: %s: reason %#x -> %#x, PS_HOLD type %#x -> %#x, writes %d %d %d %d\n",
++		    off ? "power off" : "restart", spare, spare & 0x01u, ctl,
++		    (ctl & 0xf0u) | (off ? PON_TYPE_SHUTDOWN : PON_TYPE_HARD_RESET), w0, w1, w2, w3);
++	} else {
++		printf("SWEET HALT: %s: PMIC PON not reachable\n", off ? "power off" : "restart");
++	}
++	gmub_flush();
++	gmub_udelay(200000);                    /* the line out over the network first */
++	if (!off) {
++		gpu_smc(PSCI_SYSTEM_RESET, 0, 0, 0, 0, 0, 0, r);
++	}
++	ph = ml_io_map(PSHOLD_PA, 0x1000u);
++	if (ph) {
++		*(volatile uint32_t *)ph = 0u;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	for (;;) {
++		__asm__ volatile("wfe");
++	}
++}
++
+ /*
+  * The GPU's clock, as Linux's a6xx_gmu_set_freq() sets it on a legacy GMU (the a618; davinci's own
+  * kernel has qcom,gpu-quirk-hfi-use-reg, the same register path): the perf level into
+@@ -5910,6 +5997,13 @@ gpu_thread(void *arg, wait_result_t wr)
+ 			printf("SWEET GPU: armed for fastboot: %d\n", sweet_reboot_fastboot(0));
+ 		}
+ 	}
++	{
++		uint32_t halt = 1;
++		(void)PE_parse_boot_argn("sweethalt", &halt, sizeof(halt));
++		if (halt && PE_halt_restart == NULL) {
++			PE_halt_restart = sweet_halt_restart;
++		}
++	}
+ 	{
+ 		uint32_t f = 0;
+ 		if (PE_parse_boot_argn("sweetcpufreq", &f, sizeof(f)) && f) {

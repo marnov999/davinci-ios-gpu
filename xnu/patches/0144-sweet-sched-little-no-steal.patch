@@ -1,0 +1,41 @@
+diff --git a/osfmk/kern/sched_dualq.c b/osfmk/kern/sched_dualq.c
+index 01f6f01..40af5a7 100644
+--- a/osfmk/kern/sched_dualq.c
++++ b/osfmk/kern/sched_dualq.c
+@@ -245,6 +245,36 @@ sched_dualq_choose_thread(
+ 		return run_queue_dequeue(chosen_runq, SCHED_HEADQ);
+ 	}
+ 
++#if defined(SWEET)
++	{
++		/*
++		 * SWEET: a little core (cpu0-5) leaves the window server's urgent threads -- CoreAnimation's
++		 * render thread -- to the big cores unless one has waited 4 ms for them: choose_processor()
++		 * sends them to a big core, but when both run something as urgent they wait in this queue,
++		 * and an idle little core took them, where a frame takes 2-3 times as long (30% of the
++		 * render thread's time in the frames that took over 14 ms, 4% in the others).
++		 * Boot-arg sweetbig_nosteal=0: as before.
++		 */
++		extern task_t sweet_window_server_task;
++		static int nosteal = -1;
++		static uint64_t patience;
++		if (nosteal < 0) {
++			int v = 1;
++			(void)PE_parse_boot_argn("sweetbig_nosteal", &v, sizeof(v));
++			nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &patience);
++			nosteal = v;
++		}
++		if (nosteal && processor->cpu_id < 6 && sweet_window_server_task != TASK_NULL) {
++			thread_t head = run_queue_peek(main_runq);
++			if (head != THREAD_NULL && head->sched_pri >= 46 && head->sched_pri < BASEPRI_RTQUEUES &&
++			    get_threadtask(head) == sweet_window_server_task &&
++			    mach_absolute_time() - head->last_made_runnable_time < patience) {
++				return THREAD_NULL;
++			}
++		}
++	}
++#endif
++
+ 	if (processor->is_SMT) {
+ 		thread_t potential_thread = run_queue_peek(chosen_runq);
+ 		if (potential_thread == THREAD_NULL) {

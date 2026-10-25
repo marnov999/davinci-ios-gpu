@@ -1,0 +1,30 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 7e9defa..9aa4286 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -4431,7 +4431,25 @@ sweet_gpu_surface_wait(uint32_t surf_id, uint32_t ms)
+ 		}
+ 	}
+ 	if (fence != 0 && !gpu_wait(fence, ms)) {
++		/* (which fence, and where from: a present that waits its whole time, 100 ms a frame, came and went
++		 * with Settings in some boots -- the GPU busy a third of the time, its submissions 2.4 ms each) */
++		static uint32_t told;
+ 		done = 0;
++		if (told++ < 12u) {
++			unsigned bos = 0, lefts = 0, used = 0;
++			for (i = 0; i < KGSL_MAX_BO; i++) {
++				if ((g_bo[i].used == 1 || g_bo[i].used == 3) && g_bo[i].surf_id == surf_id && g_bo[i].fence != 0) {
++					bos++;
++					used |= 1u << g_bo[i].used;
++				}
++			}
++			for (i = 0; i < g_left_count; i++) {
++				lefts += g_left[i].surf_id == surf_id;
++			}
++			printf("SWEET DRM: surface %u: waited %u ms for fence %u, the core has done %u, the last submitted is %u; "
++			    "%u buffers of it (kinds %#x), %u given back\n", surf_id, ms, fence,
++			    *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF), g_fence, bos, used, lefts);
++		}
+ 	}
+ 	gpu_unlock();
+ 	return done;

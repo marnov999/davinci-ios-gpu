@@ -1,0 +1,581 @@
+diff --git a/bsd/dev/sweet_dpu.c b/bsd/dev/sweet_dpu.c
+index ca276b3..9c5c803 100644
+--- a/bsd/dev/sweet_dpu.c
++++ b/bsd/dev/sweet_dpu.c
+@@ -8,7 +8,8 @@
+  * sde_hw_intf.c). Every block is printed as its non-zero words, so what is live stands out: the
+  * pipe that fetches the framebuffer (its address, stride, format, sizes), the mixer and control
+  * path it goes through, the pingpong's tear check and autorefresh (a command-mode panel), and the
+- * DSI interface.
++ * DSI interface. And VIG0's pixel extension and scaler (QSEED3 lite at +0xa00), which
++ * SweetFramebuffer.cpp's scalerOn sets up to fetch 1125x2436 and give the panel 1080x2340.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -33,7 +34,8 @@ static const struct {
+ 	{ "top", 0x1000u, 0x460u },
+ 	{ "ctl0", 0x2000u, 0x100u }, { "ctl1", 0x2200u, 0x100u }, { "ctl2", 0x2400u, 0x100u },
+ 	{ "ctl3", 0x2600u, 0x100u }, { "ctl4", 0x2800u, 0x100u }, { "ctl5", 0x2a00u, 0x100u },
+-	{ "vig0", 0x5000u, 0x80u }, { "vig1", 0x7000u, 0x80u },
++	{ "vig0", 0x5000u, 0x80u }, { "vig0 pe", 0x5100u, 0x30u }, { "vig0 qseed", 0x5a00u, 0xa0u },
++	{ "vig1", 0x7000u, 0x80u },
+ 	{ "dma0", 0x25000u, 0x80u }, { "dma1", 0x27000u, 0x80u }, { "dma2", 0x29000u, 0x80u },
+ 	{ "lm0", 0x45000u, 0x60u }, { "lm1", 0x46000u, 0x60u }, { "lm2", 0x47000u, 0x60u }, { "lm3", 0x48000u, 0x60u },
+ 	{ "intf1(dsi)", 0x6b800u, 0x2c0u }, { "intf2(dsi)", 0x6c000u, 0x2c0u },
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0e07bae..a82b79b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -24,10 +24,12 @@
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+  *
+- * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
+- * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+- * enabled it, through the port they registered (IOConnectSetNotificationPort).
++ * SwapEnd copies the enabled layers' surfaces into the panel memory (CPU
++ * copy; scaled to the panel unless sweetfb_scale=0, below), or has the
++ * display engine fetch the frame itself (sweetfb_scanout=1). Vsync
++ * (notification type 5) is a 60 Hz timer that sends (count,
++ * mach_absolute_time, 0) as 32-bit halves to clients that enabled it,
++ * through the port they registered (IOConnectSetNotificationPort).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+@@ -83,6 +85,41 @@ enum {
+ #define SWEET_MDP_VIG0_ADDR     (0x5000u + 0x014u)
+ #define SWEET_MDP_VIG0_STRIDE   (0x5000u + 0x024u)
+ #define SWEET_MDP_FLUSH_VIG0    0x1u
++/*
++ * VIG0's sizes, its pixel extension and its scaler (scalerOn): sde_hw_sspp.c, sde_hw_util.c
++ * (SDE_SCALER_QSEED3 / QSEED3LITE), the scaler at dt qcom,sde-vig-qseed-off 0xa00 into the pipe.
++ */
++#define SWEET_MDP_VIG0              0x5000u                     /* dt qcom,sde-sspp-off */
++#define SWEET_MDP_VIG0_SRC_SIZE     (SWEET_MDP_VIG0 + 0x000u)   /* h << 16 | w, fetched */
++#define SWEET_MDP_VIG0_SRC_XY       (SWEET_MDP_VIG0 + 0x008u)
++#define SWEET_MDP_VIG0_OUT_SIZE     (SWEET_MDP_VIG0 + 0x00cu)   /* h << 16 | w, into LM0 */
++#define SWEET_MDP_VIG0_OUT_XY       (SWEET_MDP_VIG0 + 0x010u)
++#define SWEET_MDP_VIG0_FORMAT       (SWEET_MDP_VIG0 + 0x030u)
++#define SWEET_MDP_VIG0_FORMAT_ALPHA (1u << 8)                   /* SRCC3_EN: the format's alpha is used */
++#define SWEET_MDP_VIG0_DECIMATION   (SWEET_MDP_VIG0 + 0x0b4u)
++#define SWEET_MDP_VIG0_PE(c)        (SWEET_MDP_VIG0 + 0x100u + 0x10u * (c))     /* c 0, 1 (1 and 2), 2 (3): +0 LR, +4 TB, +8 REQ_PIXELS */
++#define SWEET_MDP_VIG0_QSEED        (SWEET_MDP_VIG0 + 0xa00u)
++#define SWEET_QSEED_VERSION         0x00u
++#define SWEET_QSEED_OP_MODE         0x04u
++#define SWEET_QSEED_STEP_Y_H        0x10u       /* (and _Y_V 0x14, _UV_H 0x18, _UV_V 0x1c) */
++#define SWEET_QSEED_PRELOAD         0x20u
++#define SWEET_QSEED_SRC_SIZE_Y      0x40u       /* (and _UV 0x44) */
++#define SWEET_QSEED_DST_SIZE        0x48u
++#define SWEET_QSEED_INIT_Y_H        0x90u       /* (and _Y_V 0x94, _UV_H 0x98, _UV_V 0x9c; not on version 0x1002) */
++#define SWEET_QSEED_PHASE_SHIFT     21          /* sde_plane.c PHASE_STEP_SHIFT: a source pixel is 1 << 21 */
++#define SWEET_QSEED_PRELOAD_H       4           /* sde_hw_util.c QSEED3_DEFAULT_PRELOAD_H / _V */
++#define SWEET_QSEED_PRELOAD_V       3
++#define SWEET_QSEED_OP_ENABLE       (1u << 0)
++#define SWEET_QSEED_OP_ALPHA        (1u << 10)  /* the format has alpha... */
++#define SWEET_QSEED_OP_8BIT         (1u << 14)  /* ...and is not a 10-bit one */
++#define SWEET_QSEED_OP_Y_BILINEAR   (3u << 16)  /* y_rgb_filter_cfg SDE_SCALE_BIL: no coefficient tables */
++#define SWEET_QSEED_OP_A_BILINEAR   (1u << 29)  /* alpha_filter_cfg SDE_SCALE_ALPHA_BIL */
++#define SWEET_QSEED_OP_BLEND        (1u << 31)  /* blend_cfg 1 */
++#define SWEET_FB_SCALER_REGS        32
++
++struct sweet_fb_reg {
++	uint32_t off, val;
++};
+ 
+ /*
+  * The frame timeline (asked with the profiler, bsd/dev/sweet_prof.c): for every swap, when it came
+@@ -158,9 +195,12 @@ sweet_fb_timeline(int on)
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+  * rdar://45025538 bar for 360x800 points). The display is therefore
+- * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+- * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+- * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and
++ * shown scaled onto the whole 1080x2340 panel (the same 19.5:9), as an
++ * iPhone 12 mini shows the same 1125x2436 on its 1080x2340 one: by the
++ * display engine's scaler when it fetches the frame itself, else by the
++ * copy. Boot-arg sweetfb_scale=0 shows the centered 1080x2340 part of it
++ * instead (cropped), sweetfb_native=1 presents the real panel size.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+@@ -192,6 +232,10 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	 * frame took tens of milliseconds -- and share the rows out among helper threads on the
+ 	 * other cores (boot-arg sweetfb_threads, default 3: the presenting thread and two helpers).
+ 	 */
++	/* scaled (fScale): a panel row is runs of consecutive source pixels (1125 -> 1080: 46 runs, 24 of every 25) */
++	struct ScaleRun {
++		uint32_t dst, src, n;   /* panel pixel (from the job's first), source pixel (likewise), how many */
++	};
+ 	struct RowJob {
+ 		uintptr_t src;          /* first pixel of the first row to copy */
+ 		uint64_t  stride;       /* bytes from one source row to the next */
+@@ -199,6 +243,9 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 		uint64_t  rowBytes;     /* bytes from one panel row to the next */
+ 		size_t    bytes;        /* bytes of a row */
+ 		int32_t   rows;
++		const ScaleRun *runs;   /* scaled: the row's runs (NULL: the row as it is) */
++		uint32_t  nruns;
++		const uint32_t *rowMap; /* scaled: the source row (from the first) of each panel row */
+ 	};
+ 	IOLock            *fHelperLock;
+ 	const RowJob      *fHelperJob;
+@@ -245,8 +292,17 @@ public:
+ 	uint32_t      fRateSwaps, fRateShown, fRateFlips, fRateLate;
+ 	uint64_t      fRateSince, fLastShown;
+ 	uint64_t      fNextTick;      /* the timer's next deadline: a fixed 60 Hz cadence, not 16.7 ms after the work */
+-	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride);
++	bool scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled);
+ 	void scanBack(void);
++	bool          fScale;         /* boot-arg sweetfb_scale (default 1): the presented size onto the whole panel */
++	bool          fScaled;        /* VIG0 fetches the presented size and its scaler shrinks it (scalerOn) */
++	int           fScalerState;   /* 0 not looked at yet, 1 the boot loader's values kept, -1 not usable */
++	struct sweet_fb_reg fScalerSave[SWEET_FB_SCALER_REGS];    /* the boot loader's (put back by scalerOff) */
++	unsigned      fScalerRegs;
++	ScaleRun     *fRuns;          /* scaled copies: a panel row's runs, and each panel row's source row */
++	uint32_t     *fRowMap;
++	bool          scalerOn(void);
++	void          scalerOff(void);
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -382,6 +438,16 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	{
++		/* (SweetHID.cpp maps the touches by the same boot-args) */
++		int v = 1;
++		(void)PE_parse_boot_argn("sweetfb_scale", &v, sizeof(v));
++		fScale = v != 0 && (fLogicalW != fWidth || fLogicalH != fHeight);
++		if (fScale) {
++			fRuns = (ScaleRun *)IOMallocData(sizeof(ScaleRun) * fWidth);
++			fRowMap = (uint32_t *)IOMallocData(sizeof(uint32_t) * fHeight);
++		}
++	}
+ 	publishModes();
+ 	fLock = IOLockAlloc();
+ 	fPresentLock = IOLockAlloc();
+@@ -433,8 +499,9 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+ 	sweet_publish_accelerator(provider);
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u%s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fScale ? ", scaled to the panel" : (fLogicalW != fWidth || fLogicalH != fHeight) ? ", centered crop" : "");
+ 	return true;
+ }
+ 
+@@ -442,8 +509,16 @@ void
+ AppleCLCD::copyRows(const RowJob *job, int32_t y0, int32_t y1)
+ {
+ 	for (int32_t y = y0; y < y1; y++) {
+-		memcpy((void *)(job->dst + (uint64_t)y * job->rowBytes), (const void *)(job->src + (uint64_t)y * job->stride),
+-		    job->bytes);
++		uintptr_t to = job->dst + (uint64_t)y * job->rowBytes;
++		uintptr_t from = job->src + (uint64_t)(job->rowMap != NULL ? job->rowMap[y] : (uint32_t)y) * job->stride;
++		if (job->runs == NULL) {
++			memcpy((void *)to, (const void *)from, job->bytes);
++			continue;
++		}
++		for (uint32_t i = 0; i < job->nruns; i++) {
++			const ScaleRun *run = &job->runs[i];
++			memcpy((void *)(to + (uint64_t)run->dst * 4), (const void *)(from + (uint64_t)run->src * 4), (size_t)run->n * 4);
++		}
+ 	}
+ }
+ 
+@@ -816,15 +891,154 @@ AppleCLCD::swap(const uint8_t *rec)
+  * into VIG0 and VIG0's flush bit into CTL0 (sde_hw_ctl: SSPP_VIG0 = bit 0): the engine takes the
+  * double-buffered registers at the next frame's start, so there is no tearing. The surface has to
+  * be one physical piece below 4 GB (SweetSurface allocates CoreAnimation's full-screen ones so);
+- * anything else is copied as before, with VIG0 back on the boot framebuffer.
++ * anything else is copied as before, with VIG0 back on the boot framebuffer. Scaled (fScale), VIG0
++ * fetches the whole 1125x2436 surface and its scaler shrinks it to the panel (scalerOn): the boot
++ * loader's 1:1 setup of the pipe is changed at the first flip, and put back by scanBack.
+  */
+ 
++/* VIG0's last flush taken by the display engine (or MS gone by): what is written now is all taken together at the next */
++static bool
++sweet_fb_flush_taken(volatile uint32_t *r, uint32_t ms)
++{
++	uint64_t until = 0;
++	clock_interval_to_deadline(ms, kMillisecondScale, &until);
++	while ((r[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_MDP_FLUSH_VIG0) != 0) {
++		if (mach_absolute_time() >= until) {
++			return false;
++		}
++		IODelay(100);
++	}
++	return true;
++}
++
++/*
++ * VIG0 fetching SW x SH and its scaler giving DW x DH to LM0, as the vendor driver sets a pipe up when
++ * nobody gave it scaler data (sde_plane.c _sde_plane_setup_scaler3 -> sde_hw_sspp.c setup_rects,
++ * setup_pe, sde_hw_util.c sde_hw_setup_scaler3): bilinear, so no coefficient tables to load; a phase
++ * step of SW / DW source pixels (21 fraction bits: 1125 -> 1080 is 0x215555, 2436 -> 2340 0x215015);
++ * initial phase 0; the preload of QSEED3 (4 across, 3 down); no pixel extension (the pipe's
++ * PE_OVERRIDE is set, so REQ_PIXELS is what it fetches: the whole source). The scaler's op mode last.
++ */
++static unsigned
++sweet_fb_scaler_config(struct sweet_fb_reg *c, uint32_t sw, uint32_t sh, uint32_t dw, uint32_t dh, bool alpha)
++{
++	uint32_t src = (sh << 16) | sw, dst = (dh << 16) | dw;
++	uint32_t step_x = (uint32_t)(((uint64_t)sw << SWEET_QSEED_PHASE_SHIFT) / dw);
++	uint32_t step_y = (uint32_t)(((uint64_t)sh << SWEET_QSEED_PHASE_SHIFT) / dh);
++	uint32_t preload = SWEET_QSEED_PRELOAD_H | (SWEET_QSEED_PRELOAD_V << 8) | (SWEET_QSEED_PRELOAD_H << 16) |
++	    (SWEET_QSEED_PRELOAD_V << 24);
++	uint32_t op = SWEET_QSEED_OP_ENABLE | SWEET_QSEED_OP_Y_BILINEAR | SWEET_QSEED_OP_BLEND | SWEET_QSEED_OP_8BIT;
++	const uint32_t q = SWEET_MDP_VIG0_QSEED;
++	unsigned n = 0;
++
++	if (alpha) {
++		op |= SWEET_QSEED_OP_ALPHA | SWEET_QSEED_OP_A_BILINEAR;
++	}
++	c[n++] = { SWEET_MDP_VIG0_SRC_SIZE, src };
++	c[n++] = { SWEET_MDP_VIG0_SRC_XY, 0 };
++	c[n++] = { SWEET_MDP_VIG0_OUT_SIZE, dst };
++	c[n++] = { SWEET_MDP_VIG0_OUT_XY, 0 };
++	c[n++] = { SWEET_MDP_VIG0_DECIMATION, 0 };
++	for (uint32_t i = 0; i < 3; i++) {     /* colour 0, colours 1 and 2, colour 3: LR, TB, REQ_PIXELS */
++		c[n++] = { SWEET_MDP_VIG0_PE(i) + 0x0u, 0 };
++		c[n++] = { SWEET_MDP_VIG0_PE(i) + 0x4u, 0 };
++		c[n++] = { SWEET_MDP_VIG0_PE(i) + 0x8u, src };
++	}
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0x0u, 0 };
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0x4u, 0 };
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0x8u, 0 };
++	c[n++] = { q + SWEET_QSEED_INIT_Y_H + 0xcu, 0 };
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0x0u, step_x };
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0x4u, step_y };
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0x8u, step_x };      /* (RGB: no subsampled chroma) */
++	c[n++] = { q + SWEET_QSEED_STEP_Y_H + 0xcu, step_y };
++	c[n++] = { q + SWEET_QSEED_PRELOAD, preload };
++	c[n++] = { q + SWEET_QSEED_SRC_SIZE_Y + 0x0u, src };
++	c[n++] = { q + SWEET_QSEED_SRC_SIZE_Y + 0x4u, src };
++	c[n++] = { q + SWEET_QSEED_DST_SIZE, dst };
++	c[n++] = { q + SWEET_QSEED_OP_MODE, op };
++	return n;
++}
++#define SWEET_FB_SCALER_SRC     0       /* (indexes into that: logged) */
++#define SWEET_FB_SCALER_OUT     2
++#define SWEET_FB_SCALER_REQ     7
++#define SWEET_FB_SCALER_STEP    18
++#define SWEET_FB_SCALER_DST     25
++
++/*
++ * The scaler on (VIG0 fetching the presented size): the first time, its version read (a scaler that
++ * is not there, or the first QSEED3 with its other phase registers, is not used: the frames are then
++ * copied, scaled by the CPU) and what the boot loader had in these registers kept. Written while no
++ * flush is pending, so that the next flush (scanOut's, with the address) has the engine take all of
++ * them at one frame's start.
++ */
++bool
++AppleCLCD::scalerOn(void)
++{
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	struct sweet_fb_reg c[SWEET_FB_SCALER_REGS];
++	bool alpha = (r[SWEET_MDP_VIG0_FORMAT / 4] & SWEET_MDP_VIG0_FORMAT_ALPHA) != 0;
++	unsigned n = sweet_fb_scaler_config(c, fLogicalW, fLogicalH, fWidth, fHeight, alpha);
++
++	if (fScalerState < 0) {
++		return false;
++	}
++	if (fScalerState == 0) {
++		uint32_t version = r[(SWEET_MDP_VIG0_QSEED + SWEET_QSEED_VERSION) / 4];
++		if (version == 0 || version == 0xffffffffu || version == 0x1002u) {
++			IOLog("SWEET FB: VIG0's scaler reads version %#x: not used (frames copied, scaled by the CPU)\n", version);
++			fScalerState = -1;
++			return false;
++		}
++		for (unsigned i = 0; i < n; i++) {
++			fScalerSave[i].off = c[i].off;
++			fScalerSave[i].val = r[c[i].off / 4];
++		}
++		fScalerRegs = n;
++		fScalerState = 1;
++		IOLog("SWEET FB: VIG0's scaler version %#x; the boot loader's src %#x out %#x req %#x, scaler op %#x step %#x/%#x "
++		    "dst %#x\n", version, fScalerSave[SWEET_FB_SCALER_SRC].val, fScalerSave[SWEET_FB_SCALER_OUT].val,
++		    fScalerSave[SWEET_FB_SCALER_REQ].val, fScalerSave[n - 1].val, fScalerSave[SWEET_FB_SCALER_STEP].val,
++		    fScalerSave[SWEET_FB_SCALER_STEP + 1].val, fScalerSave[SWEET_FB_SCALER_DST].val);
++	}
++	if (!sweet_fb_flush_taken(r, 40)) {
++		IOLog("SWEET FB: scaler on: VIG0's last flush still not taken after 40 ms\n");
++	}
++	for (unsigned i = 0; i < n; i++) {
++		r[c[i].off / 4] = c[i].val;
++	}
++	fScaled = true;
++	IOLog("SWEET FB: VIG0 scaled: %ux%u -> %ux%u, step %#x/%#x, scaler op %#x\n", fLogicalW, fLogicalH, fWidth,
++	    fHeight, c[SWEET_FB_SCALER_STEP].val, c[SWEET_FB_SCALER_STEP + 1].val, c[n - 1].val);
++	return true;
++}
++
++/* The boot loader's 1:1 setup back (the next flush takes it), for its framebuffer. */
++void
++AppleCLCD::scalerOff(void)
++{
++	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	if (!fScaled) {
++		return;
++	}
++	(void)sweet_fb_flush_taken(r, 40);
++	for (unsigned i = 0; i < fScalerRegs; i++) {
++		r[fScalerSave[i].off / 4] = fScalerSave[i].val;
++	}
++	fScaled = false;
++}
++
+ bool
+-AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride)
++AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled)
+ {
+ 	if (fMdp == 0 && (fMdp = ml_io_map_unmappable(SWEET_MDP_PA, 0x6000u, 0x7u /* VM_WIMG_IO */)) == 0) {
+ 		return false;
+ 	}
++	if (scaled && !fScaled && !scalerOn()) {
++		return false;
++	} else if (!scaled && fScaled) {
++		scalerOff();
++	}
+ 	volatile uint32_t *r = (volatile uint32_t *)fMdp;
+ 	r[SWEET_MDP_VIG0_ADDR / 4] = (uint32_t)pa;
+ 	r[SWEET_MDP_VIG0_STRIDE / 4] = (r[SWEET_MDP_VIG0_STRIDE / 4] & 0xffff0000u) | (stride & 0xffffu);
+@@ -838,7 +1052,8 @@ AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride)
+ 		fShown[0] = s;
+ 	}
+ 	if (!fScanning || fFlips < 4) {
+-		IOLog("SWEET FB: scanning out surface %u at %#llx, stride %u (flip %u)\n", s->id, pa, stride, fFlips);
++		IOLog("SWEET FB: scanning out surface %u at %#llx, stride %u%s (flip %u)\n", s->id, pa, stride,
++		    fScaled ? ", scaled" : "", fFlips);
+ 	}
+ 	fScanning = true;
+ 	fFlips++;
+@@ -966,6 +1181,7 @@ AppleCLCD::scanBack(void)
+ 		return;
+ 	}
+ 	volatile uint32_t *r = (volatile uint32_t *)fMdp;
++	scalerOff();        /* (scaled: the boot framebuffer is the panel's size) */
+ 	r[SWEET_MDP_VIG0_ADDR / 4] = (uint32_t)fPhys;
+ 	r[SWEET_MDP_VIG0_STRIDE / 4] = (r[SWEET_MDP_VIG0_STRIDE / 4] & 0xffff0000u) | (fRowBytes & 0xffffu);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+@@ -974,6 +1190,22 @@ AppleCLCD::scanBack(void)
+ 	IOLog("SWEET FB: back on the boot framebuffer\n");
+ }
+ 
++/* Scaled: the first panel pixel (of PANEL) whose centre is on logical pixel L or after it (of LOGICAL). */
++static int32_t
++sweet_fb_panel_at(int32_t l, uint32_t logical, uint32_t panel)
++{
++	int64_t num = 2 * (int64_t)l * panel - logical;
++	int64_t p = num <= 0 ? 0 : (num + 2 * (int64_t)logical - 1) / (2 * (int64_t)logical);
++	return (int32_t)(p > (int64_t)panel ? panel : p);
++}
++
++/* Scaled: the logical pixel under panel pixel P's centre. */
++static uint32_t
++sweet_fb_logical_at(int32_t p, uint32_t logical, uint32_t panel)
++{
++	return (uint32_t)(((2 * (uint64_t)p + 1) * logical) / (2 * (uint64_t)panel));
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -1042,9 +1274,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
++		/*
++		 * Logical (presented) display coordinates -> panel coordinates: cropped, the centered part
++		 * (sweetfb_scale=0); scaled, the layer stays in logical coordinates (and is scaled below).
++		 */
++		int32_t areaW = (int32_t)(fScale ? fLogicalW : fWidth), areaH = (int32_t)(fScale ? fLogicalH : fHeight);
++		if (!fScale) {
++			dx -= fOffX;
++			dy -= fOffY;
++		}
+ 		if (dx < 0) {
+ 			sx -= dx;
+ 			w += dx;
+@@ -1061,11 +1299,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (h > (int32_t)s->height - sy) {
+ 			h = (int32_t)s->height - sy;
+ 		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
++		if (w > areaW - dx) {
++			w = areaW - dx;
+ 		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
++		if (h > areaH - dy) {
++			h = areaH - dy;
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+@@ -1078,12 +1316,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 			fScanout = PE_parse_boot_argn("sweetfb_scanout", &v, sizeof(v)) && v != 0;
+ 		}
+ 		if (fScanout && src != 0 && bpe == 4 && (mask & 0xfu) == 1u && dx == 0 && dy == 0 &&
+-		    w == (int32_t)fWidth && h == (int32_t)fHeight) {
++		    w == areaW && h == areaH) {
+ 			uint64_t off = (uint64_t)s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+ 			uint64_t need = (uint64_t)(h - 1) * s->bytesPerRow + (uint64_t)w * 4;
+ 			IOByteCount seg = 0;
+ 			addr64_t pa = s->memory->getPhysicalSegment(off, &seg, kIOMemoryMapperNone);
+-			if (pa != 0 && seg >= need && pa + need <= 0x100000000ull && scanOut(s, pa, s->bytesPerRow)) {
++			if (pa != 0 && seg >= need && pa + need <= 0x100000000ull && scanOut(s, pa, s->bytesPerRow, fScale)) {
+ 				if (sweet_tl_on) {
+ 					struct sweet_tl_swap *t = sweet_tl_find(get32(rec, 0x50));
+ 					if (t != NULL) {
+@@ -1103,14 +1341,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		} else if (fScanout) {
+ 			static uint32_t told;
+ 			if (told++ < 6) {
+-				IOLog("SWEET FB: not scanned out: mask %#x src %d bpe %u at %d,%d %dx%d (panel %ux%u)\n", mask, src != 0, bpe,
+-				    dx, dy, w, h, fWidth, fHeight);
++				IOLog("SWEET FB: not scanned out: mask %#x src %d bpe %u at %d,%d %dx%d (%s %dx%d)\n", mask, src != 0, bpe,
++				    dx, dy, w, h, fScale ? "presented" : "panel", areaW, areaH);
+ 			}
+ 		}
+ 		if (fScanning) {
+ 			scanBack();
+ 		}
+-		if (src != 0 && bpe == 4) {
++		if (src != 0 && bpe == 4 && !fScale) {
+ 			RowJob job;
+ 			job.src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+ 			job.stride = s->bytesPerRow;
+@@ -1118,7 +1356,48 @@ AppleCLCD::present(const uint8_t *rec)
+ 			job.rowBytes = fRowBytes;
+ 			job.bytes = (size_t)w * 4;
+ 			job.rows = h;
++			job.runs = NULL;
++			job.nruns = 0;
++			job.rowMap = NULL;
+ 			copyFrame(&job);
++		} else if (src != 0 && bpe == 4 && fRuns != NULL && fRowMap != NULL) {
++			/*
++			 * Scaled by the CPU (a frame the display engine does not fetch itself), nearest rather
++			 * than the scaler's bilinear but onto the same place: panel pixel X shows logical pixel
++			 * ((2X + 1) * 1125) / (2 * 1080), the one under its centre, so a layer covers the same
++			 * part of the panel either way and a touch lands where it is drawn. The panel pixels of
++			 * the layer are those whose logical pixel is in it.
++			 */
++			int32_t x0 = sweet_fb_panel_at(dx, fLogicalW, fWidth), x1 = sweet_fb_panel_at(dx + w, fLogicalW, fWidth);
++			int32_t y0 = sweet_fb_panel_at(dy, fLogicalH, fHeight), y1 = sweet_fb_panel_at(dy + h, fLogicalH, fHeight);
++			uint32_t runs = 0;
++			for (int32_t x = x0; x < x1; x++) {
++				uint32_t from = sweet_fb_logical_at(x, fLogicalW, fWidth) - (uint32_t)dx;
++				if (runs != 0 && fRuns[runs - 1].src + fRuns[runs - 1].n == from) {
++					fRuns[runs - 1].n++;
++				} else {
++					fRuns[runs].dst = (uint32_t)(x - x0);
++					fRuns[runs].src = from;
++					fRuns[runs].n = 1;
++					runs++;
++				}
++			}
++			for (int32_t y = y0; y < y1; y++) {
++				fRowMap[y - y0] = sweet_fb_logical_at(y, fLogicalH, fHeight) - (uint32_t)dy;
++			}
++			if (x1 > x0 && y1 > y0) {
++				RowJob job;
++				job.src = src + s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
++				job.stride = s->bytesPerRow;
++				job.dst = fPixels + (uint64_t)y0 * fRowBytes + (uint64_t)x0 * 4;
++				job.rowBytes = fRowBytes;
++				job.bytes = (size_t)(x1 - x0) * 4;
++				job.rows = y1 - y0;
++				job.runs = fRuns;
++				job.nruns = runs;
++				job.rowMap = fRowMap;
++				copyFrame(&job);
++			}
+ 		}
+ 		s->release();
+ 	}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..e22ff28 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -356,6 +356,9 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/* what sweet_touch.c reports: the panel's 1080 columns, its 2340 rows stretched to 2400 */
++#define SWEET_TOUCH_W 1080
++#define SWEET_TOUCH_H 2400
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -368,6 +371,7 @@ protected:
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	bool fScaled;   /* the whole panel is the whole presented display (SweetFramebuffer.cpp fScale) */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -432,19 +436,27 @@ SweetHIDTouch::start(IOService *provider)
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
+-	int native = 0;
++	int native = 0, scale = 1;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
+ 	fLogicalW = native ? 1080 : 1125;
+ 	fLogicalH = native ? 2400 : 2436;
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - 2400) / 2;
++	/*
++	 * As SweetFramebuffer.cpp shows the display: scaled onto the whole panel (boot-args as there,
++	 * sweetfb_scale default 1), the panel's edges are the display's; cropped (sweetfb_scale=0), the
++	 * panel is the centered part of it.
++	 */
++	fScaled = !native && scale != 0;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+-	IOLog("SWEET HID: touch registered\n");
++	IOLog("SWEET HID: touch registered (%s %dx%d)\n", fScaled ? "the whole panel onto" : "the panel centered on",
++	    fLogicalW, fLogicalH);
+ 	return true;
+ }
+ 
+@@ -463,9 +475,19 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/*
++	 * Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp), 0..1 across it. Scaled,
++	 * a pixel's centre: panel x 0 and 1079 are 0.0005 and 0.9995 of the display, its pixels 0 and 1124
++	 * as the framebuffer shows them there.
++	 */
++	IOFixed nx, ny;
++	if (fScaled) {
++		nx = (IOFixed)((((int64_t)x * 2 + 1) << 16) / (2 * SWEET_TOUCH_W));
++		ny = (IOFixed)((((int64_t)y * 2 + 1) << 16) / (2 * SWEET_TOUCH_H));
++	} else {
++		nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++		ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	}
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);

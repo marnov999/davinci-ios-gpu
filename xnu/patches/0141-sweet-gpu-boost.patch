@@ -1,0 +1,110 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index be6ebc1..7e9defa 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2968,6 +2968,7 @@ static uint32_t g_fence;            /* the last submission's number (redwood gpu
+ #define GPU_TIMES          64u
+ #define A6XX_CP_ALWAYS_ON_COUNTER 0x400u   /* (RBBM_PERFCTR_CP_0; the name kept for the ring code) */
+ static uint32_t g_timed;            /* the last fence whose times are added up */
++static uint64_t g_gpu_busy_ticks;   /* ... all of them, in GPU cycles (the clock governor's: dvfs_thread) */
+ static uint64_t g_gpu_ticks;
+ static uint32_t g_gpu_timed;
+ static uint32_t g_reports;          /* hang reports printed (the first few) */
+@@ -3191,6 +3192,7 @@ gpu_times(void)
+ 		uint32_t slot = ++g_timed % GPU_TIMES;
+ 		if (g_timed != 0 && times[2 * slot + 1] > times[2 * slot]) {
+ 			g_gpu_ticks += times[2 * slot + 1] - times[2 * slot];
++			g_gpu_busy_ticks += times[2 * slot + 1] - times[2 * slot];
+ 			g_gpu_timed++;
+ 		}
+ 	}
+@@ -5685,9 +5687,10 @@ struct sweet_clocks {
+ 	uint32_t row[3];                        /* L3, little, big */
+ 	uint32_t gpu;
+ 	int autoidle;
++	int boost;                              /* boost=0|1 (default 1): the GPU faster while it is the one late */
+ };
+-static struct sweet_clocks g_clocks = { { 5, 7, 9 }, SWEET_GPU_LEVEL_BOOT, 0 };
+-static const struct sweet_clocks g_clocks_idle = { { 3, 2, 1 }, 99, 1 };
++static struct sweet_clocks g_clocks = { { 5, 7, 9 }, SWEET_GPU_LEVEL_BOOT, 0, 1 };
++static const struct sweet_clocks g_clocks_idle = { { 3, 2, 1 }, 99, 1, 0 };
+ 
+ void
+ sweet_dvfs_kick(void)
+@@ -5749,7 +5752,7 @@ clocks_apply(const struct sweet_clocks *k, const char *why)
+ static bool
+ clocks_file(struct sweet_clocks *k)
+ {
+-	static const char *keys[5] = { "l3=", "little=", "big=", "gpu=", "auto=" };
++	static const char *keys[6] = { "l3=", "little=", "big=", "gpu=", "auto=", "boost=" };
+ 	char text[128];
+ 	vnode_t vp = NULLVP;
+ 	vfs_context_t ctx;
+@@ -5765,7 +5768,7 @@ clocks_file(struct sweet_clocks *k)
+ 	(void)vn_rdwr(UIO_READ, vp, (caddr_t)text, sizeof(text) - 1, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
+ 	    vfs_context_proc(ctx));
+ 	vnode_put(vp);
+-	for (unsigned i = 0; i < 5u; i++) {
++	for (unsigned i = 0; i < 6u; i++) {
+ 		const char *at = strnstr(text, keys[i], sizeof(text));
+ 		uint32_t v = 0;
+ 		bool any = false;
+@@ -5783,8 +5786,10 @@ clocks_file(struct sweet_clocks *k)
+ 			k->row[i] = v;
+ 		} else if (i == 3u) {
+ 			k->gpu = v;
+-		} else {
++		} else if (i == 4u) {
+ 			k->autoidle = v != 0;
++		} else {
++			k->boost = v != 0;
+ 		}
+ 	}
+ 	return true;
+@@ -5814,6 +5819,46 @@ dvfs_thread(__unused void *arg, __unused wait_result_t wr)
+ 		g_dvfs_idle = idle;
+ 		want = idle ? g_clocks_idle : g_clocks;
+ 		want.autoidle = g_clocks.autoidle;
++		{
++			/*
++			 * The GPU faster while it is what holds the frames up: the widget panel takes ~28 ms of
++			 * GPU work a frame at 355 MHz (19 at 610), so its frames queue behind it and come in
++			 * bursts with ~80 ms holes. Busy more than 85% of the last 100 ms: the fastest level;
++			 * under 50% for half a second: a level back towards the one asked (gpu=).
++			 */
++			static uint64_t was_ticks, was_at;
++			static uint32_t boosted = 99u, calm;
++			uint64_t now = mach_absolute_time(), ns = 0, ticks;
++			uint32_t mhz = g_gpu_nlevels ? g_gpu_mhz[g_gpu_level < g_gpu_nlevels ? g_gpu_level : 0] : 355u;
++			if (g_kgsl_ready) {
++				gpu_lock();
++				gpu_times();
++				ticks = g_gpu_busy_ticks;
++				gpu_unlock();
++			} else {
++				ticks = was_ticks;
++			}
++			absolutetime_to_nanoseconds(now - was_at, &ns);
++			if (was_at != 0 && ns != 0 && mhz != 0) {
++				uint64_t busy_permille = (ticks - was_ticks) / mhz * 1000000ull / ns;      /* (us of GPU work / us) */
++				if (boosted > want.gpu) {
++					boosted = want.gpu;
++				}
++				if (!want.boost || idle) {
++					boosted = want.gpu;
++					calm = 0;
++				} else if (busy_permille > 850u) {
++					boosted = 0;
++					calm = 0;
++				} else if (busy_permille < 500u && boosted < want.gpu && ++calm >= 5u) {
++					boosted++;
++					calm = 0;
++				}
++				want.gpu = boosted;
++			}
++			was_ticks = ticks;
++			was_at = now;
++		}
+ 		if (first || memcmp(&want, &applied, sizeof(want)) != 0) {
+ 			clocks_apply(&want, idle ? "idle" : "as asked");
+ 			applied = want;

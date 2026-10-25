@@ -1,0 +1,13 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index a1cba58..e374177 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1948,7 +1948,7 @@ sleh_irq(arm_saved_state_t *state)
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+ 
+-	if (__improbable(sweet_prof_target != TASK_NULL)) {
++	if (__improbable(sweet_prof_target != TASK_NULL || sweet_prof_bigcores)) {
+ 		sweet_prof_irq(state);
+ 	}
+ 

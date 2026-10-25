@@ -20,3 +20,8 @@ void con_str(const char *label, const char *s);
 void con_hex(const char *label, uint64_t v);
 /* label, then "a=xxxxxxxx b=xxxxxxxx" style pairs of 32-bit values */
 void con_hex2(const char *label, const char *a, uint32_t va, const char *b, uint32_t vb);
+/* s on text row r (the row cleared first), in fg */
+void con_at(int r, const char *s, uint32_t fg);
+/* A filled rectangle, and text at pixel x, y with each font dot scale x scale pixels. */
+void con_rect(int x, int y, int w, int h, uint32_t c);
+void con_text(int x, int y, const char *s, int scale, uint32_t fg, uint32_t bg);

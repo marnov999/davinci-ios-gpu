@@ -140,8 +140,11 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex("JUMP", entry_pa);
 	con_str("XNU", "jumping (fbcon clears screen)");
 
-	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too. */
-	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");
+	/* Everything was written with the MMU and caches off; drop any stale I-cache lines too, and enter
+	 * XNU with the I-cache off as iBoot does: its early start rebases its own code with the MMU off
+	 * and then runs it, which a still-enabled I-cache can serve stale (shim.c turns it on). */
+	__asm__ volatile("mrs x9, sctlr_el1; bic x9, x9, #0x1000; msr sctlr_el1, x9; isb\n"
+			 "dsb sy; ic iallu; dsb sy; isb" ::: "x9", "memory");
 	((xnu_entry_t)entry_pa)(ba_pa);
 	return "xnu returned";
 }

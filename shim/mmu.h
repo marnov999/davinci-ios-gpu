@@ -11,3 +11,9 @@ struct mmu_info {
 
 int mmu_enable(struct mmu_info *info);
 uint64_t mmu_probe(uintptr_t va);
+
+/* Copies done with the caches on, left clean in memory, the MMU off again. 0, or -1 (nothing done). */
+struct copy_job {
+	uint64_t dst, src, len;
+};
+int mmu_fast_copy(const struct copy_job *jobs, int n);

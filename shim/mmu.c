@@ -130,3 +130,116 @@ uint64_t mmu_probe(uintptr_t va)
 	__asm__ volatile("at s1e1r, %0; isb" : : "r"(va) : "memory");
 	return rsr("par_el1");
 }
+
+/*
+ * A big copy with the caches on (the Linux hand-off moves ~46 MB; with the MMU off every access is
+ * Device-nGnRnE and that took 3.6 s). Only the shim's image and the copy's own ranges are mapped
+ * cacheable, page by page -- they are plain RAM -- the rest stays Device as above, so nothing
+ * speculates into a carve-out. Afterwards the destinations are cleaned to the point of coherency
+ * (arm64 booting.rst: the kernel is entered with the MMU off and the image clean to PoC), the
+ * shim's own lines (stack included) cleaned and invalidated, and the MMU and caches switched off
+ * again in one sequence with no memory access in between.
+ */
+#define FC_TABLES	12
+static uint64_t fc_pool[(FC_TABLES + 1) * NENT] __attribute__((aligned(PG_SIZE)));
+
+static int fc_cacheable(uint64_t pa, const struct copy_job *j, int n, uintptr_t img_lo, uintptr_t img_hi)
+{
+	if (pa >= img_lo && pa < img_hi)
+		return 1;
+	for (int k = 0; k < n; k++)
+		if ((pa + PG_SIZE > j[k].src && pa < j[k].src + j[k].len) ||
+		    (pa + PG_SIZE > j[k].dst && pa < j[k].dst + j[k].len))
+			return 1;
+	return 0;
+}
+
+int mmu_fast_copy(const struct copy_job *jobs, int n)
+{
+	uintptr_t img_lo = (uintptr_t)_head & ~(PG_SIZE - 1);
+	uintptr_t img_hi = ((uintptr_t)_end + PG_SIZE - 1) & ~(PG_SIZE - 1);
+	uintptr_t pool = (uintptr_t)fc_pool;
+	uint64_t *l2 = (uint64_t *)pool;
+	int n_l3 = 0;
+
+	zero_table(l2);
+	for (uint64_t i = 0; i < (8UL << 30) >> BLK_SHIFT; i++)
+		l2[i] = (i << BLK_SHIFT) | DEV_FLAGS | D_BLOCK;
+	/* only the 32 MB blocks a range touches get an L3 table */
+	uint64_t want[2 * 8 + 1][2];
+	int nw = 0;
+	want[nw][0] = img_lo, want[nw++][1] = img_hi;
+	for (int k = 0; k < n && nw < 2 * 8 + 1; k++) {
+		want[nw][0] = jobs[k].src, want[nw++][1] = jobs[k].src + jobs[k].len;
+		want[nw][0] = jobs[k].dst, want[nw++][1] = jobs[k].dst + jobs[k].len;
+	}
+	for (uint64_t blk = 0; blk < (8UL << 30) >> BLK_SHIFT; blk++) {
+		uint64_t base = blk << BLK_SHIFT;
+		int touched = 0;
+		for (int w = 0; w < nw && !touched; w++)
+			touched = want[w][0] < base + BLK_SIZE && want[w][1] > base;
+		if (!touched)
+			continue;
+		int any = 0;
+		for (uint64_t pa = base; pa < base + BLK_SIZE && !any; pa += PG_SIZE)
+			any = fc_cacheable(pa, jobs, n, img_lo, img_hi);
+		if (!any)
+			continue;
+		if (n_l3 == FC_TABLES)
+			return -1;
+		uint64_t *l3 = (uint64_t *)(pool + (1 + n_l3++) * PG_SIZE);
+		for (int i = 0; i < NENT; i++) {
+			uint64_t pa = base + ((uint64_t)i << PG_SHIFT);
+			l3[i] = pa | (fc_cacheable(pa, jobs, n, img_lo, img_hi) ? WB_FLAGS : DEV_FLAGS) | D_PAGE;
+		}
+		l2[blk] = (uintptr_t)l3 | D_TABLE;
+	}
+
+	/* nothing of ours may sit stale in the cache: we wrote memory with the MMU off */
+	dcache_inval_range(img_lo, img_hi);
+	for (int k = 0; k < n; k++) {
+		dcache_inval_range(jobs[k].src, jobs[k].src + jobs[k].len);
+		dcache_inval_range(jobs[k].dst, jobs[k].dst + jobs[k].len);
+	}
+	__asm__ volatile("ic iallu; dsb sy; isb" ::: "memory");
+	wsr("mair_el1", MAIR_VAL);
+	wsr("tcr_el1", TCR_VAL);
+	wsr("ttbr0_el1", pool);
+	__asm__ volatile("isb; tlbi vmalle1; dsb nsh; isb" ::: "memory");
+	uint64_t sctlr = rsr("sctlr_el1");
+	wsr("sctlr_el1", (sctlr & ~(SCTLR_A | SCTLR_WXN)) | SCTLR_M | SCTLR_C | SCTLR_I);
+	__asm__ volatile("isb" ::: "memory");
+
+	for (int k = 0; k < n; k++) {
+		volatile uint64_t *d = (volatile uint64_t *)jobs[k].dst;
+		const volatile uint64_t *s = (const volatile uint64_t *)jobs[k].src;
+		for (uint64_t i = 0; i < (jobs[k].len + 7) / 8; i++)
+			d[i] = s[i];
+	}
+
+	uint64_t line = 4UL << ((rsr("ctr_el0") >> 16) & 0xf);
+	for (int k = 0; k < n; k++)
+		for (uintptr_t a = jobs[k].dst & ~(line - 1); a < jobs[k].dst + jobs[k].len; a += line)
+			__asm__ volatile("dc cvac, %0" : : "r"(a) : "memory");
+	/* the shim's own lines (stack, tables) back to memory, then MMU and caches off at once */
+	__asm__ volatile(
+		"	dsb	sy\n"
+		"1:	dc	civac, %[a]\n"
+		"	add	%[a], %[a], %[l]\n"
+		"	cmp	%[a], %[e]\n"
+		"	b.lo	1b\n"
+		"	dsb	sy\n"
+		"	mrs	x9, sctlr_el1\n"
+		"	bic	x9, x9, #1\n"		/* M */
+		"	bic	x9, x9, #4\n"		/* C */
+		"	bic	x9, x9, #0x1000\n"	/* I */
+		"	msr	sctlr_el1, x9\n"
+		"	isb\n"
+		"	ic	iallu\n"
+		"	dsb	sy\n"
+		"	isb\n"
+		: [a] "+r"(img_lo)
+		: [l] "r"(line), [e] "r"(img_hi)
+		: "x9", "memory");
+	return 0;
+}

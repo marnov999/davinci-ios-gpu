@@ -11,6 +11,11 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "charge.h"
+#include "diag.h"
+#include "oops.h"
+#include "menu.h"
+#include "spmi.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -94,12 +99,7 @@ static uint64_t now(void)
 	return rsr("cntpct_el0");
 }
 
-static void delay_ms(unsigned ms)
-{
-	uint64_t end = now() + rsr("cntfrq_el0") / 1000 * ms;
-	while (now() < end)
-		;
-}
+/* delay_ms: spmi.c */
 
 static void __attribute__((noreturn)) reset(unsigned after_s)
 {
@@ -370,12 +370,31 @@ static uint32_t to_us(uint64_t ticks)
 	return ticks * 10 / 192;	/* 19.2 MHz */
 }
 
+uint64_t shim_t0;			/* the timer at entry (since the SoC came on): linux.c reports it */
+
 void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+	shim_t0 = now();
+	/* instruction fetches cacheable from here on (allowed with the MMU off): everything runs faster */
+	__asm__ volatile("ic iallu; dsb sy; isb" ::: "memory");
+	wsr("sctlr_el1", rsr("sctlr_el1") | (1UL << 12));
+	isb();
+
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
+#ifdef SWEET_OOPS
+	oops_report();			/* measuring build: what MIUI's last boot spent its time on */
+#endif
+	diag_mode(dtb);
+	charge_mode(dtb);		/* a charger woke the phone: MIUI's own charger mode */
+	switch (boot_menu(0)) {		/* (Boot MIUI waits for its own data partition) */
+	case BOOT_OFF:
+		spmi_power_off();
+	default:
+		break;
+	}
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();

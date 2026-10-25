@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d83df69..0e07bae 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -309,6 +309,38 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * The graphics accelerator Metal looks for (HackiOS MiniIOMobileFramebuffer.cpp IOAcceleratorES): its
++ * MetalPluginName is the bundle Metal opens, /System/Library/Extensions/<name>.bundle, and its
++ * MetalPluginClassName the device class in it (RedwoodMetal, from HackiOS's redwoodmetal.m). Only
++ * with boot-arg sweetmetal=1: a process handed a half-made device aborts rather than falls back, so
++ * the bundle itself says which processes get one (/usr/local/gltest/metal_allow) -- the window
++ * server stays on OpenGL ES.
++ */
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++static void
++sweet_publish_accelerator(IOService *provider)
++{
++	uint32_t metal = 0;
++	if (!PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) || metal == 0) {
++		return;
++	}
++	IOAcceleratorES *accelerator = OSTypeAlloc(IOAcceleratorES);
++	if (accelerator != NULL && accelerator->init() && accelerator->attach(provider)) {
++		accelerator->setName("sgx");
++		accelerator->setProperty("MetalPluginName", "RedwoodMetal");
++		accelerator->setProperty("MetalPluginClassName", "RedwoodMetalDevice");
++		accelerator->registerService();
++		IOLog("SWEET FB: IOAcceleratorES published (sweetmetal=%u): MetalPluginName RedwoodMetal\n", metal);
++	}
++	OSSafeReleaseNULL(accelerator);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -400,6 +432,7 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	sweet_publish_accelerator(provider);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;

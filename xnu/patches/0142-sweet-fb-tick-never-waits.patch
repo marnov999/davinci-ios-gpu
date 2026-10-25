@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a55193f..d83df69 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -523,7 +523,23 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	IOLockUnlock(fb->fLock);
+ 	if (flush) {
+-		fb->presentPending();
++		/*
++		 * On the present thread, not here: a present waits for the GPU to be done with the frame
++		 * (up to SWEET_SWAP_GPU_MS), and while this waited no tick came -- with the GPU behind
++		 * (the widget panel, ~28 ms of GPU a frame) the ticks stopped for 70-110 ms at a time,
++		 * and CoreAnimation, which draws on them, with them. Boot-arg sweetfb_tickpresent=1: here.
++		 */
++		static int here = -1;
++		if (here < 0) {
++			int v = 0;
++			(void)PE_parse_boot_argn("sweetfb_tickpresent", &v, sizeof(v));
++			here = v != 0;
++		}
++		if (!here && fb->fPresentCall != NULL) {
++			thread_call_enter(fb->fPresentCall);
++		} else {
++			fb->presentPending();
++		}
+ 	}
+ 	{
+ 		static int want = -1;

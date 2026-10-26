@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index d1f00bc..325a598 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -698,6 +698,7 @@ pgpio_restore(unsigned gpio)
+ #define LPG_PREDIV_FAST         0x01            /* prediv 1, exponent 1: 53.33 us */
+ 
+ static bool popup_enabled, popup_test, popup_is_up, popup_pins_set;
++static uint32_t popup_stop = 99;        /* sweetpopup_stop=N: stop after step N (bisecting a hang) */
+ 
+ /* One byte of one of the two peripherals the motor needs (PM6150L GPIO 10, LPG 2), by our own channel. */
+ static bool
+@@ -788,6 +789,7 @@ popup_pins(void)
+ 	/* PM6150L GPIO 10 (pwm_out_gpio10_default): func1 = the LPG, VIN1, no pull, push-pull, strength 3 */
+ 	static const uint8_t regs[6] = { 0x41, 0x42, 0x40, 0x44, 0x45, 0x46 };
+ 	static const uint8_t vals[6] = { 0x01, 0x05, 0x01, 0x02, 0x03, 0x80 };
++	if (popup_stop < 2) { say("pop-up: stopping after step 1\n"); return false; }
+ 	say("pop-up step 2: LPG2 subtype %#x; PM6150L GPIO 10 to func1\n", subtype);
+ 	for (int i = 0; i < 6; i++) {
+ 		say("pop-up step 2.%d: GPIO10 reg %#x <- %#x\n", i, regs[i], vals[i]);
+@@ -797,6 +799,7 @@ popup_pins(void)
+ 	}
+ 	/* LPG 2: 9-bit PWM of the 19.2 MHz clock (the size bit moves with the subtype), 50 % duty, glitch removal */
+ 	uint8_t size_clk = (uint8_t)(((subtype == 0x0b) ? (1u << 2) : (1u << 4)) | 3u);
++	if (popup_stop < 3) { say("pop-up: stopping after step 2\n"); return false; }
+ 	say("pop-up step 3: LPG2 configuration (size/clock %#x)\n", size_clk);
+ 	if (!popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), 0) ||
+ 	    !popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_TYPE_CONFIG), 0x20) ||
+@@ -806,8 +809,10 @@ popup_pins(void)
+ 	    !popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_VALUE_MSB), 0x01)) {
+ 		return false;
+ 	}
++	if (popup_stop < 4) { say("pop-up: stopping after step 3\n"); return false; }
+ 	say("pop-up step 4: TLMM 43 (fault) as input\n");
+ 	wr(GPIO_CFG(POPUP_FAULT), CFG_PULL_UP | CFG_DRIVE_MA(2));      /* input */
++	if (popup_stop < 5) { say("pop-up: stopping after step 4\n"); return false; }
+ 	say("pop-up step 5: TLMM 88 91 66 55 90 as outputs\n");
+ 	popup_out(POPUP_SLEEP, false);
+ 	popup_out(POPUP_MODE0, false);                                  /* step mode 2 */
+@@ -828,6 +833,7 @@ popup_move(bool up)
+ 	if (!popup_pins()) {
+ 		return false;
+ 	}
++	if (popup_stop < 6) { say("pop-up: stopping after step 5 (configured, no motion)\n"); return false; }
+ 	say("pop-up step 6: direction %s, driver awake\n", up ? "up" : "down");
+ 	popup_out(POPUP_DIR, !up);
+ 	popup_out(POPUP_SLEEP, true);
+@@ -3371,6 +3377,7 @@ sweet_camera_init(void)
+ 	v = 0;
+ 	popup_enabled = level >= 2 && PE_parse_boot_argn("sweetpopup", &v, sizeof(v)) && v != 0;
+ 	popup_test = popup_enabled && v == 2;
++	(void)PE_parse_boot_argn("sweetpopup_stop", &popup_stop, sizeof(popup_stop));
+ 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

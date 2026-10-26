@@ -63,7 +63,6 @@
 +#include <kern/sched_prim.h>
 +#include <kern/locks.h>
 +#include <sys/vnode.h>
-+#include <sys/uio.h>                    /* UIO_READ / UIO_SYSSPACE for vn_rdwr (WiFi step 4) */
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <vm/pmap.h>
@@ -5404,6 +5403,7 @@
 +	return true;
 +}
 +
++#include <sys/uio.h>                    /* UIO_READ / UIO_SYSSPACE for vn_rdwr; here, not among the includes at the top, so later patches' context there still matches */
 +/*
 + * Wi-Fi, step 4 (boot-arg sweetwifi=3): read the modem image from the iOS filesystem and check it
 + * against its own header (HackiOS redwood_wifi.c step_firmware, davinci). Reads only -- the files,

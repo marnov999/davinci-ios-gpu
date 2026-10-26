@@ -1,0 +1,40 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index ea2ac82..b4e3069 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -659,6 +659,15 @@ rail(unsigned r, bool on)
+ 	if (!use_rails || rail_on[r] == on) {
+ 		return true;
+ 	}
++	/*
++	 * Never an "off" vote: BOB and S8C feed more than the camera, and the boot loader's votes for
++	 * them are on the same (apps) DRV as ours, so an off from here could take a supply away from
++	 * something else. Powered down, the camera leaves its rails as they were.
++	 */
++	if (!on) {
++		rail_on[r] = false;
++		return true;
++	}
+ 	if (sweet_rpmh_vreg_vote(rail_res[r].res, rail_res[r].mv, on) != 0) {
+ 		say("RPMh did not take %s %s\n", rail_res[r].res, on ? "on" : "off");
+ 		if (on) {
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f190eb3..a76cc92 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -5708,6 +5708,7 @@ sweet_reboot_fastboot(uint32_t mode)
+ #define PON_TYPE_HARD_RESET     0x07u
+ enum { SWEET_PE_HALT = 0, SWEET_PE_RESTART = 1, SWEET_PE_UPS_HALT = 3 };   /* IOPlatformExpert.h kPE* */
+ extern int (*PE_halt_restart)(unsigned int type);
++extern void sweet_camera_quiesce(void);        /* bsd/dev/sweet_camera.c: the sensor powered down first */
+ 
+ static int
+ sweet_halt_restart(unsigned int type)
+@@ -5721,6 +5722,7 @@ sweet_halt_restart(unsigned int type)
+ 	if (!off && type != SWEET_PE_RESTART) {
+ 		return -1;
+ 	}
++	sweet_camera_quiesce();
+ 	core = ml_io_map(SPMI_CORE_PA, 0x2000u);
+ 	cfg = ml_io_map(SPMI_CFG_PA, 0x1000u);
+ 	obs = ml_io_map(SPMI_OBS_PA, 0x10000u);

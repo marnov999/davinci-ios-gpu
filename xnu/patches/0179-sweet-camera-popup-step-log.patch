@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 362bcde..d1f00bc 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -756,6 +756,9 @@ popup_spmi_put(unsigned sid, uint16_t address, uint8_t value)
+ static void
+ popup_out(unsigned n, bool high)
+ {
++	if (!popup_pins_set) {
++		say("pop-up: TLMM %u -> %s\n", n, high ? "high" : "low");
++	}
+ 	wr(GPIO_IO(n), high ? 2 : 0);
+ 	wr(GPIO_CFG(n), CFG_OUTPUT | CFG_PULL_UP | CFG_DRIVE_MA(2));   /* motor_gpio_default: pull-up, 2 mA */
+ }
+@@ -777,6 +780,7 @@ popup_pins(void)
+ 	if (popup_pins_set) {
+ 		return true;
+ 	}
++	say("pop-up step 1: read LPG2's subtype (SID 5 %#x)\n", LPG(LPG_SUBTYPE));
+ 	if (!spmi_read(SID_PM6150L_B, LPG(LPG_SUBTYPE), &subtype)) {
+ 		give_up("the pop-up's LPG cannot be read");
+ 		return false;
+@@ -784,13 +788,16 @@ popup_pins(void)
+ 	/* PM6150L GPIO 10 (pwm_out_gpio10_default): func1 = the LPG, VIN1, no pull, push-pull, strength 3 */
+ 	static const uint8_t regs[6] = { 0x41, 0x42, 0x40, 0x44, 0x45, 0x46 };
+ 	static const uint8_t vals[6] = { 0x01, 0x05, 0x01, 0x02, 0x03, 0x80 };
++	say("pop-up step 2: LPG2 subtype %#x; PM6150L GPIO 10 to func1\n", subtype);
+ 	for (int i = 0; i < 6; i++) {
++		say("pop-up step 2.%d: GPIO10 reg %#x <- %#x\n", i, regs[i], vals[i]);
+ 		if (!popup_spmi_put(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | regs[i]), vals[i])) {
+ 			return false;
+ 		}
+ 	}
+ 	/* LPG 2: 9-bit PWM of the 19.2 MHz clock (the size bit moves with the subtype), 50 % duty, glitch removal */
+ 	uint8_t size_clk = (uint8_t)(((subtype == 0x0b) ? (1u << 2) : (1u << 4)) | 3u);
++	say("pop-up step 3: LPG2 configuration (size/clock %#x)\n", size_clk);
+ 	if (!popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), 0) ||
+ 	    !popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_TYPE_CONFIG), 0x20) ||
+ 	    !popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SIZE_CLK), size_clk) ||
+@@ -799,7 +806,9 @@ popup_pins(void)
+ 	    !popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_VALUE_MSB), 0x01)) {
+ 		return false;
+ 	}
++	say("pop-up step 4: TLMM 43 (fault) as input\n");
+ 	wr(GPIO_CFG(POPUP_FAULT), CFG_PULL_UP | CFG_DRIVE_MA(2));      /* input */
++	say("pop-up step 5: TLMM 88 91 66 55 90 as outputs\n");
+ 	popup_out(POPUP_SLEEP, false);
+ 	popup_out(POPUP_MODE0, false);                                  /* step mode 2 */
+ 	popup_out(POPUP_MODE1, true);
+@@ -819,20 +828,25 @@ popup_move(bool up)
+ 	if (!popup_pins()) {
+ 		return false;
+ 	}
++	say("pop-up step 6: direction %s, driver awake\n", up ? "up" : "down");
+ 	popup_out(POPUP_DIR, !up);
+ 	popup_out(POPUP_SLEEP, true);
++	say("pop-up step 7: LPG2 on (slow)\n");
+ 	bool ok = popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_PREDIV_CLK), LPG_PREDIV_SLOW) &&
+ 	    popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SYNC), 1) &&
+ 	    popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), 0x84);        /* out on, source PWM value */
+ 	if (ok) {
+ 		popup_wait_ms(51);
++		say("pop-up step 8: fast\n");
+ 		ok = popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_PREDIV_CLK), LPG_PREDIV_FAST) &&
+ 		    popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SYNC), 1);
+ 		popup_wait_ms(up ? 737 : 742);
++		say("pop-up step 9: slow\n");
+ 		ok = popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_PREDIV_CLK), LPG_PREDIV_SLOW) &&
+ 		    popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SYNC), 1) && ok;
+ 		popup_wait_ms(51);
+ 	}
++	say("pop-up step 10: stop\n");
+ 	bool fault = (rd(GPIO_IO(POPUP_FAULT)) & 1) == 0;
+ 	/* always stop, whatever failed on the way */
+ 	(void)popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), 0);

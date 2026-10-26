@@ -1,0 +1,89 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index fdd0639..cb7ca58 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -26,14 +26,14 @@ extern "C" void clock_set_calendar_microtime(unsigned long secs, uint32_t micros
+  * and the wall time as an offset in its own data. Set only when it reads as a date after 2020;
+  * boot-arg sweettime_offset=N (seconds) is added first.
+  */
+-static void
++static int64_t
+ sweet_rtc_set_clock(void)
+ {
+ 	uint8_t b[4], again = 0, ctrl = 0;
+ 	bool ok = false;
+ 	if (sweet_spmi_init() != 0) {
+ 		IOLog("SWEET RTC: no SPMI\n");
+-		return;
++		return -1;
+ 	}
+ 	for (int tries = 0; tries < 3 && !ok; tries++) {
+ 		ok = true;
+@@ -45,7 +45,7 @@ sweet_rtc_set_clock(void)
+ 	(void)sweet_spmi_read(0, 0x6046, &ctrl);
+ 	if (!ok) {
+ 		IOLog("SWEET RTC: unreadable (ctrl %#x)\n", ctrl);
+-		return;
++		return -2;
+ 	}
+ 	uint32_t raw = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+ 	int64_t offset = 0;
+@@ -57,6 +57,7 @@ sweet_rtc_set_clock(void)
+ 	if (plausible) {
+ 		clock_set_calendar_microtime((unsigned long)secs, 0);
+ 	}
++	return raw;
+ }
+ 
+ class SweetBattery : public IOPMPowerSource {
+@@ -310,7 +311,9 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	sweet_rtc_set_clock();
++	/* the raw counter also as a property (SweetRTCCounter; -1 no SPMI, -2 unreadable): the log
++	 * line comes before the USB console does */
++	setProperty("SweetRTCCounter", (unsigned long long)sweet_rtc_set_clock(), 64);
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index bb89899..4f59054 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -673,9 +673,12 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	 * shaped (or named CAMetalLayer...), kept otherwise; each decision logged, the first 24.
+ 	 */
+ 	OSString *name = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
+-	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && props->getObject("IOSurfacePlaneInfo") == NULL) {
+-		bool drawable = name != NULL ? strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 :
+-		    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4);
++	OSArray *plane_info = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	/* one-plane plane info counts as single-plane: CAMetalLayer passes its drawable's row there too */
++	bool one_plane = plane_info == NULL || plane_info->getCount() == 1;
++	bool drawable = name != NULL ? strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 :
++	    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4);
++	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && one_plane) {
+ 		static unsigned told;
+ 		if (told < 24 || drawable) {
+ 			told++;
+@@ -714,9 +717,19 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
+ 			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
++			bool rounded = false;
++			if (drawable && planes->getCount() == 1 && (p->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0) {
++				/* the drawable's own row, as the surface's above (0157) */
++				p->bytesPerRow = (uint32_t)((p->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &
++				    ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++				rounded = true;
++			}
+ 			p->offset = sweet_dict_u32(pd, "IOSurfacePlaneOffset", (uint32_t)next);
+ 			p->size = sweet_dict_u32(pd, "IOSurfacePlaneSize",
+ 			    p->bytesPerRow * sweet_div_up(p->height, p->elementHeight));
++			if (rounded && p->size < p->bytesPerRow * sweet_div_up(p->height, p->elementHeight)) {
++				p->size = p->bytesPerRow * sweet_div_up(p->height, p->elementHeight);
++			}
+ 			next = round_page((uint64_t)p->offset + p->size);
+ 			if ((uint64_t)p->offset + p->size > end) {
+ 				end = (uint64_t)p->offset + p->size;

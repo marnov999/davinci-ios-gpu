@@ -1,0 +1,38 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 56d78c3..9790f0a 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -531,4 +531,13 @@ sysctl_sweet_rtc SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_rtc, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_rtc, "Q", "PMIC RTC counter, seconds (free-running)");
+ 
++/*
++ * kern.sweet_scanout_id: the IOSurface the display engine fetches now (AppleCLCD::scanOut sets it at
++ * every flip). Screenshots read that surface: with VIG0 scaling the presented one itself, a fixed id
++ * went stale whenever backboardd's buffers changed (and a frozen phone looked like a live one).
++ */
++uint32_t sweet_fb_scanout_id;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_scanout_id, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_scanout_id, 0,
++    "IOSurface id scanned out now");
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 004d109..cfc6827 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,6 +58,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <libkern/c++/OSSerialize.h>
+ extern "C" int sweet_panel_power(int on);
+ extern "C" void sweet_panel_new_frame(void);   /* bsd/dev/sweet_gpu.c: light the panel after a wake */
++extern "C" uint32_t sweet_fb_scanout_id;       /* bsd/kern/sweet_amfi.c kern.sweet_scanout_id: the surface on the panel */
+ extern "C" void sweet_dpu_survey(void);
+ extern "C" void sweet_prof_start(void);
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+@@ -1047,6 +1048,7 @@ AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled)
+ 	r[SWEET_MDP_CTL0_FLUSH / 4] = SWEET_MDP_FLUSH_VIG0;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_panel_new_frame();
++	sweet_fb_scanout_id = s->id;
+ 	if (s != fShown[0]) {
+ 		OSSafeReleaseNULL(fShown[1]);        /* two flips old: no longer fetched */
+ 		fShown[1] = fShown[0];

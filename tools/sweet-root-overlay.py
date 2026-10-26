@@ -267,7 +267,7 @@ FLAGS = {
     # metalshim.m: in backboardd, dlopen libredwood-gl (CA -> freedreno GLES). ESSENTIAL.
     'ca_gles': b'1',
     # RedwoodMetal allowlist (backboardd never gets Metal)
-    'metal_allow': b'metal_test\nmtltry\nmtlcompute\nmtlrender\nmtldrawable\nMetalDemo\nMobileNotes\n',  # Notes 10-26: PencilKit needs a device
+    'metal_allow': b'metal_test\nmtltry\nmtlcompute\nmtlrender\nmtldrawable\nMetalDemo\nMobileNotes\nPreferences\n',  # 10-26: Notes (PencilKit), Settings (CoreImage icons; with metal_profile=1)
     # kernel 0115 (sweetcpufreq=1): CPU/L3/GPU clock rows (devtools/clocks.sh); all max
     'clocks': b'l3=10 little=9 big=12 gpu=0\n',
     # eagl: environment for backboardd's Mesa; shader cache dir MUST be writable by uid 501

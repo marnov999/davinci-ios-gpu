@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index e8bd3ac..60eba04 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -2206,6 +2206,25 @@ exposure_limits(uint32_t *lines, uint32_t *gain, uint32_t *frame_lines)
+ 
+ /* ---- sensor bring-up shared by sweetcam=4 and =5 --------------------------------------------------- */
+ 
++static vm_offset_t kept_frame;          /* its allocation stays for the rest of the boot */
++static uint32_t kept_frame_bytes;
++
++static int
++camframe_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	if (kept_frame == 0) {
++		return ENOENT;
++	}
++	for (vm_offset_t l = kept_frame & ~63ul; l < kept_frame + kept_frame_bytes; l += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (l));
++	}
++	__asm__ volatile ("dsb sy");
++	return SYSCTL_OUT(req, (const void *)kept_frame, kept_frame_bytes);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_camframe, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    camframe_sysctl, "A", "sweetcam=4's last frame, RAW10 as the IFE wrote it");
++
+ static uint32_t ios_mode_n;
+ 
+ /* The mode: sweetcam_mode, else the 4:3-ish one with the fewest pixels at >= 24 fps (the ultra's 2104x1560@60). */
+@@ -2312,6 +2331,13 @@ capture_sensor(void)
+ 	power_down();
+ 	if (done != 0) {
+ 		first_bytes(frames + (uint64_t)((done - 1) & 1) * frame, "last frame");
++		/* kept for sysctl kern.sweet_camframe (the camera is off and the SMMU mapping is gone) */
++		kept_frame = frames + (uint64_t)((done - 1) & 1) * frame;
++		kept_frame_bytes = stride * ios_mode->height;
++		frames = 0;
++		frames_bytes = 0;
++		say("last frame kept: %ux%u RAW10, stride %u, %u bytes (sysctl kern.sweet_camframe)\n", ios_mode->width,
++		    ios_mode->height, stride, kept_frame_bytes);
+ 	}
+ 	frames_free();
+ }

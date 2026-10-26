@@ -1,0 +1,48 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index b4e3069..a4fbb9c 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -68,6 +68,7 @@
+ #include <pexpert/pexpert.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <sys/sweet_camera.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -90,6 +91,23 @@ static bool broken, leaving, fake, use_rails = true, swap_i2c, pmic_reads;
+ 
+ static void say(const char *format, ...) __printflike(1, 2);
+ 
++/*
++ * The whole report, also kept here: the kernel's 128 KB message buffer holds only a few seconds of a boot
++ * (backboardd's frame lines), so the start of a camera report is gone before USB comes up.
++ * sysctl kern.sweet_camlog reads it; once full, later lines go to the message buffer only.
++ */
++static char camlog[32768];
++static unsigned camlog_len;
++
++static int
++camlog_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, camlog, camlog_len);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_camlog, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    camlog_sysctl, "A", "the camera driver's report");
++
+ static void
+ say(const char *format, ...)
+ {
+@@ -100,6 +118,11 @@ say(const char *format, ...)
+ 	vsnprintf(line, sizeof(line), format, list);
+ 	va_end(list);
+ 	if (!leaving && ml_get_interrupts_enabled()) {
++		size_t n = strlen(line);
++		if (camlog_len + n <= sizeof(camlog)) {
++			memcpy(camlog + camlog_len, line, n);
++			camlog_len += (unsigned)n;
++		}
+ 		printf("SWEET CAM: %s", line);
+ 	}
+ }

@@ -1,0 +1,112 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 8958453..5761a7d 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -697,7 +697,7 @@ pgpio_restore(unsigned gpio)
+ #define LPG_PREDIV_SLOW         0x23            /* prediv 3 (index 1), exponent 3: 640 us */
+ #define LPG_PREDIV_FAST         0x01            /* prediv 1, exponent 1: 53.33 us */
+ 
+-static bool popup_enabled, popup_test, popup_is_up, popup_pins_set;
++static bool popup_enabled, popup_test, popup_probe_wanted, popup_is_up, popup_pins_set;
+ static uint32_t popup_stop = 99;        /* sweetpopup_stop=N: stop after step N (bisecting a hang) */
+ 
+ /* One byte of one of the two peripherals the motor needs (PM6150L GPIO 10, LPG 2), by our own channel. */
+@@ -709,7 +709,7 @@ popup_spmi_put(unsigned sid, uint16_t address, uint8_t value)
+ 	uint8_t back = 0;
+ 
+ 	if (!((sid == SID_PM6150L && (address >> 8) == PGPIO_PERIPH(POPUP_PGPIO)) ||
+-	    (sid == SID_PM6150L_B && (address >> 8) == POPUP_LPG))) {
++	    (sid == SID_PM6150L_B && (address >> 8) >= 0xb1u && (address >> 8) <= 0xb3u))) {
+ 		give_up("a PMIC peripheral the pop-up does not use");
+ 		return false;
+ 	}
+@@ -835,6 +835,71 @@ popup_pins(void)
+ 	return !broken;
+ }
+ 
++/*
++ * sweetpopup=3: which LPG channel, clock and GPIO 10 function make the step signal (the motor's driver asleep:
++ * nothing moves). Each combination: 50 % PWM, then GPIO 10's level read 100 times; a working one reads about half
++ * high. Every channel is switched off again after its turn.
++ */
++static void
++popup_probe(void)
++{
++	static const uint8_t lpgs[3] = { 0xb1, 0xb2, 0xb3 };
++	/* size/clock (9 bits): 19.2 MHz | 32.768 kHz; prediv/exponent: 19.2 MHz prediv 3 exp 3 (640 us), 32 kHz prediv 1 exp 0 */
++	static const uint8_t clocks[2][2] = { { 3, 0x23 }, { 2, 0x00 } };
++
++	if (!popup_pins()) {
++		return;
++	}
++	popup_out(POPUP_SLEEP, false);                  /* the driver asleep: steps do nothing */
++	for (unsigned c = 0; c < 3; c++) {
++		uint8_t subtype = 0;
++
++		if (!spmi_read(SID_PM6150L_B, (uint16_t)(lpgs[c] << 8 | LPG_SUBTYPE), &subtype)) {
++			say("pop-up probe: LPG%u (%#x) cannot be read\n", c + 1, lpgs[c]);
++			continue;
++		}
++		for (unsigned k = 0; k < 2; k++) {
++			uint8_t size_clk = (uint8_t)(((subtype == 0x0b) ? (1u << 2) : (1u << 4)) | clocks[k][0]);
++			uint16_t b = (uint16_t)(lpgs[c] << 8);
++
++			if (!popup_spmi_put(SID_PM6150L_B, b | LPG_ENABLE_CONTROL, 0) ||
++			    !popup_spmi_put(SID_PM6150L_B, b | LPG_PWM_TYPE_CONFIG, 0x20) ||
++			    !popup_spmi_put(SID_PM6150L_B, b | LPG_PWM_SIZE_CLK, size_clk) ||
++			    !popup_spmi_put(SID_PM6150L_B, b | LPG_PWM_PREDIV_CLK, clocks[k][1]) ||
++			    !popup_spmi_put(SID_PM6150L_B, b | LPG_PWM_VALUE_LSB, 0x00) ||
++			    !popup_spmi_put(SID_PM6150L_B, b | LPG_PWM_VALUE_MSB, 0x01) ||
++			    !popup_spmi_put(SID_PM6150L_B, b | LPG_PWM_SYNC, 1) ||
++			    !popup_spmi_put(SID_PM6150L_B, b | LPG_ENABLE_CONTROL, 0x84)) {
++				broken = false;         /* (a probe: go on with the next one) */
++				say("pop-up probe: LPG%u clock %u: a write did not take\n", c + 1, k);
++				(void)popup_spmi_put(SID_PM6150L_B, b | LPG_ENABLE_CONTROL, 0);
++				broken = false;
++				continue;
++			}
++			for (uint8_t f = 1; f <= 5; f++) {
++				unsigned highs = 0, reads = 0;
++				uint8_t v = 0;
++
++				(void)popup_spmi_put(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | 0x44), f);
++				popup_wait_ms(5);
++				for (int r = 0; r < 100; r++) {
++					if (spmi_read(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | 0x10), &v)) {
++						reads++;
++						highs += v & 1;
++					}
++					spin_us(k == 0 ? 37 : 513);
++				}
++				say("pop-up probe: LPG%u (subtype %#x) clock %s, GPIO10 source %u: high %u of %u\n", c + 1, subtype,
++				    k == 0 ? "19.2 MHz" : "32 kHz", f, highs, reads);
++			}
++			(void)popup_spmi_put(SID_PM6150L_B, b | LPG_ENABLE_CONTROL, 0);
++		}
++	}
++	(void)popup_spmi_put(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | 0x44), 0x02);
++	broken = false;
++	say("pop-up probe: done\n");
++}
++
+ static bool
+ popup_move(bool up)
+ {
+@@ -3356,6 +3421,9 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
+ 		look_readonly();
+ 	}
+ 	/* sweetpopup=2: only the motor, up, 2 s, down; no camera power (to tell the motor from the sensor) */
++	if (popup_enabled && popup_probe_wanted && !broken) {
++		popup_probe();
++	}
+ 	if (popup_test && !broken) {
+ 		say("pop-up test: up\n");
+ 		(void)popup_move(true);
+@@ -3408,6 +3476,7 @@ sweet_camera_init(void)
+ 	v = 0;
+ 	popup_enabled = level >= 2 && PE_parse_boot_argn("sweetpopup", &v, sizeof(v)) && v != 0;
+ 	popup_test = popup_enabled && v == 2;
++	popup_probe_wanted = popup_enabled && v == 3;
+ 	(void)PE_parse_boot_argn("sweetpopup_stop", &popup_stop, sizeof(popup_stop));
+ 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

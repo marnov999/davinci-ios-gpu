@@ -1,0 +1,160 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 11cb965..263cf09 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3053,6 +3053,18 @@ sweet_panel_brightness(uint32_t level)
+ 	if (level > most) {
+ 		level = most;
+ 	}
++	/*
++	 * backboardd turns the backlight off as brightness 0 and back on as brightness 1, each with a
++	 * FadePeriod, and leaves it to the backlight to fade back to where it was (as Apple's does);
++	 * taken literally, the panel woke at 1 of 2047 -- dark, it looked as if it had not woken
++	 * (2026-10-26). So 1 means: the last level above it.
++	 */
++	static uint32_t last_lit = 0x218u;
++	if (level == 1u && last_lit > 1u) {
++		level = last_lit;
++	} else if (level > 1u) {
++		last_lit = level;
++	}
+ 	g_panel_level = level;
+ 	return g_panel_off ? 0 : panel_dcs_brightness(level);
+ }
+@@ -3067,7 +3079,7 @@ sweet_panel_brightness(uint32_t level)
+  */
+ static int panel_dcs_cmd(uint8_t cmd, bool refresh_stays_off);
+ static int panel_power_up(void);
+-static void panel_reset_line(bool high);
++extern void sweet_touch_resume(void);
+ extern int sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on);
+ static bool     g_panel_asleep;
+ static uint32_t g_panel_refresh = ~0u;     /* INTF1 autorefresh config before sleep (~0: none saved) */
+@@ -3096,8 +3108,8 @@ sweet_panel_power(int on)
+ 			g_panel_asleep = true;
+ 			printf("SWEET PANEL: asleep (display off %d, sleep in %d)\n", a, b);
+ 			if (rails) {
+-				/* dsi_panel_power_off: the reset line low, then the supplies */
+-				panel_reset_line(false);
++				/* dsi_panel_power_off takes the supplies away (its reset line is PM6150L GPIO 9, a
++				 * PMIC pin, not driven here: the panel's own power-on reset does it on the way back) */
+ 				printf("SWEET PANEL: vdda (L18A) vote off -> %d\n", sweet_rpmh_vreg_vote("ldoa18", 3000, false));
+ 			}
+ 		}
+@@ -3111,6 +3123,7 @@ sweet_panel_power(int on)
+ 		g_panel_asleep = false;
+ 		g_panel_off = false;
+ 		printf("SWEET PANEL: awake after power-up (%d)\n", up);
++		sweet_touch_resume();
+ 		return panel_dcs_brightness(g_panel_level);
+ 	}
+ 	if (g_panel_asleep) {
+@@ -3119,32 +3132,12 @@ sweet_panel_power(int on)
+ 		int b = panel_dcs_cmd(0x29, false);
+ 		g_panel_asleep = false;
+ 		printf("SWEET PANEL: awake (sleep out %d, display on %d)\n", a, b);
++		sweet_touch_resume();
+ 	}
+ 	g_panel_off = false;
+ 	return panel_dcs_brightness(g_panel_level);
+ }
+ 
+-/*
+- * The panel's reset line, TLMM GPIO 9 (dtbo 14 qcom,platform-reset-gpio; sdmmagpie's NORTH tile:
+- * 0x03400000 + 0x500000 + 9 * 0x1000, io register +4 bit 1 the level, ctl bit 9 output enable).
+- * Driven only if the boot loader left it a GPIO output (function 0), else left alone and said so.
+- */
+-static void
+-panel_reset_line(bool high)
+-{
+-	static vm_offset_t g9;
+-	if (!g9 && !(g9 = ml_io_map(0x03909000u, 0x1000u))) {
+-		return;
+-	}
+-	uint32_t ctl = gpu_rd(g9, 0x0u);
+-	if (((ctl >> 2) & 0xfu) != 0 || !(ctl & (1u << 9))) {
+-		printf("SWEET PANEL: reset GPIO 9 ctl %#x is not a GPIO output: left alone\n", ctl);
+-		return;
+-	}
+-	gpu_wr(g9, 0x4u, high ? (1u << 1) : 0u);
+-	__asm__ volatile("dsb sy" ::: "memory");
+-}
+-
+ /*
+  * One DSI command packet through the test-pattern FIFO and the command DMA, as panel_dcs_cmd and
+  * panel_dcs_brightness send theirs: a short one (0x05, 0x15) as its header alone, a long one (0x39)
+@@ -3239,7 +3232,7 @@ static const uint8_t panel_on_commands[] = {
+ 
+ /*
+  * Back from a powered-off panel, dsi_panel_power_on and dsi_panel_enable's order: the supply (L18A)
+- * on, the reset sequence (qcom,mdss-dsi-reset-sequence <0 1 1 10>: low 1 ms, high 10 ms), the on
++ * on (the reset sequence, on PM6150L GPIO 9, is left to the panel's power-on reset), the on
+  * commands with their waits (sleep out, the panel's set-up, display on), then the display engine's
+  * refresh as it was (panel_dcs_cmd 0x29 with refresh back).
+  */
+@@ -3248,11 +3241,7 @@ panel_power_up(void)
+ {
+ 	int bad = 0, sent = 0;
+ 	printf("SWEET PANEL: vdda (L18A) vote on -> %d\n", sweet_rpmh_vreg_vote("ldoa18", 3000, true));
+-	gmub_udelay(10000);
+-	panel_reset_line(false);
+-	gmub_udelay(1000);
+-	panel_reset_line(true);
+-	gmub_udelay(10000);
++	gmub_udelay(20000);                             /* the supply up and the panel's power-on reset done */
+ 	for (unsigned j = 0; j + 7 <= sizeof(panel_on_commands);) {
+ 		const uint8_t *c = &panel_on_commands[j];
+ 		unsigned n = ((unsigned)c[5] << 8) | c[6];
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index fb05e34..27a9974 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -654,6 +654,8 @@ touch_se_init(void)
+ 	return true;
+ }
+ 
++static volatile bool touch_resume_wanted;
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -749,6 +751,21 @@ touch_thread(void *arg, wait_result_t result)
+ 	unsigned errors = 0, ticks = 0, edges = 0, edgeless = 0, quiet = 0;
+ 	while (!st.dead) {
+ 		bool now;
++		if (touch_resume_wanted) {
++			touch_resume_wanted = false;
++			touch_report(0, st.x, st.y);                    /* nothing held down across the sleep */
++			touch_gpio(8, 0, 3, 3, true, false);           /* reset low */
++			touch_wait(10);
++			touch_gpio(8, 0, 3, 3, true, true);            /* and out of it, as at start */
++			touch_wait(300);
++			if (st.edge) {
++				touch_wr(st.gpio, TOUCH_GPIO_INTR_ST(9), 0);
++			}
++			edges = 0;
++			edgeless = 0;
++			errors = 0;
++			printf("SWEET TOUCH: reset after the panel woke\n");
++		}
+ 		if (st.edge) {
+ 			now = (touch_rd(st.gpio, TOUCH_GPIO_INTR_ST(9)) & 1u) != 0;
+ 			if (now) {
+@@ -793,6 +810,17 @@ out:
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * The panel woke (sweet_gpu.c sweet_panel_power): the touch IC is brought out of reset again and read
++ * from scratch, as the Goodix driver does on the panel's resume notification -- after display off and
++ * on, touch had stopped (2026-10-26). Taken by the touch thread at its next tick.
++ */
++void
++sweet_touch_resume(void)
++{
++	touch_resume_wanted = true;
++}
++
+ void
+ sweet_touch_init(void)
+ {

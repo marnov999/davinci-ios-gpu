@@ -1,0 +1,23 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 3a33ba5..e402541 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -657,6 +657,18 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/*
++	 * A row the client sized itself, on a single-plane surface, rounded up to the alignment this
++	 * kernel advertises (and a6xx imports: fd_resource_from_handle's pitchalign 6, i.e. 64 bytes).
++	 * CAMetalLayer asks for its drawables at width * 4 -- PencilKit's 1128-pixel canvas came as
++	 * 4512 bytes a row, which the GPU cannot take, so Notes' ink was never drawn. Clients read
++	 * the row back (IOSurfaceGetBytesPerRow) rather than assume their own, as on a real iPhone,
++	 * where the kernel also gives every surface its hardware's row alignment.
++	 */
++	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && props->getObject("IOSurfacePlaneInfo") == NULL) {
++		s->bytesPerRow = (uint32_t)((s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &
++		    ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
++	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = sweet_fmt_subst ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));

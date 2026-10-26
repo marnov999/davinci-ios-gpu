@@ -1,0 +1,136 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a5cd85d..340abb5 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3039,6 +3039,48 @@ static bool     g_panel_off;               /* the display is off (IOMFB RequestP
+ static int panel_dcs_brightness(uint32_t level);
+ 
+ /* The brightness asked for: remembered, and shown unless the display is off. */
++/*
++ * After a wake the panel stays dark -- refresh off, backlight 0 -- until backboardd presents its
++ * first new frame (AppleCLCD::scanOut calls sweet_panel_new_frame), as an iPhone shows nothing
++ * before the lock screen is drawn: lit at once, the panel showed the last frame from before the
++ * sleep (the home screen) for a moment (2026-10-26). If no frame comes within a second, the clocks
++ * thread lights it anyway (sweet_panel_wake_tick).
++ */
++static volatile uint32_t g_wake_pending;
++static uint64_t g_wake_at;
++static int panel_dcs_cmd(uint8_t cmd, bool refresh_stays_off);
++static int panel_dcs_brightness(uint32_t level);
++static uint32_t g_panel_level_shown(void);
++
++static void
++panel_wake_reveal(const char *why)
++{
++	if (!__atomic_exchange_n(&g_wake_pending, 0u, __ATOMIC_ACQ_REL)) {
++		return;
++	}
++	int a = panel_dcs_cmd(0x29, false);             /* display on again, with the refresh back */
++	int b = panel_dcs_brightness(g_panel_level_shown());
++	printf("SWEET PANEL: shown after the wake (%s; display on %d, brightness %d)\n", why, a, b);
++}
++
++void sweet_panel_new_frame(void);
++void
++sweet_panel_new_frame(void)
++{
++	if (g_wake_pending) {
++		panel_wake_reveal("first frame");
++	}
++}
++
++void sweet_panel_wake_tick(void);
++void
++sweet_panel_wake_tick(void)
++{
++	if (g_wake_pending && mach_absolute_time() - g_wake_at > 1000u * 19200u) {   /* 1 s of 19.2 MHz ticks */
++		panel_wake_reveal("no frame in 1 s");
++	}
++}
++
+ int
+ sweet_panel_brightness(uint32_t level)
+ {
+@@ -3066,7 +3108,13 @@ sweet_panel_brightness(uint32_t level)
+ 		last_lit = level;
+ 	}
+ 	g_panel_level = level;
+-	return g_panel_off ? 0 : panel_dcs_brightness(level);
++	return (g_panel_off || g_wake_pending) ? 0 : panel_dcs_brightness(level);
++}
++
++static uint32_t
++g_panel_level_shown(void)
++{
++	return g_panel_level;
+ }
+ 
+ /*
+@@ -3120,20 +3168,26 @@ sweet_panel_power(int on)
+ 		/* The supply was off, so the panel lost everything: powered and brought up from reset as
+ 		 * dsi_panel_power_on + the panel's on-commands do (just sleep out + display on left it
+ 		 * dark, seen 2026-10-26: the screen never came back). */
++		g_wake_at = mach_absolute_time();
++		g_wake_pending = 1u;
+ 		int up = panel_power_up();
+ 		g_panel_asleep = false;
+ 		g_panel_off = false;
+-		printf("SWEET PANEL: awake after power-up (%d)\n", up);
++		printf("SWEET PANEL: awake after power-up (%d); dark until the first frame\n", up);
+ 		sweet_touch_resume();
+-		return panel_dcs_brightness(g_panel_level);
++		return 0;
+ 	}
+ 	if (g_panel_asleep) {
++		g_wake_at = mach_absolute_time();
++		g_wake_pending = 1u;
+ 		int a = panel_dcs_cmd(0x11, true);
+ 		gmub_udelay(120000);                    /* exit sleep -> display on: 120 ms (MIPI DCS) */
+-		int b = panel_dcs_cmd(0x29, false);
++		int b = panel_dcs_cmd(0x29, true);      /* the refresh comes back with the first frame */
+ 		g_panel_asleep = false;
+-		printf("SWEET PANEL: awake (sleep out %d, display on %d)\n", a, b);
++		g_panel_off = false;
++		printf("SWEET PANEL: awake (sleep out %d, display on %d); dark until the first frame\n", a, b);
+ 		sweet_touch_resume();
++		return 0;
+ 	}
+ 	g_panel_off = false;
+ 	return panel_dcs_brightness(g_panel_level);
+@@ -3366,7 +3420,7 @@ panel_power_up(void)
+ 		}
+ 		j += 7 + n;
+ 	}
+-	int on = panel_dcs_cmd(0x29, false);         /* display on again, and the refresh back */
++	int on = panel_dcs_cmd(0x29, true);          /* display on; the refresh comes back with the first frame */
+ 	printf("SWEET PANEL: on-commands %d sent, %d failed; display on %d\n", sent, bad, on);
+ 	return bad ? -bad : on;
+ }
+@@ -6291,6 +6345,7 @@ dvfs_thread(__unused void *arg, __unused wait_result_t wr)
+ 		}
+ 		idle = g_clocks.autoidle && mach_absolute_time() - g_dvfs_active > idle_after;
+ 		g_dvfs_idle = idle;
++		sweet_panel_wake_tick();
+ 		want = g_panel_off ? g_clocks_dark : idle ? g_clocks_idle : g_clocks;
+ 		want.autoidle = g_clocks.autoidle;
+ 		if (g_panel_off) {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a82b79b..004d109 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -57,6 +57,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <libkern/c++/OSSerialize.h>
+ extern "C" int sweet_panel_power(int on);
++extern "C" void sweet_panel_new_frame(void);   /* bsd/dev/sweet_gpu.c: light the panel after a wake */
+ extern "C" void sweet_dpu_survey(void);
+ extern "C" void sweet_prof_start(void);
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
+@@ -1045,6 +1046,7 @@ AppleCLCD::scanOut(SweetSurface *s, uint64_t pa, uint32_t stride, bool scaled)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	r[SWEET_MDP_CTL0_FLUSH / 4] = SWEET_MDP_FLUSH_VIG0;
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_panel_new_frame();
+ 	if (s != fShown[0]) {
+ 		OSSafeReleaseNULL(fShown[1]);        /* two flips old: no longer fetched */
+ 		fShown[1] = fShown[0];

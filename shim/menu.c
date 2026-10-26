@@ -1,6 +1,6 @@
 /*
  * Boot menu, at every power-on that is not a charger's: "Boot iOS / Boot MIUI / Power off" on a black
- * screen. Volume up and down move (and stop the countdown), power picks; with no key for 4 s the
+ * screen. Volume up and down move (and stop the countdown), power picks; with no key for 10 s the
  * phone boots iOS. A power key still held from switching the phone on counts only once let go. Keys
  * over SPMI as bsd/dev/sweet_keys.c reads them. Without readable keys: iOS at once.
  */
@@ -11,7 +11,7 @@
 #define BLACK		0xff000000U
 #define GREY		0xff6e6e73U
 #define DIM		0xff3a3a3cU
-#define TIMEOUT_MS	4000
+#define TIMEOUT_MS	10000
 #define TICK_MS		20
 
 #define ITEM_X		120

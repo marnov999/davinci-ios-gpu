@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 27a9974..3fc91ec 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -696,6 +696,21 @@ touch_thread(void *arg, wait_result_t result)
+ 	touch_wait(10); /* conservative rail settling; not a DT timing value */
+ 	touch_gpio(6, 1, 0, 0, false, false); /* qup11 SDA/SCL, 2 mA */
+ 	touch_gpio(7, 1, 0, 0, false, false);
++	/*
++	 * The probe is tried up to six times: now and then the IC answers no address at all (every
++	 * read NACKed, 2026-10-26 -- the boot before and after found it), and one try left the phone
++	 * without touch until the next boot. From the second try on, its avdd is switched off for
++	 * 50 ms first, a whole power-on reset.
++	 */
++	unsigned attempt = 0;
++again:
++	if (attempt > 0) {
++		touch_gpio(8, 0, 3, 3, true, false);
++		touch_gpio(5, 0, 0, 0, true, false);    /* avdd off */
++		touch_wait(50);
++		touch_gpio(5, 0, 0, 0, true, true);
++		touch_wait(10);
++	}
+ 	/* Vendor GT9896 dev_confirm: reset low 2 ms, then high. */
+ 	touch_gpio(8, 0, 3, 3, true, false);
+ 	touch_wait(2);
+@@ -721,6 +736,12 @@ touch_thread(void *arg, wait_result_t result)
+ 	bool goodix = normandy || yellow;
+ 	touch_normandy = normandy;
+ 	bool fts = !fe1 && !fe2 && fid1 == 0x54 && fid2 == 0x52;
++	if (!st.dead && goodix == fts && ++attempt < 6u) {
++		printf("SWEET TOUCH: no unique supported IC (normandy=%d yellow=%d fts=%d); again (try %u of 6)\n",
++		    normandy, yellow, fts, attempt + 1u);
++		touch_wait(500u * attempt);
++		goto again;
++	}
+ 	if (st.dead || goodix == fts) {
+ 		printf("SWEET TOUCH: no unique supported IC (normandy=%d yellow=%d fts=%d dead=%d); stopping\n",
+ 		    normandy, yellow, fts, st.dead);

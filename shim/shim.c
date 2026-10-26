@@ -15,6 +15,8 @@
 #include "diag.h"
 #include "oops.h"
 #include "menu.h"
+#include "linux.h"
+#include "fdt.h"
 #include "spmi.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
@@ -389,16 +391,32 @@ void shim_main(uint64_t dtb)
 #endif
 	diag_mode(dtb);
 	charge_mode(dtb);		/* a charger woke the phone: MIUI's own charger mode */
-	switch (boot_menu(0)) {		/* (Boot MIUI waits for its own data partition) */
+#ifndef SWEET_HAVE_MIUI
+#define SWEET_HAVE_MIUI 0		/* 1 once LUN 0 has MIUI's own userdata (davinci-ios/dualboot) */
+#endif
+	switch (boot_menu(SWEET_HAVE_MIUI)) {
 	case BOOT_OFF:
 		spmi_power_off();
+	case BOOT_MIUI: {
+		const char *why = linux_boot(dtb);	/* returns only if MIUI's kernel could not start */
+		con_clear(0xff000000U);
+		con_str("MIUI", why);
+		delay_ms(3000);
+		break;
+	}
 	default:
 		break;
 	}
-	con_clear(RED);
+	/* Black while xnu starts; the loader's lines only with "sweetverbose" in the boot image's cmdline. */
+	con_clear(0xff000000U);
+	con_quiet = !fdt_chosen_has(dtb, "bootargs", "sweetverbose");
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();
 	const char *why = loader_boot(dtb);
+	if (con_quiet) {		/* came back: the boot failed, say why */
+		con_quiet = 0;
+		con_clear(RED);
+	}
 	con_str("LOADER", why);
 	con_skip();
 

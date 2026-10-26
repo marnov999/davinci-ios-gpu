@@ -1,0 +1,117 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 7fd9be1..36aa8a4 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -29,6 +29,7 @@
+ #include <sys/sysproto.h>
+ #include <sys/kauth.h>
+ #include <sys/bitstring.h>
++#include <kern/startup.h>
+ 
+ #include <security/audit/audit.h>
+ 
+@@ -79,6 +80,93 @@ __XNU_PRIVATE_EXTERN    int             syscalls_log[SYS_MAXSYSCALL];
+ extern int mach_trap_count;
+ #endif
+ 
++/*
++ * SWEET: boot-arg sweettrace=NAME[,NAME...] logs every system call of the processes so named
++ * (p_comm, the first 16 characters) that fails, with its errno and, for the calls that take paths, the path(s):
++ *     SWEET TRACE: MobileNotes[491] mkdir("/private/var/...") = 1 EPERM
++ * One process's failures and nothing else, to find the call an obfuscated or Swift binary gives
++ * up on (HackiOS's systrace= does the same for every call). The error-return path only, so a
++ * process not named costs one byte compare per call.
++ */
++static TUNABLE_STR(sweet_trace_name, 96, "sweettrace", "");
++
++static bool
++sweet_trace_named(const char *comm)
++{
++	size_t len = strnlen(comm, MAXCOMLEN + 1);
++	for (const char *t = sweet_trace_name; *t != '\0';) {
++		const char *end = strchr(t, ',');
++		size_t n = end ? (size_t)(end - t) : strlen(t);
++		if (n == len && strncmp(t, comm, n) == 0) {
++			return true;
++		}
++		if (end == NULL) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++static int
++sweet_trace_path_args(unsigned short code, int *second)
++{
++	*second = -1;
++	switch (code) {
++	case SYS_link: case SYS_rename: case SYS_symlink:
++		*second = 1;
++		return 0;
++	case SYS_open: case SYS_open_nocancel: case SYS_unlink: case SYS_chdir: case SYS_mknod:
++	case SYS_chmod: case SYS_chown: case SYS_access: case SYS_readlink: case SYS_mkdir:
++	case SYS_rmdir: case SYS_utimes: case SYS_pathconf: case SYS_truncate: case SYS_getattrlist:
++	case SYS_setattrlist: case SYS_getxattr: case SYS_setxattr: case SYS_removexattr:
++	case SYS_listxattr: case SYS_stat64: case SYS_lstat64: case SYS_statfs64: case SYS_lchown:
++	case SYS_chflags: case SYS_mkfifo: case SYS_stat: case SYS_lstat: case SYS_statfs:
++	case SYS_getattrlistbulk:
++		return code == SYS_getattrlistbulk ? -1 : 0;
++	case SYS_openat: case SYS_openat_nocancel: case SYS_mkdirat: case SYS_fstatat64:
++	case SYS_unlinkat: case SYS_faccessat: case SYS_getattrlistat: case SYS_readlinkat:
++	case SYS_fchmodat: case SYS_fchownat: case SYS_fstatat: case SYS_setattrlistat:
++		return 1;
++	case SYS_renameat: case SYS_renameatx_np:
++		*second = 3;
++		return 1;
++	case SYS_linkat:
++		*second = 3;
++		return 1;
++	case SYS_symlinkat:
++		*second = 2;
++		return 0;
++	default:
++		return -1;
++	}
++}
++
++static void
++sweet_trace_fail(struct proc *p, unsigned short code, struct uthread *ut, int error)
++{
++	static char path[2][160];
++	size_t n;
++	int second, first;
++
++	if (!sweet_trace_named(p->p_comm)) {
++		return;
++	}
++	path[0][0] = path[1][0] = '\0';
++	first = sweet_trace_path_args(code, &second);
++	if (first >= 0 && copyinstr((user_addr_t)ut->uu_arg[first], path[0], sizeof(path[0]), &n) != 0) {
++		strlcpy(path[0], "?", sizeof(path[0]));
++	}
++	if (second >= 0 && copyinstr((user_addr_t)ut->uu_arg[second], path[1], sizeof(path[1]), &n) != 0) {
++		strlcpy(path[1], "?", sizeof(path[1]));
++	}
++	printf("SWEET TRACE: %s[%d] syscall %u(%s%s%s%s%s%s) args %#llx %#llx %#llx = errno %d\n", p->p_comm,
++	    proc_pid(p), code, first >= 0 ? "\"" : "", path[0], first >= 0 ? "\"" : "",
++	    second >= 0 ? ", \"" : "", path[1], second >= 0 ? "\"" : "",
++	    (unsigned long long)ut->uu_arg[0], (unsigned long long)ut->uu_arg[1],
++	    (unsigned long long)ut->uu_arg[2], error);
++}
++
+ /*
+  * Function:	unix_syscall
+  *
+@@ -180,6 +268,10 @@ unix_syscall(
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++	if (__improbable(sweet_trace_name[0] != '\0') && error != 0 && error != EJUSTRETURN &&
++	    error != ERESTART) {
++		sweet_trace_fail(proc, code, uthread, error);
++	}
+ 
+ #if CONFIG_MACF
+ skip_syscall:

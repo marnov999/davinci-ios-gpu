@@ -17,7 +17,7 @@ Groups (all on by default):
           kgsl_test, sweet_push + hello_gl          (inject_gltest.sh / inject_kgsltest.sh + pushes)
   metal   RedwoodMetal.bundle (Metal plug-in for IOAcceleratorES "sgx", kernel 0146 + sweetmetal=1)
           and libredwoodair.dylib
-  launchd xpc/launchd.plist jobs (shims for backboardd/SpringBoard, com.sweet.push/gltest/kgsltest),
+  launchd xpc/launchd.plist jobs (shims for backboardd/SpringBoard/mediaserverd, com.sweet.push/gltest/kgsltest),
           the standalone com.apple.backboardd.plist, launchd disabled.plist (vmd, axassetsd)
   flags   /usr/local/gltest switch files read by metalshim / eagl / RedwoodMetal / the kernel
   apps    staged system apps -> /Applications (metal/stageapps.c), MetalDemo.app
@@ -40,6 +40,8 @@ import argparse, hashlib, os, plistlib, shutil, struct, sys
 # Claude session transcripts (push_file.py / push.sh, last push per path).
 FILES = [
     ('launchd', 'usr/local/gltest/sweettime', 'davinci-ios/gpu/userland/metal/sweettime', 0o755, '12ffbb8fc9df4a7a'),  # 2026-10-26: time of day = RTC (kern.sweet_rtc, 0162) + kept offset (job com.sweet.time)
+    ('launchd', 'usr/local/lib/libsweet-media.dylib', 'davinci-ios/camera/userland/libsweet-media.dylib', 0o755, 'c8b3f69de8305313'),  # 2026-10-26: mediaserverd camera (sweetcam=5), camera/userland/build.sh
+    ('launchd', 'usr/local/lib/sweet_media_shim', 'davinci-ios/camera/userland/sweet_media_shim', 0o755, '9c48829ed46d8fb5'),  # 2026-10-26: mediaserverd ProgramArguments[0]; inserts libsweet-media (execs without it if missing)
     ('launchd', 'usr/local/gltest/scset', 'davinci-ios/gpu/userland/metal/scset', 0o755, 'a838fc11ea8053b7'),  # 2026-10-25: publishes Plugin:InterfaceNamer *QUIET* at boot (job com.sweet.scquiet)
     ('assets', 'usr/local/gltest/inplace_copy_lpf.fragment.spv', 'backup/ios-root-sources-20261025/phone-only/inplace_copy_lpf.fragment.spv', 0o644, '05f9adab013b54c8'),  # only on the phone; pulled 2026-10-25
     ('assets', 'usr/local/gltest/inplace_copy_lph.fragment.spv', 'backup/ios-root-sources-20261025/phone-only/inplace_copy_lph.fragment.spv', 0o644, '05f9adab013b54c8'),  # only on the phone; pulled 2026-10-25
@@ -55,7 +57,7 @@ FILES = [
     ('gl', 'usr/local/lib/libglapi.0.dylib', 'davinci-ios/gpu/userland/mesa/gltest/libglapi.0.dylib', 0o644, 'c2c5647d9ea258ab'),  # inject_gltest.sh; = device copy 10-24
     ('gl', 'usr/local/lib/libgallium-24.2.8.dylib', 'davinci-ios/gpu/userland/mesa/gltest/libgallium-24.2.8.dylib', 0o755, 'e003f1637d005ddf'),  # push 2026-10-25 00:01Z (build-fdgl, sweet stats + restore->sysmem)
     ('gl', 'usr/local/lib/msm_dri.so', 'davinci-ios/gpu/userland/mesa/gltest/libgallium-24.2.8.dylib.bak-nofetchbarrier', 0o644, 'd2de82901800515e'),  # device copy 10-24 == this .bak (legacy, unused by eagl)
-    ('gl', 'usr/local/lib/libredwood-gl.dylib', 'davinci-ios/gpu/hackios-port/obj/libredwood-gl.dylib', 0o755, '01c5d53b7ef1f9d6'),  # devtools/gl_iter.sh push 2026-10-25 06:21Z (eagl.c + redwood_gl_egl.c)
+    ('gl', 'usr/local/lib/libredwood-gl.dylib', 'davinci-ios/gpu/hackios-port/obj/libredwood-gl.dylib', 0o755, '4baa16b92f671bac'),  # 2026-10-27 eagl.c: planar surfaces (camera preview) refilled when they change
     ('gl', 'usr/local/lib/metalshim.dylib', 'davinci-ios/gpu/userland/metal/metalshim.dylib.device-20261024', 0o755, '28b8318855cef160'),  # push 2026-10-23 23:48Z (metalshim_vbl); == device copy 10-24. NOT metal/metalshim.dylib (older)
     ('gl', 'usr/local/lib/sweet_shim', 'davinci-ios/gpu/userland/metal/sweet_shim', 0o755, 'f2c858d06ebb141c'),  # push 10-22; SpringBoard ProgramArguments[0]; == device copy
     ('gl', 'usr/libexec/backboardd_shim', 'davinci-ios/gpu/userland/metal/bbd_shim', 0o755, '9232fe0e6b48628b'),  # push 10-21 17:18Z; backboardd ProgramArguments[0]
@@ -318,6 +320,7 @@ BBD_KEY = '/System/Library/LaunchDaemons/com.apple.backboardd.plist'
 SB_KEY = '/System/Library/LaunchDaemons/com.apple.SpringBoard.plist'
 BBD_SHIM, SWEET_SHIM = '/usr/libexec/backboardd_shim', '/usr/local/lib/sweet_shim'
 METALSHIM = '/usr/local/lib/metalshim.dylib'
+MS_KEY, MEDIA_SHIM = '/System/Library/LaunchDaemons/com.apple.mediaserverd.plist', '/usr/local/lib/sweet_media_shim'
 
 # launchd's disabled.plist as on the phone after 2026-10-25 (launchd's own first-boot entries + ours)
 DISABLED = {
@@ -445,13 +448,19 @@ class Overlay:
         if pa[0] != SWEET_SHIM:
             sb['ProgramArguments'] = [SWEET_SHIM] + pa
         sb.pop('Program', None)
+        # mediaserverd: sweet_media_shim in front (camera/userland, libsweet-media.dylib = the camera, sweetcam=5)
+        ms = jobs[MS_KEY]
+        pa = ms.get('ProgramArguments') or [ms['Program']]
+        if pa[0] != MEDIA_SHIM:
+            ms['ProgramArguments'] = [MEDIA_SHIM] + pa
+        ms.pop('Program', None)
         for k, job in SWEET_JOBS.items():
             for other in [o for o, j in jobs.items() if o != k and isinstance(j, dict) and j.get('Label') == job['Label']]:
                 del jobs[other]
             jobs[k] = job
         new = plistlib.dumps(d, fmt=plistlib.FMT_BINARY)
         if plistlib.loads(new) != plistlib.loads(raw):
-            self.say('edit', '/' + rel, '(backboardd + SpringBoard shims, com.sweet.{push,gltest,kgsltest})')
+            self.say('edit', '/' + rel, '(backboardd + SpringBoard + mediaserverd shims, com.sweet.{push,gltest,kgsltest})')
             self.put(rel, new, st.st_mode & 0o7777, st.st_uid, st.st_gid)
         if self.a.reference_launchd:
             ref = plistlib.load(open(self.a.reference_launchd, 'rb'))['LaunchDaemons']

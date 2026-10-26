@@ -48,10 +48,10 @@ index fdd0639..cb7ca58 100644
  	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
  	fReal = real == 1 && sweet_spmi_init() == 0;
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index bb89899..3edb67f 100644
+index bb89899..a9a6842 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -673,11 +673,14 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -673,11 +673,17 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  	 * shaped (or named CAMetalLayer...), kept otherwise; each decision logged, the first 24.
  	 */
  	OSString *name = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
@@ -61,7 +61,10 @@ index bb89899..3edb67f 100644
 +	OSArray *plane_info = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
 +	/* one-plane plane info counts as single-plane: CAMetalLayer passes its drawable's row there too */
 +	bool one_plane = plane_info == NULL || plane_info->getCount() == 1;
-+	bool drawable = name != NULL ? strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 :
++	/* and PencilKit's own canvas ("PencilKit", 1125x2436 at 4512): a surface it wraps as a Metal
++	 * texture and draws only on the GPU */
++	bool drawable = name != NULL ? (strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 ||
++	    strcmp(name->getCStringNoCopy(), "PencilKit") == 0) :
 +	    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4);
 +	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && one_plane) {
  		static unsigned told;
@@ -70,7 +73,7 @@ index bb89899..3edb67f 100644
  			told++;
  			IOLog("SWEET SURF: %ux%u asked %u bytes a row (not a multiple of %u), name %s: %s\n", s->width,
  			    s->height, s->bytesPerRow, SWEET_SURFACE_ROW_ALIGN, name ? name->getCStringNoCopy() : "(none)",
-@@ -714,9 +717,25 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -714,9 +720,25 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  			}
  			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
  			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));

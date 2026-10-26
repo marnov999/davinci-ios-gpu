@@ -1,0 +1,149 @@
+diff --git a/bsd/dev/sweet_qg.c b/bsd/dev/sweet_qg.c
+index 4ff6d2d..f8909b2 100644
+--- a/bsd/dev/sweet_qg.c
++++ b/bsd/dev/sweet_qg.c
+@@ -29,13 +29,16 @@
+ extern int sweet_spmi_init(void);
+ extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern int sweet_spmi_read_n(unsigned sid, unsigned addr, uint8_t *out, unsigned n);
++extern int sweet_spmi_write_sdam(unsigned addr, const uint8_t *buf, unsigned n);
+ extern uint64_t sweet_qg_host_now_ms(void);
+ #define QG_LOG printf
++#define PE_parse_boot_argn(name, ptr, size) (0)       /* host tests: no boot-args (no write-back) */
+ static uint64_t now_ms(void) { return sweet_qg_host_now_ms(); }
+ #else
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_spmi.h"
+ extern uint64_t mach_continuous_time(void);
+ #define QG_LOG printf
+@@ -448,6 +451,42 @@ soft_fifo_sample(uint32_t rtc, uint64_t now, struct sweet_qg_status *st)
+ 	}
+ }
+ 
++/*
++ * SDAM write-back (boot-arg sweetbattery_wb=1): the SOC parameters Linux keeps there, as it writes them
++ * (SweetBattery-integration.md 4.6, dirty bits 0 and 1), so the next power-on -- MIUI's or ours --
++ * starts from the number shown here. IBAT is written as 0; ESR, learned capacity, the cycle buckets,
++ * MAGIC and QG's monotonic register are not written.
++ */
++static void
++sdam_write_back(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		enabled = 0;
++		(void)PE_parse_boot_argn("sweetbattery_wb", &enabled, sizeof(enabled));
++	}
++	if (enabled != 1 || !(K.sdam_dirty & 3)) {
++		return;
++	}
++	struct qg_sdam s = K.sdam;
++	uint8_t raw[QG_SDAM_RAW_LEN];
++	int rc = 0;
++	s.ibat_ua = 0;
++	qg_sdam_pack(&s, raw);
++	if (K.sdam_dirty & 1) {
++		rc |= sweet_spmi_write_sdam(0xB646, raw, 8);
++		rc |= sweet_spmi_write_sdam(0xB64E, raw + 8, 8);
++		rc |= sweet_spmi_write_sdam(0xB656, raw + 16, 2);
++	} else {
++		rc |= sweet_spmi_write_sdam(0xB647, raw + 1, 1);
++	}
++	QG_LOG("SWEET QG: SDAM written (%s): soc %u ocv %u time %u -> %d\n", (K.sdam_dirty & 1) ? "soc params" : "soc",
++	    s.soc, s.ocv_uv, s.time_sec, rc);
++	if (rc == 0) {
++		K.sdam_dirty &= ~3;
++	}
++}
++
+ /* ---------------- one poll ---------------- */
+ uint32_t
+ sweet_qg_poll(struct sweet_qg_status *st)
+@@ -560,6 +599,7 @@ sweet_qg_poll(struct sweet_qg_status *st)
+ 	snapshot(st);
+ 	if (now - last_publish_ms >= 30000) { st->changed = 1; }
+ 	if (st->changed) last_publish_ms = now;
++	sdam_write_back();
+ 	return delay;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET || SWEET_QG_HOST */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index ce3c513..ceae89a 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -141,4 +141,59 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	return sweet_spmi_read_n(sid, addr, out, 1);
+ }
++/*
++ * The one write this file allows: the QG SDAM's SOC parameters, 0xB646..0xB657 (VALID, SOC, TEMP, RBAT,
++ * OCV, IBAT, TIME -- what qpnp-qg's qg_store_soc_params / update_msoc write), so MIUI's next power-on SOC
++ * (and ours) continues from the number iOS showed. EXT_WRITEL of n = 1..8 bytes by our own (EE 0)
++ * channel at chnls + 0x10000 * APID, as the PON writes in sweet_gpu.c; only on an APID owned by EE 0.
++ */
++#define SP_CHNLS_PA 0x0c600000u
++int
++sweet_spmi_write_sdam(unsigned addr, const uint8_t *buf, unsigned n)
++{
++	static vm_offset_t ch;
++	static uint16_t ch_apid = SP_NO_APID;
++	if (!sp_ready || !buf || n < 1 || n > 8 || addr < 0xB646u || addr + n > 0xB658u) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid(0xB6u);
++	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -2;
++	}
++	if (ch == 0 || ch_apid != apid) {
++		ch = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000u);
++		ch_apid = apid;
++		if (ch == 0) {
++			IOLockUnlock(sp_lock);
++			return -1;
++		}
++	}
++	uint32_t w0 = 0, w1 = 0;
++	for (unsigned i = 0; i < n; i++) {
++		if (i < 4) {
++			w0 |= (uint32_t)buf[i] << (8 * i);
++		} else {
++			w1 |= (uint32_t)buf[i] << (8 * (i - 4));
++		}
++	}
++	*(volatile uint32_t *)(ch + 0x10u) = w0;                                     /* WDATA0 */
++	*(volatile uint32_t *)(ch + 0x14u) = w1;                                     /* WDATA1 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (0u << 27) | ((addr & 0xffu) << 4) | (n - 1u);   /* EXT_WRITEL */
++	__asm__ volatile("dsb osh" ::: "memory");
++	int rc = -3;
++	for (unsigned i = 0; i < 1000u; ++i) {
++		uint32_t status = *(volatile uint32_t *)(ch + 0x08u);
++		if (status & 1u) {
++			rc = (status & 0x0eu) ? -4 : 0;
++			break;
++		}
++		delay(1);
++	}
++	IOLockUnlock(sp_lock);
++	return rc;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index ca59d8c..6218c42 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* the QG SDAM's SOC parameters only (0xB646..0xB657), 1..8 bytes; 0 success */
++int sweet_spmi_write_sdam(unsigned addr, const uint8_t *buf, unsigned n);
+ /* n = 1..8 bytes of one peripheral in one transaction; same rules */
+ int sweet_spmi_read_n(unsigned sid, unsigned addr, uint8_t *out, unsigned n);
+ #ifdef __cplusplus

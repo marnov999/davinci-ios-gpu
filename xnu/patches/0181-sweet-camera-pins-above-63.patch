@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 325a598..ec374c0 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -193,7 +193,7 @@ cam_pa(vm_offset_t va)
+ #define CFG_FUNCTION(f)         ((uint32_t)(f) << 2)
+ #define CFG_DRIVE_MA(ma)        ((uint32_t)((ma) / 2 - 1) << 6)
+ #define FUNC_CAM_MCLK           1               /* gpio13..16 function 1 */
+-#define MAX_PIN                 64
++#define MAX_PIN                 128     /* sdmmagpie: gpio0..118 (the pop-up motor uses 88-91) */
+ 
+ static vm_offset_t pin_va[MAX_PIN];
+ 
+@@ -760,6 +760,9 @@ popup_out(unsigned n, bool high)
+ 	if (!popup_pins_set) {
+ 		say("pop-up: TLMM %u -> %s\n", n, high ? "high" : "low");
+ 	}
++	if (pin(n) == 0) {
++		return;                 /* refused (give_up said why): never an access at pin()'s 0 */
++	}
+ 	wr(GPIO_IO(n), high ? 2 : 0);
+ 	wr(GPIO_CFG(n), CFG_OUTPUT | CFG_PULL_UP | CFG_DRIVE_MA(2));   /* motor_gpio_default: pull-up, 2 mA */
+ }
+@@ -811,6 +814,12 @@ popup_pins(void)
+ 	}
+ 	if (popup_stop < 4) { say("pop-up: stopping after step 3\n"); return false; }
+ 	say("pop-up step 4: TLMM 43 (fault) as input\n");
++	static const unsigned motor_pins[6] = { POPUP_FAULT, POPUP_SLEEP, POPUP_MODE0, POPUP_MODE1, POPUP_DIR, POPUP_PWREN };
++	for (int i = 0; i < 6; i++) {
++		if (pin(motor_pins[i]) == 0) {
++			return false;   /* every pin mapped before the first is touched */
++		}
++	}
+ 	wr(GPIO_CFG(POPUP_FAULT), CFG_PULL_UP | CFG_DRIVE_MA(2));      /* input */
+ 	if (popup_stop < 5) { say("pop-up: stopping after step 4\n"); return false; }
+ 	say("pop-up step 5: TLMM 88 91 66 55 90 as outputs\n");
+@@ -853,7 +862,7 @@ popup_move(bool up)
+ 		popup_wait_ms(51);
+ 	}
+ 	say("pop-up step 10: stop\n");
+-	bool fault = (rd(GPIO_IO(POPUP_FAULT)) & 1) == 0;
++	bool fault = pin(POPUP_FAULT) != 0 && (rd(GPIO_IO(POPUP_FAULT)) & 1) == 0;
+ 	/* always stop, whatever failed on the way */
+ 	(void)popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), 0);
+ 	popup_out(POPUP_SLEEP, false);

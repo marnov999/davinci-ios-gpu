@@ -1,0 +1,246 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index f9d9f16..11cb965 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3066,6 +3066,8 @@ sweet_panel_brightness(uint32_t level)
+  * everything at its lowest (g_clocks_dark). Boot-arg sweetpanel_sleep=0: the old dimming only.
+  */
+ static int panel_dcs_cmd(uint8_t cmd, bool refresh_stays_off);
++static int panel_power_up(void);
++static void panel_reset_line(bool high);
+ extern int sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on);
+ static bool     g_panel_asleep;
+ static uint32_t g_panel_refresh = ~0u;     /* INTF1 autorefresh config before sleep (~0: none saved) */
+@@ -3094,16 +3096,24 @@ sweet_panel_power(int on)
+ 			g_panel_asleep = true;
+ 			printf("SWEET PANEL: asleep (display off %d, sleep in %d)\n", a, b);
+ 			if (rails) {
++				/* dsi_panel_power_off: the reset line low, then the supplies */
++				panel_reset_line(false);
+ 				printf("SWEET PANEL: vdda (L18A) vote off -> %d\n", sweet_rpmh_vreg_vote("ldoa18", 3000, false));
+ 			}
+ 		}
+ 		return r;
+ 	}
++	if (g_panel_asleep && rails) {
++		/* The supply was off, so the panel lost everything: powered and brought up from reset as
++		 * dsi_panel_power_on + the panel's on-commands do (just sleep out + display on left it
++		 * dark, seen 2026-10-26: the screen never came back). */
++		int up = panel_power_up();
++		g_panel_asleep = false;
++		g_panel_off = false;
++		printf("SWEET PANEL: awake after power-up (%d)\n", up);
++		return panel_dcs_brightness(g_panel_level);
++	}
+ 	if (g_panel_asleep) {
+-		if (rails) {
+-			printf("SWEET PANEL: vdda (L18A) vote on -> %d\n", sweet_rpmh_vreg_vote("ldoa18", 3000, true));
+-			gmub_udelay(20000);
+-		}
+ 		int a = panel_dcs_cmd(0x11, true);
+ 		gmub_udelay(120000);                    /* exit sleep -> display on: 120 ms (MIPI DCS) */
+ 		int b = panel_dcs_cmd(0x29, false);
+@@ -3114,6 +3124,155 @@ sweet_panel_power(int on)
+ 	return panel_dcs_brightness(g_panel_level);
+ }
+ 
++/*
++ * The panel's reset line, TLMM GPIO 9 (dtbo 14 qcom,platform-reset-gpio; sdmmagpie's NORTH tile:
++ * 0x03400000 + 0x500000 + 9 * 0x1000, io register +4 bit 1 the level, ctl bit 9 output enable).
++ * Driven only if the boot loader left it a GPIO output (function 0), else left alone and said so.
++ */
++static void
++panel_reset_line(bool high)
++{
++	static vm_offset_t g9;
++	if (!g9 && !(g9 = ml_io_map(0x03909000u, 0x1000u))) {
++		return;
++	}
++	uint32_t ctl = gpu_rd(g9, 0x0u);
++	if (((ctl >> 2) & 0xfu) != 0 || !(ctl & (1u << 9))) {
++		printf("SWEET PANEL: reset GPIO 9 ctl %#x is not a GPIO output: left alone\n", ctl);
++		return;
++	}
++	gpu_wr(g9, 0x4u, high ? (1u << 1) : 0u);
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * One DSI command packet through the test-pattern FIFO and the command DMA, as panel_dcs_cmd and
++ * panel_dcs_brightness send theirs: a short one (0x05, 0x15) as its header alone, a long one (0x39)
++ * as the header {word count, type, last + long} and the payload in words, padded. lp: in low power,
++ * as the panel's on-commands are sent (qcom,mdss-dsi-on-command-state "dsi_lp_mode"). The display
++ * engine's refresh must be off (the caller's, asleep).
++ */
++static int
++panel_dsi_packet(uint8_t dtype, const uint8_t *data, unsigned n, bool lp)
++{
++	static vm_offset_t dsi;
++	uint32_t reg, saved, i, done = 0, len;
++	if (!dsi && !(dsi = ml_io_map(DSI0_PA, 0x400u))) {
++		return -1;
++	}
++	if (!(gpu_rd(dsi, DSI_CTRL_R) & 1u)) {
++		return -2;
++	}
++	if (n > 48) {
++		return -4;
++	}
++	for (i = 0; i < 40000u && (gpu_rd(dsi, DSI_STATUS_R) & (1u << 2)); i++) {
++		gmub_udelay(1);
++	}
++	gpu_wr(dsi, DSI_TPG_CTRL_R, (1u << 1) | (1u << 2) | (3u << 16));
++	if (dtype == 0x39 || dtype == 0x29) {
++		gpu_wr(dsi, DSI_TPG_DMA_INIT_R, n | (uint32_t)dtype << 16 | 0xC0u << 24);
++		for (unsigned w = 0; w < n; w += 4) {
++			uint32_t v = 0;
++			for (unsigned k = 0; k < 4; k++) {
++				v |= (uint32_t)(w + k < n ? data[w + k] : 0xFFu) << (8 * k);
++			}
++			gpu_wr(dsi, DSI_TPG_DMA_INIT_R, v);
++		}
++		len = 4u + ((n + 3u) & ~3u);
++	} else {
++		gpu_wr(dsi, DSI_TPG_DMA_INIT_R, (uint32_t)(n > 0 ? data[0] : 0) | (uint32_t)(n > 1 ? data[1] : 0) << 8 |
++		    (uint32_t)dtype << 16 | 0x80u << 24);
++		len = 4u;
++	}
++	saved = reg = gpu_rd(dsi, DSI_CMD_DMA_CTRL_R);
++	reg &= ~((1u << 31) | (1u << 30) | (1u << 26));
++	reg |= 1u << 28;
++	if (lp) {
++		reg |= 1u << 26;                        /* DSI_CMD_DMA_CTRL low-power transmission */
++	}
++	gpu_wr(dsi, DSI_CMD_DMA_CTRL_R, reg);
++	gpu_wr(dsi, DSI_DMA_CMD_LENGTH_R, len);
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_wr(dsi, DSI_DMA_SW_TRIGGER_R, 1u);
++	for (i = 0; i < 20000u; i++) {
++		if ((done = gpu_rd(dsi, DSI_INT_CTRL_R)) & 1u) {
++			break;
++		}
++		gmub_udelay(1);
++	}
++	if (done & 1u) {
++		gpu_wr(dsi, DSI_INT_CTRL_R, done);
++	}
++	gpu_wr(dsi, DSI_TPG_CTRL_R, 0u);
++	gpu_wr(dsi, DSI_TPG_FIFO_RESET_R, 1u);
++	gmub_udelay(1);
++	gpu_wr(dsi, DSI_TPG_FIFO_RESET_R, 0u);
++	gpu_wr(dsi, DSI_CMD_DMA_CTRL_R, saved & ~(1u << 26));
++	return (done & 1u) ? 0 : -3;
++}
++
++/* MIUI's qcom,mdss-dsi-on-command for "ss ea fhd cmd dsi panel" timing@0 (dtbo 14), byte for byte:
++ * per command {type, last, vc, ack, wait ms, length (2, big endian), payload} */
++static const uint8_t panel_on_commands[] = {
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x03, 0xfc, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xb0, 0x0c, 0x39, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x02, 0xff, 0x10, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xb0, 0x2f, 0x39,
++	0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0xd1, 0x01, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0,
++	0xa5, 0xa5, 0x39, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0xfc, 0xa5, 0xa5, 0x05, 0x01, 0x00, 0x00,
++	0x0a, 0x00, 0x02, 0x11, 0x00, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0x5a, 0x5a, 0x39,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x35, 0x00, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xb7,
++	0x01, 0x4b, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xb0, 0x06, 0x39, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x02, 0xb7, 0x10, 0x39, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5, 0x39, 0x01,
++	0x00, 0x00, 0x00, 0x00, 0x05, 0x2b, 0x00, 0x00, 0x09, 0x23, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x03, 0xf0, 0x5a, 0x5a, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xfc, 0x5a, 0x5a, 0x39, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x02, 0xb0, 0x23, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xd1, 0x11,
++	0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0xe9, 0x11, 0x55, 0xa6, 0x75, 0xa3, 0xb9, 0xa1, 0x4a,
++	0x00, 0x1a, 0xb8, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xe1, 0x00, 0x00, 0x02, 0x02, 0x42,
++	0x02, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0xe2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x39,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xb0, 0x0c, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xe1,
++	0x19, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf0, 0xa5, 0xa5, 0x39, 0x01, 0x00, 0x00, 0x00,
++	0x00, 0x03, 0xfc, 0xa5, 0xa5, 0x39, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x53, 0x20, 0x39, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x03, 0x51, 0x00, 0x00, 0x39, 0x01, 0x00, 0x00, 0x43, 0x00, 0x02, 0x55,
++	0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x29, 0x00,
++};
++
++/*
++ * Back from a powered-off panel, dsi_panel_power_on and dsi_panel_enable's order: the supply (L18A)
++ * on, the reset sequence (qcom,mdss-dsi-reset-sequence <0 1 1 10>: low 1 ms, high 10 ms), the on
++ * commands with their waits (sleep out, the panel's set-up, display on), then the display engine's
++ * refresh as it was (panel_dcs_cmd 0x29 with refresh back).
++ */
++static int
++panel_power_up(void)
++{
++	int bad = 0, sent = 0;
++	printf("SWEET PANEL: vdda (L18A) vote on -> %d\n", sweet_rpmh_vreg_vote("ldoa18", 3000, true));
++	gmub_udelay(10000);
++	panel_reset_line(false);
++	gmub_udelay(1000);
++	panel_reset_line(true);
++	gmub_udelay(10000);
++	for (unsigned j = 0; j + 7 <= sizeof(panel_on_commands);) {
++		const uint8_t *c = &panel_on_commands[j];
++		unsigned n = ((unsigned)c[5] << 8) | c[6];
++		if (j + 7 + n > sizeof(panel_on_commands)) {
++			break;
++		}
++		if (panel_dsi_packet(c[0], c + 7, n, true) != 0) {
++			bad++;
++		}
++		sent++;
++		if (c[4]) {
++			gmub_udelay((uint32_t)c[4] * 1000u);
++		}
++		j += 7 + n;
++	}
++	int on = panel_dcs_cmd(0x29, false);         /* display on again, and the refresh back */
++	printf("SWEET PANEL: on-commands %d sent, %d failed; display on %d\n", sent, bad, on);
++	return bad ? -bad : on;
++}
++
+ static int
+ panel_dcs_brightness(uint32_t level)
+ {
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index c385f80..56ae718 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -33,6 +33,7 @@
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
+@@ -492,4 +493,35 @@ sweet_amfi_policy_register(void)
+ 	printf("SWEET AMFI: dyld policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
+ }
++/*
++ * kern.sweet_rtc: the PMIC's RTC counter now (PM6150 RTC_RW RDATA 0x6048..0x604b, read twice around
++ * byte 0 for a carry), -1 if it cannot be read. It free-runs (16773 s at 2026-10-26 07:28 -- not UTC):
++ * MIUI keeps the time of day as an offset to it, and so does iOS here, in userland (sweettime: time =
++ * counter + the offset saved when the time was last set).
++ */
++extern int sweet_spmi_init(void);
++extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++static int
++sysctl_sweet_rtc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int64_t v = -1;
++	uint8_t b[4], again = 0;
++	if (sweet_spmi_init() == 0) {
++		for (int tries = 0; tries < 3 && v < 0; tries++) {
++			bool ok = true;
++			for (unsigned i = 0; i < 4; i++) {
++				ok = ok && sweet_spmi_read(0, 0x6048 + i, &b[i]) == 0;
++			}
++			if (ok && sweet_spmi_read(0, 0x6048, &again) == 0 && again == b[0]) {
++				v = (int64_t)((uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
++			}
++		}
++	}
++	return SYSCTL_OUT(req, &v, sizeof(v));
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rtc, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_rtc, "Q", "PMIC RTC counter, seconds (free-running)");
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

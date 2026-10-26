@@ -63,9 +63,9 @@ FILES = [
     ('gl', 'usr/local/gltest/hello_gl', 'davinci-ios/gpu/userland/mesa/gltest/hello_gl', 0o755, '57d864c7ecb5f3e3'),  # inject_gltest.sh; job com.sweet.gltest (disabled)
     ('gl', 'usr/local/lib/libvulkan_freedreno.dylib', 'davinci-ios/gpu/userland/mesa/build-tu/src/freedreno/vulkan/libvulkan_freedreno.dylib', 0o755, 'a47aa312aa44dcf6'),  # push 10-21 (turnip, Vulkan era); == device copy
     # (usr/local/lib/logshim: pushed 10-24, no longer on the phone 2026-10-25 -- left out)
-    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, 'fe6dfe74fb73f449'),  # push 10-25 07:13Z (redwoodmetal.m + redwooddrawable.m)
+    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, '7b5d17c7be36d95c'),  # push 10-26 06:27Z (64-byte texture/linear alignment answers)
     ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/Info.plist', 'davinci-ios/gpu/userland/metal/redwood/metal_plugin.plist', 0o644, '96f6896e6e1137cb'),  # push 10-25 06:32Z
-    ('metal', 'usr/local/lib/libredwoodair.dylib', 'davinci-ios/gpu/userland/metal/redwood/libredwoodair.dylib', 0o755, 'fad7a791543805fd'),  # push 10-25 08:08Z (Mesa AIR frontend)
+    ('metal', 'usr/local/lib/libredwoodair.dylib', 'davinci-ios/gpu/userland/metal/redwood/libredwoodair.dylib', 0o755, '2e748088bbdc20b4'),  # push 10-26 06:31Z (fewer attachments, SSBO offset bounce, min/max factors)
     ('apps', 'Applications/MetalDemo.app/MetalDemo', 'davinci-ios/gpu/userland/metal/demoapp/MetalDemo', 0o755, 'f34277acc0078ae5'),  # push 10-25 07:53Z (signed with demoapp/ents.plist)
     ('apps', 'Applications/MetalDemo.app/Info.plist', 'davinci-ios/gpu/userland/metal/demoapp/Info.plist', 0o644, '1dc8e501ab0ac4b1'),  # push 10-25 07:53Z
     ('apps', 'Applications/MetalDemo.app/AppIcon60x60@2x.png', 'davinci-ios/gpu/userland/metal/demoapp/AppIcon60x60@2x.png', 0o644, '2aa4673331efbbb0'),  # push 10-25 07:53Z
@@ -266,7 +266,7 @@ FLAGS = {
     # metalshim.m: in backboardd, dlopen libredwood-gl (CA -> freedreno GLES). ESSENTIAL.
     'ca_gles': b'1',
     # RedwoodMetal allowlist (backboardd never gets Metal)
-    'metal_allow': b'metal_test\nmtltry\nmtlcompute\nmtlrender\nmtldrawable\nMetalDemo\n',
+    'metal_allow': b'metal_test\nmtltry\nmtlcompute\nmtlrender\nmtldrawable\nMetalDemo\nMobileNotes\n',  # Notes 10-26: PencilKit needs a device
     # kernel 0115 (sweetcpufreq=1): CPU/L3/GPU clock rows (devtools/clocks.sh); all max
     'clocks': b'l3=10 little=9 big=12 gpu=0\n',
     # eagl: environment for backboardd's Mesa; shader cache dir MUST be writable by uid 501
@@ -320,8 +320,11 @@ DISABLED = {
     'com.apple.magicswitchd.companion': True, 'com.apple.relevanced': True, 'com.apple.security.otpaird': True,
     'com.apple.voicemail.vmd': True,            # vmd XPC-retry flood (no CommCenter), 2026-10-25
     'com.apple.accessibility.axassetsd': True,  # speech plug-ins crash ~18x/boot, 2026-10-25
+    'com.apple.fairplayd.H2': True,             # exits at once, never reads its port: every sync FairPlay call
+                                                # (lockdownd, checkpointd -> Notes, Photos) hung forever, 2026-10-26
 }
-OURS_DISABLED = {k: DISABLED[k] for k in ('com.apple.voicemail.vmd', 'com.apple.accessibility.axassetsd')}
+OURS_DISABLED = {k: DISABLED[k] for k in ('com.apple.voicemail.vmd', 'com.apple.accessibility.axassetsd',
+                                          'com.apple.fairplayd.H2')}
 
 # dyld shared cache (iOS 16.7.x 20H392 iPhone10,3). VA unslid; file offset checked against the mapping.
 DYLD_DIRS = ['System/Library/Caches/com.apple.dyld',
@@ -484,6 +487,16 @@ class Overlay:
                 if not self.dry:
                     os.rename(os.path.join(src, n), self.p(f'{APPS}/{n}'))
         self.mkdirs('Applications/MetalDemo.app')
+        # Foundation's item-replacement directory for a not-yet-existing URL in an app container walks up to
+        # Containers/Data and mkdirs tmp there as mobile: root-owned, EACCES, and Notes' drawing died in a
+        # Coherence try! (2026-10-26, found with kernel 0152 sweettrace=MobileNotes)
+        rel = 'private/var/mobile/Containers/Data/tmp'
+        if os.path.isdir(self.p('private/var/mobile/Containers/Data')) and not os.path.isdir(self.p(rel)):
+            self.say('mkdir', '/' + rel, '(501:501 755)')
+            self.done += 1
+            if not self.dry:
+                os.mkdir(self.p(rel), 0o755)
+                self.own(self.p(rel), 0o755, 501, 501)
         self.files('apps')
 
     def g_dyld(self):

@@ -48,10 +48,10 @@ index fdd0639..cb7ca58 100644
  	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
  	fReal = real == 1 && sweet_spmi_init() == 0;
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index bb89899..4f59054 100644
+index bb89899..3edb67f 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -673,9 +673,12 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -673,11 +673,14 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  	 * shaped (or named CAMetalLayer...), kept otherwise; each decision logged, the first 24.
  	 */
  	OSString *name = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
@@ -65,13 +65,22 @@ index bb89899..4f59054 100644
 +	    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4);
 +	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && one_plane) {
  		static unsigned told;
- 		if (told < 24 || drawable) {
+-		if (told < 24 || drawable) {
++		if (told < 24 || drawable || s->width >= 1000) {
  			told++;
-@@ -714,9 +717,19 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			IOLog("SWEET SURF: %ux%u asked %u bytes a row (not a multiple of %u), name %s: %s\n", s->width,
+ 			    s->height, s->bytesPerRow, SWEET_SURFACE_ROW_ALIGN, name ? name->getCStringNoCopy() : "(none)",
+@@ -714,9 +717,25 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  			}
  			p->bytesPerRow = sweet_dict_u32(pd, "IOSurfacePlaneBytesPerRow",
  			    sweet_row_bytes(p->width, p->elementWidth, p->bytesPerElement));
 +			bool rounded = false;
++			if (planes->getCount() == 1 && (p->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 &&
++			    (drawable || s->width >= 1000)) {
++				OSString *pn = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
++				IOLog("SWEET SURF: %ux%u plane 0 asked %u bytes a row, name %s: %s\n", s->width, s->height,
++				    p->bytesPerRow, pn ? pn->getCStringNoCopy() : "(none)", drawable ? "rounded up" : "kept");
++			}
 +			if (drawable && planes->getCount() == 1 && (p->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0) {
 +				/* the drawable's own row, as the surface's above (0157) */
 +				p->bytesPerRow = (uint32_t)((p->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &

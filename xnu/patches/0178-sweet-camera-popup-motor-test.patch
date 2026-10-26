@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 6e56277..362bcde 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -43,7 +43,8 @@
+  *   sweetcam_rails=0 (do not vote RPMh rails: assume the bootloader left them on),
+  *   sweetcam_fake=1 (with =5: synthetic frames, no hardware touched -- tests the iOS side alone),
+  *   sweetcam_swapi2c=1 (if SDA/SCL turn out the other way round),
+- *   sweetpopup=1 (raise the front camera's pop-up for its sessions, lower it after: the DRV8846 motor).
++ *   sweetpopup=1 (raise the front camera's pop-up for its sessions, lower it after: the DRV8846 motor),
++ *   sweetpopup=2 (the motor alone: up, 2 s, down, then nothing else; with sweetcam >= 2).
+  *
+  * Safety rules kept from HackiOS: only DT voltages; only the registers named here are written; every
+  * write that should read back is read back; any fault -> everything switched off in reverse order and
+@@ -696,7 +697,7 @@ pgpio_restore(unsigned gpio)
+ #define LPG_PREDIV_SLOW         0x23            /* prediv 3 (index 1), exponent 3: 640 us */
+ #define LPG_PREDIV_FAST         0x01            /* prediv 1, exponent 1: 53.33 us */
+ 
+-static bool popup_enabled, popup_is_up, popup_pins_set;
++static bool popup_enabled, popup_test, popup_is_up, popup_pins_set;
+ 
+ /* One byte of one of the two peripherals the motor needs (PM6150L GPIO 10, LPG 2), by our own channel. */
+ static bool
+@@ -3303,8 +3304,17 @@ camera_thread(__unused void *parameter, __unused wait_result_t result)
+ 	} else {
+ 		look_readonly();
+ 	}
++	/* sweetpopup=2: only the motor, up, 2 s, down; no camera power (to tell the motor from the sensor) */
++	if (popup_test && !broken) {
++		say("pop-up test: up\n");
++		(void)popup_move(true);
++		wait_ms(2000);
++		say("pop-up test: down\n");
++		(void)popup_move(false);
++		say("pop-up test: done\n");
++	}
+ 	/* level 1 stops here; everything below writes */
+-	if (level >= 2 && gcc != 0 && camcc != 0 && !broken && gcc_camera_ahb()) {
++	if (level >= 2 && !popup_test && gcc != 0 && camcc != 0 && !broken && gcc_camera_ahb()) {
+ 		find_pins();
+ 		if (level == 2) {
+ 			if (ctab_load(hw->tab) && power_up()) {
+@@ -3346,6 +3356,7 @@ sweet_camera_init(void)
+ 	pmic_reads = PE_parse_boot_argn("sweetcam_pmic", &v, sizeof(v)) && v != 0;
+ 	v = 0;
+ 	popup_enabled = level >= 2 && PE_parse_boot_argn("sweetpopup", &v, sizeof(v)) && v != 0;
++	popup_test = popup_enabled && v == 2;
+ 	if (kernel_thread_start(camera_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

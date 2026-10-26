@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5740 @@
+@@ -0,0 +1,5901 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -63,6 +63,7 @@
 +#include <kern/sched_prim.h>
 +#include <kern/locks.h>
 +#include <sys/vnode.h>
++#include <sys/uio.h>                    /* UIO_READ / UIO_SYSSPACE for vn_rdwr (WiFi step 4) */
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <vm/pmap.h>
@@ -5403,6 +5404,160 @@
 +	return true;
 +}
 +
++/*
++ * Wi-Fi, step 4 (boot-arg sweetwifi=3): read the modem image from the iOS filesystem and check it
++ * against its own header (HackiOS redwood_wifi.c step_firmware, davinci). Reads only -- the files,
++ * and vnode stats of the segment files; NO hardware and NOT the modem. It only proves the image is
++ * whole and fits the reserved region, so the later PAS steps (header-to-TZ, segment copy, auth+reset)
++ * have something valid to work from.
++ *
++ * davinci reads from the iOS filesystem (vnode), not from the RAM disk as redwood does: the files are
++ * pushed to /usr/local/gltest/ by the dev loop (see sweet_push_exec_bit for the vnode idiom). So this
++ * runs on its OWN thread that waits for rootvnode -- never inline in the GPU bring-up, which is early.
++ *
++ * The image (Qualcomm mdt_loader): a 32-bit ELF whose header + program-header table + hash/cert blob
++ * are modem.mdt, and whose loadable segments are a file each, modem.bNN for header index NN (only the
++ * segments with file bytes get one). Device facts (2026-10-26): modem.mdt 9100 B, 31 program headers
++ * at 52 (32 B each); hash segment is index 1 (modem.b01, 8056 B); 52 + 32*31 + 8056 = 9100.
++ */
++#define WMODEM_REGION_PA   0x8b000000u          /* dt modem_region@8b000000 */
++#define WMODEM_REGION_SIZE 0x08400000u          /* 132 MiB */
++#define WMODEM_PAS_ID      4u                   /* dt qcom,mss@4080000 pas-id 4 (a later step uses it) */
++#define WMDT_DIR           "/usr/local/gltest/"
++#define WMDT_MAX_SEG       48u
++#define WMDT_HASH(f)       ((((f) >> 24) & 7u) == 2u)   /* the program header that is the hash/cert blob */
++
++struct wmdt_phdr { uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align; };
++static uint8_t wifi_mdt[0x4000];                /* modem.mdt (device's is 9100 B; cap 16 KiB) */
++
++/* Read up to `cap` bytes of a file into `buf`; *got = bytes read. 0 on success. (reads only) */
++static int
++wifi_read_file(const char *path, uint8_t *buf, uint32_t cap, uint64_t *got)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int e, resid = (int)cap;
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return -1;
++	}
++	e = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)cap, 0, UIO_SYSSPACE, IO_NODELOCKED,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_put(vp);
++	if (e != 0) {
++		return -1;
++	}
++	*got = (uint64_t)cap - (uint64_t)resid;
++	return 0;
++}
++
++/* Stat a file's size without reading it. 0 on success. */
++static int
++wifi_file_size(const char *path, uint64_t *size)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode_attr va;
++	int e;
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return -1;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	e = vnode_getattr(vp, &va, ctx);
++	vnode_put(vp);
++	if (e != 0 || !VATTR_IS_SUPPORTED(&va, va_data_size)) {
++		return -1;
++	}
++	*size = va.va_data_size;
++	return 0;
++}
++
++static void
++wifi_firmware_read_validate(void)
++{
++	char path[64];
++	uint64_t mdtsz = 0, total_file = 0;
++	uint32_t phnum, phoff, phentsize, hashsz = 0, lowest = ~0u, highest = 0, loadable = 0;
++
++	printf("SWEET WIFI: [4] read + validate the modem image at %smodem.{mdt,bNN} (reads only; modem untouched)\n", WMDT_DIR);
++	snprintf(path, sizeof(path), "%smodem.mdt", WMDT_DIR);
++	if (wifi_read_file(path, wifi_mdt, sizeof(wifi_mdt), &mdtsz) != 0) {
++		printf("SWEET WIFI: [4] cannot read %s -- push modem.mdt + modem.bNN into %s\n", path, WMDT_DIR);
++		return;
++	}
++	phnum     = mdtsz >= 46u ? (uint32_t)(wifi_mdt[44] | wifi_mdt[45] << 8) : 0u;
++	phentsize = mdtsz >= 44u ? (uint32_t)(wifi_mdt[42] | wifi_mdt[43] << 8) : 0u;
++	phoff     = mdtsz >= 32u ? (uint32_t)(wifi_mdt[28] | wifi_mdt[29] << 8 | wifi_mdt[30] << 16 | wifi_mdt[31] << 24) : 0u;
++	if (memcmp(wifi_mdt, "\177ELF\1", 5) != 0 || phnum < 3u || phnum > WMDT_MAX_SEG || phentsize != 32u ||
++	    (uint64_t)phoff + 32ull * phnum > mdtsz) {
++		printf("SWEET WIFI: [4] %s is not a 32-bit MDT header (%02x %02x %02x %02x, phnum %u, phentsize %u, %llu bytes)\n",
++		    path, wifi_mdt[0], wifi_mdt[1], wifi_mdt[2], wifi_mdt[3], phnum, phentsize, mdtsz);
++		return;
++	}
++	printf("SWEET WIFI: [4] %s: ELF32, %u program headers at %#x, %llu bytes\n", path, phnum, phoff, mdtsz);
++	for (uint32_t i = 0; i < phnum; i++) {
++		struct wmdt_phdr ph;
++		uint64_t fsz = 0;
++		memcpy(&ph, wifi_mdt + phoff + 32u * i, sizeof(ph));
++		if (WMDT_HASH(ph.flags)) {
++			hashsz = ph.filesz;
++		}
++		if (ph.type != 1u || WMDT_HASH(ph.flags) || ph.memsz == 0u) {
++			continue;               /* not a loaded segment */
++		}
++		if (ph.paddr < WMODEM_REGION_PA || ph.filesz > ph.memsz ||
++		    (uint64_t)ph.paddr + ph.memsz > (uint64_t)WMODEM_REGION_PA + WMODEM_REGION_SIZE) {
++			printf("SWEET WIFI: [4] segment %u (paddr %#x, %#x bytes) is NOT within the modem region %#x+%#x -- stop\n",
++			    i, ph.paddr, ph.memsz, WMODEM_REGION_PA, WMODEM_REGION_SIZE);
++			return;
++		}
++		if (ph.filesz != 0u) {
++			snprintf(path, sizeof(path), "%smodem.b%02u", WMDT_DIR, i);
++			if (wifi_file_size(path, &fsz) != 0) {
++				printf("SWEET WIFI: [4] segment %u needs %s but it is not there -- stop\n", i, path);
++				return;
++			}
++			if (fsz != ph.filesz) {
++				printf("SWEET WIFI: [4] %s is %llu bytes, the header says %u -- stop\n", path, fsz, ph.filesz);
++				return;
++			}
++			total_file += fsz;
++		}
++		lowest  = ph.paddr < lowest ? ph.paddr : lowest;
++		highest = ph.paddr + ph.memsz > highest ? ph.paddr + ph.memsz : highest;
++		loadable++;
++	}
++	if (loadable == 0u || lowest != WMODEM_REGION_PA || (uint64_t)phoff + 32ull * phnum + hashsz != mdtsz) {
++		printf("SWEET WIFI: [4] not what PAS takes: %u loadable segments, lowest %#x (want %#x); %u + %u*32 + hashes %u vs %llu\n",
++		    loadable, lowest, WMODEM_REGION_PA, phoff, phnum, hashsz, mdtsz);
++		return;
++	}
++	printf("SWEET WIFI: [4] THE MODEM IMAGE IS WHOLE: %u loadable segments, %llu bytes of segment files, header %llu B "
++	    "(hashes %u), spans %#x..%#x (%#x of the %#x-byte region). Ready for PAS (pas-id %u) -- NOT started.\n",
++	    loadable, total_file, mdtsz, hashsz, lowest, highest,
++	    ((highest + 0xfffu) & ~0xfffu) - WMODEM_REGION_PA, WMODEM_REGION_SIZE, WMODEM_PAS_ID);
++}
++
++extern vnode_t rootvnode;       /* also declared near sweet_push_exec_bit; a second extern is harmless */
++static void
++wifi_fw_thread(void *arg, wait_result_t wr)
++{
++	unsigned tries;
++	(void)arg; (void)wr;
++	for (tries = 0; tries < 600u; tries++) {        /* up to ~60 s for the iOS root volume */
++		if (rootvnode != NULLVP) {
++			wifi_firmware_read_validate();
++			break;
++		}
++		delay_for_interval(100, NSEC_PER_MSEC);
++	}
++	if (tries >= 600u) {
++		printf("SWEET WIFI: [4] the iOS root volume did not appear within 60 s -- firmware not read\n");
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
 +static bool
 +wsmem_peek(uint32_t off, void *to, uint32_t size)
 +{
@@ -5666,6 +5821,12 @@
 +			wifi_survey();
 +			if (w >= 2u) {        /* sweetwifi=2: the first write -- open the AOP QMP channel */
 +				(void)wifi_mailbox_open();
++			}
++			if (w >= 3u) {        /* sweetwifi=3: read+validate the modem image (own thread: needs the iOS root) */
++				thread_t wt;
++				if (kernel_thread_start(wifi_fw_thread, NULL, &wt) == KERN_SUCCESS) {
++					thread_deallocate(wt);
++				}
 +			}
 +		}
 +	}

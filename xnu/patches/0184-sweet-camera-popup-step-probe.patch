@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 1c5a410..8958453 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -791,7 +791,7 @@ popup_pins(void)
+ 	}
+ 	/* PM6150L GPIO 10 (pwm_out_gpio10_default): func1 = the LPG, VIN1, no pull, push-pull, strength 3 */
+ 	static const uint8_t regs[6] = { 0x41, 0x42, 0x40, 0x44, 0x45, 0x46 };
+-	static const uint8_t vals[6] = { 0x01, 0x05, 0x01, 0x02, 0x03, 0x80 };
++	static const uint8_t vals[6] = { 0x01, 0x05, 0x02, 0x02, 0x03, 0x80 };    /* mode 2: in+out, to read it back */
+ 	if (popup_stop < 2) { say("pop-up: stopping after step 1\n"); return false; }
+ 	say("pop-up step 2: LPG2 subtype %#x; PM6150L GPIO 10 to func1\n", subtype);
+ 	for (int i = 0; i < 6; i++) {
+@@ -828,7 +828,9 @@ popup_pins(void)
+ 	popup_out(POPUP_MODE1, true);
+ 	popup_out(POPUP_DIR, false);
+ 	popup_out(POPUP_PWREN, true);
+-	say("pop-up: LPG2 subtype %#x, motor pins set, driver powered\n", subtype);
++	popup_wait_ms(20);                                              /* the driver's supply up first */
++	say("pop-up: LPG2 subtype %#x, motor pins set, driver powered (TLMM 90 reads %u, 43 %u)\n", subtype,
++	    rd(GPIO_IO(POPUP_PWREN)) & 1, rd(GPIO_IO(POPUP_FAULT)) & 1);
+ 	popup_pins_set = true;
+ 	return !broken;
+ }
+@@ -855,7 +857,25 @@ popup_move(bool up)
+ 		say("pop-up step 8: fast\n");
+ 		ok = popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_PREDIV_CLK), LPG_PREDIV_FAST) &&
+ 		    popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SYNC), 1);
+-		popup_wait_ms(up ? 737 : 742);
++		{
++			/* (diagnosis: does the LPG's step signal reach PM6150L GPIO 10? its level, 40 times over the fast phase) */
++			unsigned highs = 0, reads = 0, faults = 0;
++			uint8_t v = 0, en = 0, pre = 0;
++
++			for (int k = 0; k < 40; k++) {
++				popup_wait_ms((up ? 737u : 742u) / 40u);
++				if (spmi_read(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | 0x10), &v)) {
++					reads++;
++					highs += v & 1;
++				}
++				faults += (rd(GPIO_IO(POPUP_FAULT)) & 1) == 0;
++			}
++			(void)spmi_read(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), &en);
++			(void)spmi_read(SID_PM6150L_B, LPG(LPG_PWM_PREDIV_CLK), &pre);
++			say("pop-up: step pin high %u of %u reads, nFAULT low %u of 40; LPG2 enable %#x prediv %#x; TLMM 88 %u 90 %u 55 %u\n",
++			    highs, reads, faults, en, pre, rd(GPIO_IO(POPUP_SLEEP)) & 1, rd(GPIO_IO(POPUP_PWREN)) & 1,
++			    rd(GPIO_IO(POPUP_DIR)) & 1);
++		}
+ 		say("pop-up step 9: slow\n");
+ 		ok = popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_PREDIV_CLK), LPG_PREDIV_SLOW) &&
+ 		    popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SYNC), 1) && ok;

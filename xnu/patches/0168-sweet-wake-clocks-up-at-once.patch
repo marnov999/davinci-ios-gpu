@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 340abb5..f190eb3 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2869,6 +2869,7 @@ extern uint32_t sweet_surface_gpu_seed(void *surface);
+ extern void     sweet_surface_gpu_flush(void *surface);
+ extern int64_t  sweet_surface_gpu_push_written(void *surface);   /* bytes, -1: push it all out */
+ void sweet_dvfs_kick(void);     /* the clock governor (sweet_cpufreq's): something is being drawn */
++void sweet_dvfs_wake_now(void); /* and back from the display-off clocks at once (a wake) */
+ 
+ /*
+  * One lock around everything that is the GPU's: the ring, the fence, the address space and
+@@ -3170,9 +3171,10 @@ sweet_panel_power(int on)
+ 		 * dark, seen 2026-10-26: the screen never came back). */
+ 		g_wake_at = mach_absolute_time();
+ 		g_wake_pending = 1u;
++		g_panel_off = false;
++		sweet_dvfs_wake_now();
+ 		int up = panel_power_up();
+ 		g_panel_asleep = false;
+-		g_panel_off = false;
+ 		printf("SWEET PANEL: awake after power-up (%d); dark until the first frame\n", up);
+ 		sweet_touch_resume();
+ 		return 0;
+@@ -3180,6 +3182,8 @@ sweet_panel_power(int on)
+ 	if (g_panel_asleep) {
+ 		g_wake_at = mach_absolute_time();
+ 		g_wake_pending = 1u;
++		g_panel_off = false;
++		sweet_dvfs_wake_now();
+ 		int a = panel_dcs_cmd(0x11, true);
+ 		gmub_udelay(120000);                    /* exit sleep -> display on: 120 ms (MIPI DCS) */
+ 		int b = panel_dcs_cmd(0x29, true);      /* the refresh comes back with the first frame */
+@@ -6229,6 +6233,17 @@ sweet_dvfs_kick(void)
+ 	}
+ }
+ 
++/* The display is coming on: the clocks up now, not at the governor's next 100 ms tick -- the first
++ * frame after a wake (which lights the panel) was drawn at the display-off clocks otherwise. */
++void
++sweet_dvfs_wake_now(void)
++{
++	g_dvfs_active = mach_absolute_time();
++	if (g_dvfs_on) {
++		thread_wakeup((event_t)&g_dvfs_chan);
++	}
++}
++
+ static void
+ osm_set(unsigned c, uint32_t row)
+ {

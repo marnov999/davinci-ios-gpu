@@ -1,0 +1,75 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..ba4ce37 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -90,7 +90,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {   /* 0x60: RTC_RW (reads) */
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index de569e5..fdd0639 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -15,6 +15,49 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" void clock_set_calendar_microtime(unsigned long secs, uint32_t microsecs);
++
++/*
++ * The time of day, from the PMIC's RTC (PM6150 RTC_RW at 0x6000: RTC_EN is 0x46 bit 7, the
++ * seconds counter RDATA0..3 at 0x48..0x4b, rtc-pm8xxx's pmic5 layout), read twice around byte 0
++ * so a carry between the reads is caught. Without it every boot began at the epoch ("December
++ * 31, 1969" in Notes, in the lock screen, in every file's date). Whether MIUI keeps this counter
++ * at UTC is what the log line answers: Qualcomm's time_daemon may instead keep it free-running
++ * and the wall time as an offset in its own data. Set only when it reads as a date after 2020;
++ * boot-arg sweettime_offset=N (seconds) is added first.
++ */
++static void
++sweet_rtc_set_clock(void)
++{
++	uint8_t b[4], again = 0, ctrl = 0;
++	bool ok = false;
++	if (sweet_spmi_init() != 0) {
++		IOLog("SWEET RTC: no SPMI\n");
++		return;
++	}
++	for (int tries = 0; tries < 3 && !ok; tries++) {
++		ok = true;
++		for (unsigned i = 0; i < 4; i++) {
++			ok = ok && sweet_spmi_read(0, 0x6048 + i, &b[i]) == 0;
++		}
++		ok = ok && sweet_spmi_read(0, 0x6048, &again) == 0 && again == b[0];
++	}
++	(void)sweet_spmi_read(0, 0x6046, &ctrl);
++	if (!ok) {
++		IOLog("SWEET RTC: unreadable (ctrl %#x)\n", ctrl);
++		return;
++	}
++	uint32_t raw = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++	int64_t offset = 0;
++	(void)PE_parse_boot_argn("sweettime_offset", &offset, sizeof(offset));
++	int64_t secs = (int64_t)raw + offset;
++	bool plausible = secs >= 1577836800 && secs < 4102444800;   /* 2020 .. 2100 */
++	IOLog("SWEET RTC: counter %u s (enable %d), offset %lld -> %lld: %s\n", raw, (ctrl >> 7) & 1,
++	    (long long)offset, (long long)secs, plausible ? "the time of day set" : "not a date, left alone");
++	if (plausible) {
++		clock_set_calendar_microtime((unsigned long)secs, 0);
++	}
++}
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -267,6 +310,7 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
++	sweet_rtc_set_clock();
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;

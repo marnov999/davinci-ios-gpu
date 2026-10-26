@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5597 @@
+@@ -0,0 +1,5740 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5206,16 +5206,63 @@
 +	return v == QMP_UP ? "UP" : v == QMP_DOWN ? "DOWN" : "?";
 +}
 +
++static vm_offset_t waop_base;    /* AOP QMP msgram (0xc300000), mapped once */
++static vm_offset_t wapcs_base;   /* APCS IPC doorbell page (0x17c00000), mapped once */
++static uint32_t    wifi_our_box; /* offset of our mailbox inside the msgram, set when the channel is open */
++
++static void
++wmmio_wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
++/* Map the two always-on blocks once; reused by the survey and the open. */
++static bool
++wifi_map_blocks(void)
++{
++	if (!waop_base) {
++		waop_base = ml_io_map(WAOP_MSGRAM_PHYS, WAOP_MSGRAM_SIZE);
++	}
++	if (!wapcs_base) {
++		wapcs_base = ml_io_map(WAPCS_IPC_PHYS & ~0xfffu, PAGE_SIZE);
++	}
++	return waop_base != 0;
++}
++
++/* Ring the always-on processor's doorbell: davinci sets bit 0 of the single APCS IPC register. */
++static void
++wifi_ring_aop(void)
++{
++	if (wapcs_base) {
++		wmmio_wr32(wapcs_base, WAPCS_IPC_PHYS & 0xfffu, 1u << 0);
++	}
++}
++
++/* Poll a QMP descriptor word until it reads `want`, up to `ms` ms (200 us steps). */
++static bool
++wifi_qmp_wait(uint32_t off, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i <= ms * 5u; i++) {
++		if (wmmio_rd32(waop_base, off) == want) {
++			return true;
++		}
++		delay_for_interval(200, NSEC_PER_USEC);
++	}
++	return false;
++}
++
 +static void
 +wifi_mailbox_survey(void)
 +{
 +	vm_offset_t aop, ipc;
 +	uint32_t magic, ver, feat, boxsz, boxoff;
 +
++	(void)wifi_map_blocks();
 +	/* --- the always-on processor's QMP mailbox description (reads only) --- */
 +	printf("SWEET WIFI: [2] the always-on processor's QMP mailbox at %#x, %#x bytes (reads only)\n",
 +	    WAOP_MSGRAM_PHYS, WAOP_MSGRAM_SIZE);
-+	aop = ml_io_map(WAOP_MSGRAM_PHYS, WAOP_MSGRAM_SIZE);
++	aop = waop_base;
 +	if (!aop) {
 +		printf("SWEET WIFI: [2] cannot map the AOP mailbox\n");
 +	} else {
@@ -5252,7 +5299,7 @@
 +	/* --- the one APCS doorbell register davinci rings every processor through (reads only) --- */
 +	printf("SWEET WIFI: [2] the APCS global IPC doorbell at %#x (reads only; bit 0 = AOP, 14 = modem SMP2P, 12 = modem GLINK)\n",
 +	    WAPCS_IPC_PHYS);
-+	ipc = ml_io_map(WAPCS_IPC_PHYS & ~0xfffu, PAGE_SIZE);
++	ipc = wapcs_base;
 +	if (!ipc) {
 +		printf("SWEET WIFI: [2] cannot map the APCS IPC register\n");
 +	} else {
@@ -5261,6 +5308,99 @@
 +		    d, (d >> 0) & 1u, (d >> 14) & 1u, (d >> 12) & 1u);
 +	}
 +	printf("SWEET WIFI: [2] survey done, reads only -- modem has not been touched\n");
++}
++
++/*
++ * Wi-Fi, step 3 (boot-arg sweetwifi=2): THE FIRST WRITE. Open the QMP channel to the always-on
++ * processor, Linux's qmp_open() a step at a time (HackiOS redwood_wifi.c step_mailbox_open): ack
++ * their link, raise ours and wait for their ack, raise our channel and wait for theirs, ack that
++ * and wait for their ack of ours. Each write is announced first; every write is to the AOP QMP
++ * descriptor or its doorbell only -- the modem is still NOT touched (that is a later step, gated
++ * higher). On any timeout we take our side back down so the AOP is left as we found it. The AOP
++ * is restarted only with the phone, so a channel a kernel before us opened is found open and left.
++ *
++ * Survey (2026-10-26) found: AOP link UP, our link/channel DOWN, doorbell clear -- the clean state
++ * to open from. our box = 0x128, size 0x2d8. Opening the AOP does not reset anything; it is the
++ * prerequisite for later telling the AOP "the modem image is loading" before the PAS auth+reset.
++ */
++static bool
++wifi_mailbox_open(void)
++{
++	uint32_t box, size, tl, ol, ola, tc, oca;
++
++	printf("SWEET WIFI: [3] OPEN the always-on processor's QMP channel (FIRST WRITE; AOP + its doorbell only)\n");
++	if (!wifi_map_blocks() || !wapcs_base) {
++		printf("SWEET WIFI: [3] cannot map the AOP mailbox / doorbell -- not opening\n");
++		return false;
++	}
++	if (wmmio_rd32(waop_base, QMP_MAGIC) != QMP_MAGIC_VALUE || wmmio_rd32(waop_base, QMP_VERSION) != 1u) {
++		printf("SWEET WIFI: [3] not a QMP descriptor this knows -- not opening\n");
++		return false;
++	}
++	box  = wmmio_rd32(waop_base, QMP_OUR_BOX);
++	size = wmmio_rd32(waop_base, QMP_OUR_BOX_SIZE);
++	if (size < 68u || box < 0x3cu || (uint64_t)box + size > WAOP_MSGRAM_SIZE || (box & 3u)) {
++		printf("SWEET WIFI: [3] our mailbox (%#x/%#x) is not where a message fits -- not opening\n", box, size);
++		return false;
++	}
++
++	/* Already fully open (a kernel before us)? Find it so, leave it. */
++	if (wmmio_rd32(waop_base, QMP_OUR_LINK) == QMP_UP && wmmio_rd32(waop_base, QMP_OUR_LINK_ACK) == QMP_UP &&
++	    wmmio_rd32(waop_base, QMP_OUR_CHANNEL) == QMP_UP && wmmio_rd32(waop_base, QMP_THEIR_CHANNEL) == QMP_UP &&
++	    wmmio_rd32(waop_base, QMP_OUR_CHAN_ACK) == QMP_UP) {
++		wifi_our_box = box;
++		printf("SWEET WIFI: [3] the channel is open already (opened before this kernel); our box %#x\n", box);
++		return true;
++	}
++
++	/* 1) acknowledge their link, then raise ours; ring; wait for their ack. */
++	tl = wmmio_rd32(waop_base, QMP_THEIR_LINK);
++	printf("SWEET WIFI: [3] write their-link-ack = %#x, our-link = UP, ring AOP doorbell\n", tl);
++	wmmio_wr32(waop_base, QMP_THEIR_LINK_ACK, tl);
++	wmmio_wr32(waop_base, QMP_OUR_LINK, QMP_UP);
++	wifi_ring_aop();
++	if (!wifi_qmp_wait(QMP_OUR_LINK_ACK, QMP_UP, 1000)) {
++		ola = wmmio_rd32(waop_base, QMP_OUR_LINK_ACK);
++		printf("SWEET WIFI: [3] AOP did NOT ack our link within 1 s (ack=%#x); taking our link down\n", ola);
++		wmmio_wr32(waop_base, QMP_OUR_LINK, QMP_DOWN);
++		wifi_ring_aop();
++		return false;
++	}
++	printf("SWEET WIFI: [3] AOP has seen our link\n");
++
++	/* 2) raise our channel; ring; wait for theirs. */
++	printf("SWEET WIFI: [3] write our-channel = UP, ring\n");
++	wmmio_wr32(waop_base, QMP_OUR_CHANNEL, QMP_UP);
++	wifi_ring_aop();
++	if (!wifi_qmp_wait(QMP_THEIR_CHANNEL, QMP_UP, 1000)) {
++		tc = wmmio_rd32(waop_base, QMP_THEIR_CHANNEL);
++		printf("SWEET WIFI: [3] AOP did NOT open its channel within 1 s (theirs=%#x); taking ours down\n", tc);
++		wmmio_wr32(waop_base, QMP_OUR_CHANNEL, QMP_DOWN);
++		wmmio_wr32(waop_base, QMP_OUR_LINK, QMP_DOWN);
++		wifi_ring_aop();
++		return false;
++	}
++	printf("SWEET WIFI: [3] AOP has opened its channel\n");
++
++	/* 3) acknowledge their channel; ring; wait for their ack of ours. */
++	printf("SWEET WIFI: [3] write their-channel-ack = UP, ring\n");
++	wmmio_wr32(waop_base, QMP_THEIR_CHAN_ACK, QMP_UP);
++	wifi_ring_aop();
++	if (!wifi_qmp_wait(QMP_OUR_CHAN_ACK, QMP_UP, 1000)) {
++		oca = wmmio_rd32(waop_base, QMP_OUR_CHAN_ACK);
++		printf("SWEET WIFI: [3] AOP did NOT ack our channel within 1 s (ack=%#x); taking ours down\n", oca);
++		wmmio_wr32(waop_base, QMP_OUR_CHANNEL, QMP_DOWN);
++		wmmio_wr32(waop_base, QMP_OUR_LINK, QMP_DOWN);
++		wifi_ring_aop();
++		return false;
++	}
++
++	ol  = wmmio_rd32(waop_base, QMP_OUR_LINK);
++	oca = wmmio_rd32(waop_base, QMP_OUR_CHAN_ACK);
++	wifi_our_box = box;
++	printf("SWEET WIFI: [3] THE QMP CHANNEL TO THE AOP IS OPEN (our link=%#x chan-ack=%#x box=%#x); modem still untouched\n",
++	    ol, oca, box);
++	return true;
 +}
 +
 +static bool
@@ -5524,6 +5664,9 @@
 +		uint32_t w = 0;
 +		if (PE_parse_boot_argn("sweetwifi", &w, sizeof(w)) && w >= 1u) {
 +			wifi_survey();
++			if (w >= 2u) {        /* sweetwifi=2: the first write -- open the AOP QMP channel */
++				(void)wifi_mailbox_open();
++			}
 +		}
 +	}
 +	gpu_probe();

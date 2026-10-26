@@ -1,0 +1,41 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 99a6eb4..d77673d 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -678,7 +678,7 @@ pgpio_restore(unsigned gpio)
+  * both 2.4 % slower, so every phase is 2.4 % longer: the same number of steps.
+  */
+ #define SID_PM6150L_B           5
+-#define POPUP_LPG               0xb2u           /* LPG2 */
++#define POPUP_LPG               0xbdu           /* pm6150l_pwm = qcom,pwms@bc00 (2 channels), index 1: 0xbd00 */
+ #define POPUP_PGPIO             10
+ #define POPUP_DIR               55
+ #define POPUP_MODE0             91
+@@ -709,7 +709,8 @@ popup_spmi_put(unsigned sid, uint16_t address, uint8_t value)
+ 	uint8_t back = 0;
+ 
+ 	if (!((sid == SID_PM6150L && (address >> 8) == PGPIO_PERIPH(POPUP_PGPIO)) ||
+-	    (sid == SID_PM6150L_B && (address >> 8) >= 0xb1u && (address >> 8) <= 0xb3u))) {
++	    (sid == SID_PM6150L_B && (((address >> 8) >= 0xb1u && (address >> 8) <= 0xb3u) ||
++	    (address >> 8) == 0xbcu || (address >> 8) == 0xbdu)))) {
+ 		give_up("a PMIC peripheral the pop-up does not use");
+ 		return false;
+ 	}
+@@ -845,7 +846,7 @@ popup_pins(void)
+ static void
+ popup_probe(void)
+ {
+-	static const uint8_t lpgs[3] = { 0xb1, 0xb2, 0xb3 };
++	static const uint8_t lpgs[2] = { 0xbc, 0xbd };     /* pm6150l_pwm (qcom,pwms@bc00): the motor's is index 1 */
+ 	/* size/clock (9 bits): 19.2 MHz | 32.768 kHz; prediv/exponent: 19.2 MHz prediv 3 exp 3 (640 us), 32 kHz prediv 1 exp 0 */
+ 	static const uint8_t clocks[2][2] = { { 3, 0x23 }, { 2, 0x00 } };
+ 
+@@ -872,7 +873,7 @@ popup_probe(void)
+ 		say("pop-up probe: GPIO10 driven %s: RT_STS high %u of %u; 0x08..0x0b %02x %02x %02x %02x\n", level ? "high" : "low",
+ 		    highs, reads, sts[0], sts[1], sts[2], sts[3]);
+ 	}
+-	for (unsigned c = 0; c < 3; c++) {
++	for (unsigned c = 0; c < 2; c++) {
+ 		uint8_t subtype = 0;
+ 
+ 		if (!spmi_read(SID_PM6150L_B, (uint16_t)(lpgs[c] << 8 | LPG_SUBTYPE), &subtype)) {

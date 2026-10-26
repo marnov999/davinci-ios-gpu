@@ -1,0 +1,100 @@
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 36aa8a4..3c8bb8b 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -145,7 +145,7 @@ sweet_trace_path_args(unsigned short code, int *second)
+ static void
+ sweet_trace_fail(struct proc *p, unsigned short code, struct uthread *ut, int error)
+ {
+-	static char path[2][160];
++	static char path[2][1024];
+ 	size_t n;
+ 	int second, first;
+ 
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 8b5695b..c385f80 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -24,6 +24,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
++#include <kern/kalloc.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+@@ -285,8 +286,59 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++/*
++ * Extension issue (op 5): libsystem_sandbox's __sandbox_extension_issue mallocs a 2 KB buffer, passes
++ * {class, ?, path, flags, buffer, ...} and on success hands the buffer back as the token without
++ * having written a byte of it. tccd issues one to every client it grants a service to (Photos,
++ * AddressBook, ...); ENOENT here made each grant "server error: Failed to issue Sandbox Extension"
++ * (kTCCErrorDomain 6), i.e. denied -- assetsd then aborts ("requires TCCPhotosService access") and
++ * Photos opens no library. There is no sandbox to extend, so the token only has to be well formed
++ * for whoever consumes it (op 6, which succeeds): Apple's shape, the class and the path in it.
++ */
++struct sweet_sb_issue_args {
++	uint64_t ext_class;     /* const char * */
++	uint64_t unknown;
++	uint64_t path;          /* const char * */
++	uint64_t flags;
++	uint64_t token;         /* char[2048] out */
++	uint64_t pid_or_token;
++	uint64_t unknown2;
++};
++
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	struct sweet_sb_issue_args a;
++	char cls[128] = "";
++	const size_t token_size = 2048, path_size = 1024;
++	size_t n;
++	int len, error;
++
++	if (arg == USER_ADDR_NULL || copyin(arg, &a, sizeof(a)) != 0 || a.token == 0) {
++		return EINVAL;
++	}
++	char *token = kalloc_data(token_size + path_size, Z_WAITOK | Z_ZERO);
++	if (token == NULL) {
++		return ENOMEM;
++	}
++	char *path = token + token_size;
++	if (a.ext_class != 0 && copyinstr((user_addr_t)a.ext_class, cls, sizeof(cls), &n) != 0) {
++		cls[0] = '\0';
++	}
++	if (a.path != 0 && copyinstr((user_addr_t)a.path, path, path_size, &n) != 0) {
++		path[0] = '\0';
++	}
++	len = snprintf(token, token_size, "0000000000000000000000000000000000000000000000000000000000000000;"
++	    "00;00000000;00000000;00000000;0000000000000000;%s;01;00000000;0000000000000000;%04lx;%s",
++	    cls[0] ? cls : "com.apple.sweet", (unsigned long)strlen(path), path);
++	error = (len < 0 || (size_t)len >= token_size) ? ENAMETOOLONG :
++	    copyout(token, (user_addr_t)a.token, (size_t)len + 1);
++	kfree_data(token, token_size + path_size);
++	return error;
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -295,9 +347,11 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
+-	case 4:         /* container path (audit token / pid) */
+ 	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
++		return sweet_sandbox_extension_issue(arg);
++	case 6:         /* extension consume: nothing to extend, so it is in effect */
++		return 0;
++	case 4:         /* container path (audit token / pid) */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

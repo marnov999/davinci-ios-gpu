@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5901 @@
+@@ -0,0 +1,5978 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5429,6 +5429,8 @@
 +
 +struct wmdt_phdr { uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align; };
 +static uint8_t wifi_mdt[0x4000];                /* modem.mdt (device's is 9100 B; cap 16 KiB) */
++static uint64_t wifi_mdt_size;                  /* set by step 4 when the image validates whole; 0 otherwise */
++static int wifi_level;                          /* sweetwifi=N, so the fw thread knows how far to go */
 +
 +/* Read up to `cap` bytes of a file into `buf`; *got = bytes read. 0 on success. (reads only) */
 +static int
@@ -5472,18 +5474,19 @@
 +	return 0;
 +}
 +
-+static void
++static bool
 +wifi_firmware_read_validate(void)
 +{
 +	char path[64];
 +	uint64_t mdtsz = 0, total_file = 0;
 +	uint32_t phnum, phoff, phentsize, hashsz = 0, lowest = ~0u, highest = 0, loadable = 0;
 +
++	wifi_mdt_size = 0;
 +	printf("SWEET WIFI: [4] read + validate the modem image at %smodem.{mdt,bNN} (reads only; modem untouched)\n", WMDT_DIR);
 +	snprintf(path, sizeof(path), "%smodem.mdt", WMDT_DIR);
 +	if (wifi_read_file(path, wifi_mdt, sizeof(wifi_mdt), &mdtsz) != 0) {
 +		printf("SWEET WIFI: [4] cannot read %s -- push modem.mdt + modem.bNN into %s\n", path, WMDT_DIR);
-+		return;
++		return false;
 +	}
 +	phnum     = mdtsz >= 46u ? (uint32_t)(wifi_mdt[44] | wifi_mdt[45] << 8) : 0u;
 +	phentsize = mdtsz >= 44u ? (uint32_t)(wifi_mdt[42] | wifi_mdt[43] << 8) : 0u;
@@ -5492,7 +5495,7 @@
 +	    (uint64_t)phoff + 32ull * phnum > mdtsz) {
 +		printf("SWEET WIFI: [4] %s is not a 32-bit MDT header (%02x %02x %02x %02x, phnum %u, phentsize %u, %llu bytes)\n",
 +		    path, wifi_mdt[0], wifi_mdt[1], wifi_mdt[2], wifi_mdt[3], phnum, phentsize, mdtsz);
-+		return;
++		return false;
 +	}
 +	printf("SWEET WIFI: [4] %s: ELF32, %u program headers at %#x, %llu bytes\n", path, phnum, phoff, mdtsz);
 +	for (uint32_t i = 0; i < phnum; i++) {
@@ -5509,17 +5512,17 @@
 +		    (uint64_t)ph.paddr + ph.memsz > (uint64_t)WMODEM_REGION_PA + WMODEM_REGION_SIZE) {
 +			printf("SWEET WIFI: [4] segment %u (paddr %#x, %#x bytes) is NOT within the modem region %#x+%#x -- stop\n",
 +			    i, ph.paddr, ph.memsz, WMODEM_REGION_PA, WMODEM_REGION_SIZE);
-+			return;
++			return false;
 +		}
 +		if (ph.filesz != 0u) {
 +			snprintf(path, sizeof(path), "%smodem.b%02u", WMDT_DIR, i);
 +			if (wifi_file_size(path, &fsz) != 0) {
 +				printf("SWEET WIFI: [4] segment %u needs %s but it is not there -- stop\n", i, path);
-+				return;
++				return false;
 +			}
 +			if (fsz != ph.filesz) {
 +				printf("SWEET WIFI: [4] %s is %llu bytes, the header says %u -- stop\n", path, fsz, ph.filesz);
-+				return;
++				return false;
 +			}
 +			total_file += fsz;
 +		}
@@ -5530,12 +5533,83 @@
 +	if (loadable == 0u || lowest != WMODEM_REGION_PA || (uint64_t)phoff + 32ull * phnum + hashsz != mdtsz) {
 +		printf("SWEET WIFI: [4] not what PAS takes: %u loadable segments, lowest %#x (want %#x); %u + %u*32 + hashes %u vs %llu\n",
 +		    loadable, lowest, WMODEM_REGION_PA, phoff, phnum, hashsz, mdtsz);
-+		return;
++		return false;
 +	}
 +	printf("SWEET WIFI: [4] THE MODEM IMAGE IS WHOLE: %u loadable segments, %llu bytes of segment files, header %llu B "
 +	    "(hashes %u), spans %#x..%#x (%#x of the %#x-byte region). Ready for PAS (pas-id %u) -- NOT started.\n",
 +	    loadable, total_file, mdtsz, hashsz, lowest, highest,
 +	    ((highest + 0xfffu) & ~0xfffu) - WMODEM_REGION_PA, WMODEM_REGION_SIZE, WMODEM_PAS_ID);
++	wifi_mdt_size = mdtsz;
++	return true;
++}
++
++/*
++ * Wi-Fi, step 5 (boot-arg sweetwifi=4): ask TrustZone to AUTHENTICATE the modem image, WITHOUT
++ * releasing the modem. PAS is_supported(4) -> init_image(4, mdt) -> mem_setup(4, region). The modem
++ * Q6 stays in reset: there is NO segment copy and NO auth-and-reset here, so nothing on the modem
++ * runs. This proves one thing and only that: TrustZone accepts this device's signed modem image when
++ * it is handed over from our XNU. Mirrors sweet_gpu.c's GPU-zap PAS (gpu_scm_pas), with pas-id 4 and
++ * the modem's mdt/region. davinci's modem is qcom,pil-tz-generic/pas-id 4, so TZ does the whole load;
++ * init_image checks the signature of the metadata blob (modem.mdt: header + program table + hashes).
++ *
++ * THE segment copy into 0x8b000000 and auth-and-reset (SCM 0x42000205) -- which RELEASE the modem and
++ * are the reset-risk operations (a modem later shut down without a stop-ack has bricked restart until
++ * a reboot) -- are a separate, higher-gated step, to run deliberately with sweetgpu_armfb=1 armed.
++ */
++#define WMODEM_SCM_IS_SUPPORTED 0x42000207ull
++#define WMODEM_SCM_INIT_IMAGE   0x42000201ull
++#define WMODEM_SCM_MEM_SETUP    0x42000202ull
++
++static void
++wifi_modem_pas_validate(void)
++{
++	vm_offset_t mdt_cva = 0, mdt_io = 0;
++	uint64_t mdt_pa = 0, x0, x1 = 0;
++	uint64_t i, mdtsz = wifi_mdt_size;
++
++	printf("SWEET WIFI: [5] ask TrustZone to AUTHENTICATE the modem image (pas-id %u); modem STAYS IN RESET -- not released\n",
++	    WMODEM_PAS_ID);
++	if (mdtsz == 0u || mdtsz > sizeof(wifi_mdt)) {
++		printf("SWEET WIFI: [5] no validated modem.mdt from step 4 -- not asking TZ\n");
++		return;
++	}
++	/* The metadata must sit in plain, physically-contiguous DRAM below 4 GiB that TZ can read. */
++	if (gmub_alloc_phys(&mdt_cva, &mdt_pa, 0x4000) != 0 || !(mdt_io = ml_io_map(mdt_pa, 0x4000))) {
++		printf("SWEET WIFI: [5] cannot get a contiguous <4GB buffer for the mdt\n");
++		return;
++	}
++	for (i = 0; i < mdtsz; i++) {
++		((volatile unsigned char *)mdt_io)[i] = wifi_mdt[i];
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	gmub_flush();
++	printf("SWEET WIFI: [5] mdt copied to pa %#llx (%llu bytes), elf %02x%02x%02x%02x (want 7f454c46)\n",
++	    (unsigned long long)mdt_pa, mdtsz, ((volatile unsigned char *)mdt_io)[0], ((volatile unsigned char *)mdt_io)[1],
++	    ((volatile unsigned char *)mdt_io)[2], ((volatile unsigned char *)mdt_io)[3]);
++
++	x0 = gpu_scm_pas(WMODEM_SCM_IS_SUPPORTED, 0x01u, (uint64_t)WMODEM_PAS_ID, 0, 0, &x1);
++	printf("SWEET WIFI: [5] PAS is_supported(%u) -> x0=%#llx x1=%#llx (x0=0 & x1=1 => TZ can PAS this peripheral)\n",
++	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
++
++	x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, mdt_pa, 0, &x1);
++	printf("SWEET WIFI: [5] PAS init_image(%u, mdt) -> x0=%#llx x1=%#llx (0/0 => signature ACCEPTED)\n",
++	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
++	if (x0 != 0u) {
++		printf("SWEET WIFI: [5] TZ REJECTED the modem image header (x0=%#llx) -- stop; modem untouched, in reset\n",
++		    (unsigned long long)x0);
++		return;
++	}
++
++	x0 = gpu_scm_pas(WMODEM_SCM_MEM_SETUP, 0x03u, (uint64_t)WMODEM_PAS_ID, (uint64_t)WMODEM_REGION_PA,
++	    (uint64_t)WMODEM_REGION_SIZE, &x1);
++	printf("SWEET WIFI: [5] PAS mem_setup(%u, %#x, %#x) -> x0=%#llx x1=%#llx\n", WMODEM_PAS_ID, WMODEM_REGION_PA,
++	    WMODEM_REGION_SIZE, (unsigned long long)x0, (unsigned long long)x1);
++	if (x0 != 0u) {
++		printf("SWEET WIFI: [5] mem_setup refused (x0=%#llx) -- stop; modem in reset\n", (unsigned long long)x0);
++		return;
++	}
++	printf("SWEET WIFI: [5] TRUSTZONE ACCEPTS THE MODEM IMAGE (signature ok, region set). Modem STILL IN RESET. "
++	    "Next (higher-gated, reset-risk): copy the 29 segments in, then auth-and-reset to RELEASE the modem.\n");
 +}
 +
 +extern vnode_t rootvnode;       /* also declared near sweet_push_exec_bit; a second extern is harmless */
@@ -5546,7 +5620,9 @@
 +	(void)arg; (void)wr;
 +	for (tries = 0; tries < 600u; tries++) {        /* up to ~60 s for the iOS root volume */
 +		if (rootvnode != NULLVP) {
-+			wifi_firmware_read_validate();
++			if (wifi_firmware_read_validate() && wifi_level >= 4) {
++				wifi_modem_pas_validate();      /* sweetwifi=4: TZ signature check, modem NOT released */
++			}
 +			break;
 +		}
 +		delay_for_interval(100, NSEC_PER_MSEC);
@@ -5818,6 +5894,7 @@
 +	{
 +		uint32_t w = 0;
 +		if (PE_parse_boot_argn("sweetwifi", &w, sizeof(w)) && w >= 1u) {
++			wifi_level = (int)w;
 +			wifi_survey();
 +			if (w >= 2u) {        /* sweetwifi=2: the first write -- open the AOP QMP channel */
 +				(void)wifi_mailbox_open();

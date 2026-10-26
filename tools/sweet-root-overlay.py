@@ -39,7 +39,7 @@ import argparse, hashlib, os, plistlib, shutil, struct, sys
 # Provenance: device pull 2026-10-24 (scratchpad devcopy/, dev_usrlocal.txt) + the push log in the
 # Claude session transcripts (push_file.py / push.sh, last push per path).
 FILES = [
-    ('launchd', 'usr/local/gltest/sweettime', 'davinci-ios/gpu/userland/metal/sweettime', 0o755, '08201921a282e0e9'),  # 2026-10-26: time of day = RTC (kern.sweet_rtc, 0162) + kept offset (job com.sweet.time)
+    ('launchd', 'usr/local/gltest/sweettime', 'davinci-ios/gpu/userland/metal/sweettime', 0o755, '12ffbb8fc9df4a7a'),  # 2026-10-26: time of day = RTC (kern.sweet_rtc, 0162) + kept offset (job com.sweet.time)
     ('launchd', 'usr/local/gltest/scset', 'davinci-ios/gpu/userland/metal/scset', 0o755, 'a838fc11ea8053b7'),  # 2026-10-25: publishes Plugin:InterfaceNamer *QUIET* at boot (job com.sweet.scquiet)
     ('assets', 'usr/local/gltest/inplace_copy_lpf.fragment.spv', 'backup/ios-root-sources-20261025/phone-only/inplace_copy_lpf.fragment.spv', 0o644, '05f9adab013b54c8'),  # only on the phone; pulled 2026-10-25
     ('assets', 'usr/local/gltest/inplace_copy_lph.fragment.spv', 'backup/ios-root-sources-20261025/phone-only/inplace_copy_lph.fragment.spv', 0o644, '05f9adab013b54c8'),  # only on the phone; pulled 2026-10-25

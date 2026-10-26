@@ -1,0 +1,47 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 56ae718..56d78c3 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -509,15 +509,22 @@ sysctl_sweet_rtc SYSCTL_HANDLER_ARGS
+ 	int64_t v = -1;
+ 	uint8_t b[4], again = 0;
+ 	if (sweet_spmi_init() == 0) {
+-		for (int tries = 0; tries < 3 && v < 0; tries++) {
++		/* all four bytes twice, equal (a carry between the passes just takes another try): a single
++		 * SPMI read now and then returns junk -- 16803239 for ~26000 once (2026-10-26) */
++		uint8_t c[4];
++		for (int tries = 0; tries < 5 && v < 0; tries++) {
+ 			bool ok = true;
+ 			for (unsigned i = 0; i < 4; i++) {
+ 				ok = ok && sweet_spmi_read(0, 0x6048 + i, &b[i]) == 0;
+ 			}
+-			if (ok && sweet_spmi_read(0, 0x6048, &again) == 0 && again == b[0]) {
++			for (unsigned i = 0; i < 4; i++) {
++				ok = ok && sweet_spmi_read(0, 0x6048 + i, &c[i]) == 0;
++			}
++			if (ok && memcmp(b, c, 4) == 0) {
+ 				v = (int64_t)((uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+ 			}
+ 		}
++		(void)again;
+ 	}
+ 	return SYSCTL_OUT(req, &v, sizeof(v));
+ }
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index a9a6842..1c36a11 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -678,9 +678,10 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	bool one_plane = plane_info == NULL || plane_info->getCount() == 1;
+ 	/* and PencilKit's own canvas ("PencilKit", 1125x2436 at 4512): a surface it wraps as a Metal
+ 	 * texture and draws only on the GPU */
+-	bool drawable = name != NULL ? (strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 ||
+-	    strcmp(name->getCStringNoCopy(), "PencilKit") == 0) :
+-	    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4);
++	/* named ones only: an unnamed BGRA surface rounded (0157) was an image decoder's, which then
++	 * walked its rows past the end of its buffer -- SpringBoard crashed in DecodeRow */
++	bool drawable = name != NULL && (strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 ||
++	    strcmp(name->getCStringNoCopy(), "PencilKit") == 0);
+ 	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && one_plane) {
+ 		static unsigned told;
+ 		if (told < 24 || drawable || s->width >= 1000) {

@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index a538b4c..8e5d99a 100644
+index a538b4c..bb89899 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -666,17 +666,26 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
@@ -8,7 +8,7 @@ index a538b4c..8e5d99a 100644
  	 */
 +	/*
 +	 * Which ones: the drawable is created without a name (CoreAnimation names it afterwards), as
-+	 * BGRA, one plane, exactly width * 4 a row; every image writer seen keeping its own row names
++	 * BGRA, one plane, width * 4 rounded to 16 (1125 pixels: 4512); every image writer seen keeping its own row names
 +	 * its surface at creation (CoreUI, QuartzCore, CoreVideo). So: rounded when unnamed and so
 +	 * shaped (or named CAMetalLayer...), kept otherwise; each decision logged, the first 24.
 +	 */
@@ -20,10 +20,10 @@ index a538b4c..8e5d99a 100644
 -	} else if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0) {
 +	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && props->getObject("IOSurfacePlaneInfo") == NULL) {
 +		bool drawable = name != NULL ? strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 :
-+		    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4 && s->bytesPerRow == s->width * 4u);
++		    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4);
  		static unsigned told;
 -		if (told < 12) {
-+		if (told < 24) {
++		if (told < 24 || drawable) {
  			told++;
 -			IOLog("SWEET SURF: %ux%u asked %u bytes a row (not a multiple of %u), name %s: kept\n", s->width,
 -			    s->height, s->bytesPerRow, SWEET_SURFACE_ROW_ALIGN, name ? name->getCStringNoCopy() : "(none)");

@@ -1,0 +1,39 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index a538b4c..8e5d99a 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -666,17 +666,26 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	 * client-sized row (the first try) sheared images whose writers keep the row they asked for
+ 	 * (Notes' toolbar icons came out striped).
+ 	 */
++	/*
++	 * Which ones: the drawable is created without a name (CoreAnimation names it afterwards), as
++	 * BGRA, one plane, exactly width * 4 a row; every image writer seen keeping its own row names
++	 * its surface at creation (CoreUI, QuartzCore, CoreVideo). So: rounded when unnamed and so
++	 * shaped (or named CAMetalLayer...), kept otherwise; each decision logged, the first 24.
++	 */
+ 	OSString *name = OSDynamicCast(OSString, props->getObject("IOSurfaceName"));
+-	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && props->getObject("IOSurfacePlaneInfo") == NULL &&
+-	    name != NULL && strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0) {
+-		s->bytesPerRow = (uint32_t)((s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &
+-		    ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+-	} else if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0) {
++	if ((s->bytesPerRow % SWEET_SURFACE_ROW_ALIGN) != 0 && props->getObject("IOSurfacePlaneInfo") == NULL) {
++		bool drawable = name != NULL ? strncmp(name->getCStringNoCopy(), "CAMetalLayer", 12) == 0 :
++		    (s->pixelFormat == 'BGRA' && s->bytesPerElement == 4 && s->bytesPerRow == s->width * 4u);
+ 		static unsigned told;
+-		if (told < 12) {
++		if (told < 24) {
+ 			told++;
+-			IOLog("SWEET SURF: %ux%u asked %u bytes a row (not a multiple of %u), name %s: kept\n", s->width,
+-			    s->height, s->bytesPerRow, SWEET_SURFACE_ROW_ALIGN, name ? name->getCStringNoCopy() : "(none)");
++			IOLog("SWEET SURF: %ux%u asked %u bytes a row (not a multiple of %u), name %s: %s\n", s->width,
++			    s->height, s->bytesPerRow, SWEET_SURFACE_ROW_ALIGN, name ? name->getCStringNoCopy() : "(none)",
++			    drawable ? "rounded up" : "kept");
++		}
++		if (drawable) {
++			s->bytesPerRow = (uint32_t)((s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) &
++			    ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ 		}
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);

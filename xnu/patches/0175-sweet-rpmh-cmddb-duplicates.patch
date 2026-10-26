@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 90f6d0c..3029b18 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -232,6 +232,11 @@ rh_lookup(const char *res, uint32_t *address)
+ 				rh_log("invalid VRM entry for %s\n", res);
+ 				return EINVAL;
+ 			}
++			/* This cmd-db lists some resources twice (bobc1, both at 0x40400): one address is not ambiguous. */
++			if (matches && addr != *address) {
++				rh_log("%s at %#x and %#x; refusing\n", res, *address, addr);
++				return ENODEV;
++			}
+ 			*address = addr;
+ 			++matches;
+ 			rh_log("%s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+@@ -239,8 +244,8 @@ rh_lookup(const char *res, uint32_t *address)
+ 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+ 		}
+ 	}
+-	if (matches != 1) {
+-		rh_log("%s lookup matches=%u; refusing\n", res, matches);
++	if (matches == 0) {
++		rh_log("%s not in cmd-db; refusing\n", res);
+ 		return ENODEV;
+ 	}
+ 	return 0;

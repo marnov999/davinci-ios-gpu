@@ -1,0 +1,156 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 263cf09..a5cd85d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3079,6 +3079,7 @@ sweet_panel_brightness(uint32_t level)
+  */
+ static int panel_dcs_cmd(uint8_t cmd, bool refresh_stays_off);
+ static int panel_power_up(void);
++static void panel_reset_line(bool high);
+ extern void sweet_touch_resume(void);
+ extern int sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on);
+ static bool     g_panel_asleep;
+@@ -3108,8 +3109,8 @@ sweet_panel_power(int on)
+ 			g_panel_asleep = true;
+ 			printf("SWEET PANEL: asleep (display off %d, sleep in %d)\n", a, b);
+ 			if (rails) {
+-				/* dsi_panel_power_off takes the supplies away (its reset line is PM6150L GPIO 9, a
+-				 * PMIC pin, not driven here: the panel's own power-on reset does it on the way back) */
++				/* dsi_panel_power_off: the reset line low, then the supplies */
++				panel_reset_line(false);
+ 				printf("SWEET PANEL: vdda (L18A) vote off -> %d\n", sweet_rpmh_vreg_vote("ldoa18", 3000, false));
+ 			}
+ 		}
+@@ -3138,6 +3139,109 @@ sweet_panel_power(int on)
+ 	return panel_dcs_brightness(g_panel_level);
+ }
+ 
++/*
++ * The panel's reset line: PM6150L GPIO 9 (dtbo 14 qcom,platform-reset-gpio = <&pm6150l_gpios 9 0>; SID 4,
++ * peripheral 0xc8), over SPMI: reads by the observer channel, the write by our (EE 0) channel, as
++ * spmi_pon_wr does. Only the output level is changed, and only of a pin the boot loader already made
++ * an enabled output (pinctrl-spmi-gpio: LV/MV subtypes keep the level in DIG_OUT_SOURCE_CTL bit 7,
++ * the others in MODE_CTL bit 0); anything else is left alone and said. Holding it low while the
++ * supply is off is what dsi_panel_power_off does; without it the panel came back dark after the
++ * rail cut although every command was taken (2026-10-26).
++ */
++static int
++panel_pmic_gpio(unsigned reg, uint8_t *val, bool write)
++{
++	static vm_offset_t core, cfg, obs, ch;
++	static unsigned apid = 0xffffu;
++	const unsigned ppid = (4u << 8) | 0xc8u;
++	unsigned i;
++	if (!core) {
++		core = ml_io_map(0x0c440000u, 0x2000u);         /* SPMI v5 core (APID map at +0x900) */
++		cfg = ml_io_map(0x0c40a000u, 0x1000u);          /* owners at +0x700 */
++		obs = ml_io_map(0x0e600000u, 0x10000u);         /* EE 0 observer, 0x80 a channel */
++		if (!core || !cfg || !obs) {
++			core = 0;
++			return -1;
++		}
++	}
++	if (apid == 0xffffu) {
++		unsigned count = (*(volatile uint32_t *)(core + 4u)) & 0x7ffu;
++		for (i = 0; i < count && i < 512u; ++i) {
++			uint32_t map = *(volatile uint32_t *)(core + 0x900u + 4u * i);
++			if (map && ((map >> 8) & 0xfffu) == ppid &&
++			    ((*(volatile uint32_t *)(cfg + 0x700u + 4u * i)) & 7u) == 0u) {
++				apid = i;
++			}
++		}
++		if (apid == 0xffffu) {
++			return -2;                                  /* not there, or not ours */
++		}
++	}
++	if (!write) {
++		*(volatile uint32_t *)(obs + 0x80u * apid) = (1u << 27) | ((reg & 0xffu) << 4);
++		__asm__ volatile("dsb osh" ::: "memory");
++		for (i = 0; i < 1000u; ++i) {
++			uint32_t st = *(volatile uint32_t *)(obs + 0x80u * apid + 0x08u);
++			if (st & 1u) {
++				if (st & 0x0eu) {
++					return -3;
++				}
++				*val = (uint8_t)*(volatile uint32_t *)(obs + 0x80u * apid + 0x18u);
++				return 0;
++			}
++			gmub_udelay(1);
++		}
++		return -4;
++	}
++	if (!ch && !(ch = ml_io_map(0x0c600000u + 0x10000u * apid, 0x1000u))) {
++		return -1;
++	}
++	*(volatile uint32_t *)(ch + 0x10u) = *val;                          /* WDATA0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(ch + 0x00u) = (0u << 27) | ((reg & 0xffu) << 4);   /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (i = 0; i < 1000u; ++i) {
++		uint32_t st = *(volatile uint32_t *)(ch + 0x08u);
++		if (st & 1u) {
++			return (st & 0x0eu) ? -5 : 0;
++		}
++		gmub_udelay(1);
++	}
++	return -6;
++}
++
++static void
++panel_reset_line(bool high)
++{
++	static int told;
++	uint8_t subtype = 0, mode = 0, src = 0, en = 0, v;
++	if (panel_pmic_gpio(0x05, &subtype, false) || panel_pmic_gpio(0x40, &mode, false) ||
++	    panel_pmic_gpio(0x44, &src, false) || panel_pmic_gpio(0x46, &en, false)) {
++		if (!told++) {
++			printf("SWEET PANEL: reset line (PM6150L GPIO 9) not readable: left alone\n");
++		}
++		return;
++	}
++	bool lv_mv = subtype >= 0x10 && subtype <= 0x14;
++	bool output = lv_mv ? (mode & 3u) == 1u || (mode & 3u) == 2u : ((mode >> 4) & 7u) == 1u || ((mode >> 4) & 7u) == 2u;
++	if (!told++) {
++		printf("SWEET PANEL: reset line PM6150L GPIO 9: subtype %#x mode %#x out-src %#x en %#x (%s, %s)\n",
++		    subtype, mode, src, en, lv_mv ? "LV/MV" : "classic", output && (en & 0x80u) ? "an enabled output" : "NOT an enabled output");
++	}
++	if (!output || !(en & 0x80u)) {
++		return;
++	}
++	int rc;
++	if (lv_mv) {
++		v = high ? (uint8_t)(src | 0x80u) : (uint8_t)(src & ~0x80u);
++		rc = panel_pmic_gpio(0x44, &v, true);
++	} else {
++		v = high ? (uint8_t)(mode | 1u) : (uint8_t)(mode & ~1u);
++		rc = panel_pmic_gpio(0x40, &v, true);
++	}
++	printf("SWEET PANEL: reset line %s -> %d\n", high ? "high" : "low", rc);
++}
++
+ /*
+  * One DSI command packet through the test-pattern FIFO and the command DMA, as panel_dcs_cmd and
+  * panel_dcs_brightness send theirs: a short one (0x05, 0x15) as its header alone, a long one (0x39)
+@@ -3232,7 +3336,7 @@ static const uint8_t panel_on_commands[] = {
+ 
+ /*
+  * Back from a powered-off panel, dsi_panel_power_on and dsi_panel_enable's order: the supply (L18A)
+- * on (the reset sequence, on PM6150L GPIO 9, is left to the panel's power-on reset), the on
++ * on, the reset sequence (qcom,mdss-dsi-reset-sequence <0 1 1 10> on PM6150L GPIO 9), the on
+  * commands with their waits (sleep out, the panel's set-up, display on), then the display engine's
+  * refresh as it was (panel_dcs_cmd 0x29 with refresh back).
+  */
+@@ -3241,7 +3345,12 @@ panel_power_up(void)
+ {
+ 	int bad = 0, sent = 0;
+ 	printf("SWEET PANEL: vdda (L18A) vote on -> %d\n", sweet_rpmh_vreg_vote("ldoa18", 3000, true));
+-	gmub_udelay(20000);                             /* the supply up and the panel's power-on reset done */
++	gmub_udelay(10000);
++	/* qcom,mdss-dsi-reset-sequence <0 1 1 10>: low 1 ms, high, 10 ms */
++	panel_reset_line(false);
++	gmub_udelay(1000);
++	panel_reset_line(true);
++	gmub_udelay(10000);
+ 	for (unsigned j = 0; j + 7 <= sizeof(panel_on_commands);) {
+ 		const uint8_t *c = &panel_on_commands[j];
+ 		unsigned n = ((unsigned)c[5] << 8) | c[6];

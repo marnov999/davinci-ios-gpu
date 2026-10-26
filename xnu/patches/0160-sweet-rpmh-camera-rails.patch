@@ -1,0 +1,78 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 344e9d0..7f034d6 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -220,7 +220,7 @@ rh_free(unsigned t)
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv, bool on)
++rh_send(uint32_t address, unsigned mv, uint32_t mode, bool on)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -267,10 +267,10 @@ rh_send(uint32_t address, unsigned mv, bool on)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	/* The allow-list's mode (PMIC5 raw: LDO HPM 7, SMPS/BOB AUTO 6); enable comes last. */
+ 	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, on ? 1u : 0u};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=%d irq-enable=%#x\n", t, mv, on, irq_en);
++	const uint32_t values[3] = {mv, mode, on ? 1u : 0u};
++	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=%u enable=%d irq-enable=%#x\n", t, mv, mode, on, irq_en);
+ 	for (unsigned c = 0; c < 3; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+@@ -327,18 +327,35 @@ rh_send(uint32_t address, unsigned mv, bool on)
+ }
+ 
+ /*
+- * Our (apps) vote for one of the few LDOs listed: its voltage, high-power mode, and on or off. RPMh
++ * Our (apps) vote for one of the few rails listed: its voltage, mode, and on or off. RPMh
+  * aggregates the votes of every processor, so an off vote turns a rail off only if nobody else wants
+  * it. ldoc11: the touch controller's 3.2 V; ldoa18: the panel's vdda-3p3 (3.0 V; MIUI's dsi panel
+- * supply entry 1, cut in dsi_panel_power_off).
++ * supply entry 1, cut in dsi_panel_power_off). 0160, the cameras (davinci-sdmmagpie-camera-sensor.dtsi,
++ * clamped to the regulators' ranges in the live DT; bsd/dev/sweet_camera.c, sweetcam >= 2 only):
++ * ldoa16 VIO 1.8 V, ldoc9 CUSTOM 2.952-3.008 V (PMIC5 LDOs: HPM), smpc8 VDIG input 1.352 V and
++ * bobc1 VANA 3.296 V (PMIC5 SMPS / BOB: AUTO, not forced PWM).
+  */
++static const struct {
++	const char *res;
++	unsigned mv_min, mv_max;
++	uint32_t mode;
++} rh_allowed[] = {
++	{ "ldoc11", 2950, 3400, 7 }, { "ldoa18", 2950, 3050, 7 },
++	{ "ldoa16", 1800, 1800, 7 }, { "ldoc9", 2952, 3008, 7 },
++	{ "smpc8", 1352, 1352, 6 }, { "bobc1", 3296, 3296, 6 },
++};
++
+ int
+ sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || !((!strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400) ||
+-	    (!strcmp(res, "ldoa18") && mv >= 2950 && mv <= 3050))) {
+-		printf("SWEET RPMH: expected ldoc11 (2950..3400 mV) or ldoa18 (2950..3050 mV)\n");
++	/* Board-specific helper: do not apply a rail's policy to arbitrary resources. */
++	unsigned k = 0;
++	while (res && k < sizeof(rh_allowed) / sizeof(rh_allowed[0]) &&
++	    (strcmp(res, rh_allowed[k].res) || mv < rh_allowed[k].mv_min || mv > rh_allowed[k].mv_max)) {
++		++k;
++	}
++	if (!res || k == sizeof(rh_allowed) / sizeof(rh_allowed[0])) {
++		printf("SWEET RPMH: %s at %u mV is not in the allow-list\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+@@ -355,7 +372,7 @@ sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on)
+ 		error = rh_lookup(res, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv, on);
++		error = rh_send(address, mv, rh_allowed[k].mode, on);
+ 	}
+ out:
+ 	if (error) {

@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 5761a7d..99a6eb4 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -721,7 +721,8 @@ popup_spmi_put(unsigned sid, uint16_t address, uint8_t value)
+ 	if (apid != 0xffff && owner == 0) {
+ 		vm_offset_t ch = cam_map(SPMI_CHNLS_PHYS + 0x10000UL * apid, 0x1000);
+ 
+-		if (ch != 0) {
++		/* (an arbiter error status now and then, the register written all the same: up to three tries) */
++		for (unsigned attempt = 0; ch != 0 && !ok && attempt < 3; attempt++) {
+ 			wr(ch + 0x10, value);
+ 			__asm__ volatile ("dsb osh" ::: "memory");
+ 			wr(ch + 0x00, (0u << 27) | ((uint32_t)(address & 0xff) << 4));        /* EXT_WRITEL, 1 byte */
+@@ -745,8 +746,9 @@ popup_spmi_put(unsigned sid, uint16_t address, uint8_t value)
+ 	/* LPG_PWM_SYNC is a strobe: it does not read back */
+ 	if (!ok || (!(sid == SID_PM6150L_B && (address & 0xff) == LPG_PWM_SYNC) &&
+ 	    (!spmi_read(sid, address, &back) || back != value))) {
+-		say("pop-up: SID %u %#x <- %#x reads %#x\n", sid, address, value, back);
+-		give_up("a pop-up PMIC write that did not take");
++		say("pop-up: SID %u %#x <- %#x reads %#x (status %s): no more pop-up in this boot, the camera goes on\n", sid,
++		    address, value, back, ok ? "ok" : "an error");
++		popup_enabled = false;
+ 		return false;
+ 	}
+ 	return true;
+@@ -851,6 +853,25 @@ popup_probe(void)
+ 		return;
+ 	}
+ 	popup_out(POPUP_SLEEP, false);                  /* the driver asleep: steps do nothing */
++	/* first: does reading GPIO 10 back work at all? a plain output, high then low (source 0, bit 7 = the level) */
++	for (int level = 1; level >= 0; level--) {
++		unsigned highs = 0, reads = 0;
++		uint8_t v = 0, sts[4] = { 0, 0, 0, 0 };
++
++		(void)popup_spmi_put(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | 0x44), level ? 0x80 : 0x00);
++		popup_wait_ms(5);
++		for (int r = 0; r < 100; r++) {
++			if (spmi_read(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | 0x10), &v)) {
++				reads++;
++				highs += v & 1;
++			}
++		}
++		for (int r = 0; r < 4; r++) {
++			(void)spmi_read(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(POPUP_PGPIO) << 8 | (0x08 + r)), &sts[r]);
++		}
++		say("pop-up probe: GPIO10 driven %s: RT_STS high %u of %u; 0x08..0x0b %02x %02x %02x %02x\n", level ? "high" : "low",
++		    highs, reads, sts[0], sts[1], sts[2], sts[3]);
++	}
+ 	for (unsigned c = 0; c < 3; c++) {
+ 		uint8_t subtype = 0;
+ 

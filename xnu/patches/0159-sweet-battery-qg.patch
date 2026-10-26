@@ -1,0 +1,4373 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index f2d8bf8..ec81ae2 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -60,6 +60,10 @@ $(foreach o,$(SWEET_HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -include $(SWEET_HFS_ROO
+ # HFSEncodings is a separate kext on Apple with its own allocation counter.
+ hfs_encodings.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
+ hfs_encodinghint.o_CFLAGS_ADD += -Dhfs_allocated=hfs_encodings_allocated
++# MIUI-exact battery %: the algorithm keeps its float math in integer soft-float; no FP/SIMD registers at all.
++sweet_qg.o_CFLAGS_ADD += -mgeneral-regs-only
++sweet_qg_algo.o_CFLAGS_ADD += -mgeneral-regs-only
++sweet_qg_softfloat.o_CFLAGS_ADD += -mgeneral-regs-only
+ endif
+ 
+ #
+diff --git a/bsd/conf/files b/bsd/conf/files
+index daf5386..fb99cce 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,9 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_qg.c			standard
++bsd/dev/sweet_qg_algo.c			standard
++bsd/dev/sweet_qg_softfloat.c		standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_dpu.c			standard
+diff --git a/bsd/dev/sweet_qg.c b/bsd/dev/sweet_qg.c
+new file mode 100644
+index 0000000..4ff6d2d
+--- /dev/null
++++ b/bsd/dev/sweet_qg.c
+@@ -0,0 +1,565 @@
++/*
++ * sweet_qg.c - MIUI-exact battery % engine for SweetBattery (sweetbattery=1).
++ *
++ * Drives sweet_qg_algo.c (bit-exact port of the QTI QG daemon in MIUI's
++ * /vendor/bin/hvdcp_opti + the Xiaomi qpnp-qg kernel side) with PM6150
++ * registers, following the Linux flow:
++ *   probe:  SDAM/RTC/S7 OCV -> qg_determine_pon_soc, RT FIFO + PON OCV + SDAM
++ *           ESR params -> first daemon cycle (daemon init from shown %)
++ *   run:    QG FIFO completion (0x480A count wraps) -> kdata -> daemon ->
++ *           process_udata_work; msoc alarm; charger status work; 10 s smooth
++ *           tracking; force-shutdown; VBAT_EMPTY; GOOD_OCV.
++ *
++ * READ ONLY.  Every place where Linux writes the PMIC is a TODO(write):
++ *   - SDAM write-back (qg_store_soc_params / update_msoc / ESR / learned cap)
++ *     and QG_SOC_MONOTONIC: computed into the mirror, not written;
++ *   - master hold around RT FIFO / burst-avg reads: replaced by atomic reads;
++ *   - HW ESR measurement (qg_esr_estimate): not done, SDAM ESR SF kept;
++ *   - battery temperature (VADC bat_therm conversion): SDAM TEMP (the value
++ *     Linux last wrote) is used, else 25 C.
++ * See davinci-ios/battery/port/SweetBattery-integration.md.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET_QG_HOST)
++#pragma clang diagnostic ignored "-Wunknown-warning-option"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++
++#ifdef SWEET_QG_HOST
++#include <stdio.h>
++#include <string.h>
++extern int sweet_spmi_init(void);
++extern int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern int sweet_spmi_read_n(unsigned sid, unsigned addr, uint8_t *out, unsigned n);
++extern uint64_t sweet_qg_host_now_ms(void);
++#define QG_LOG printf
++static uint64_t now_ms(void) { return sweet_qg_host_now_ms(); }
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include "sweet_spmi.h"
++extern uint64_t mach_continuous_time(void);
++#define QG_LOG printf
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &ns);
++	return ns / 1000000u;
++}
++#endif
++#include "sweet_qg.h"
++#include "sweet_qg_algo.h"
++
++/* ---------------- state ---------------- */
++static struct qg_daemon D;
++static struct qg_kernel K;
++static struct qg_kernel_data KD;
++static int multibyte, subtype4 = 1;
++static uint32_t fifo_len = 5, fifo_count = 128, fifo_interval = 98, seq;
++static uint32_t rt_prev, skip_from;
++static uint64_t rt_stall_since_ms;
++static uint64_t last_wrap_ms, last_poll_ms, boot_ms, next_monitor_ms, next_fs_ms, last_publish_ms;
++static int temp_dc = 250, temp_src;
++static uint16_t good_ocv_raw_seen;
++static uint8_t int_rt_prev;
++static int status_cache[5] = { -1, -1, -1, -1, -1 };
++static int cur_ua, vbat_uv, vbat_avg_uv;
++static int soft_fifo;                 /* software FIFO fallback active */
++static int64_t sf_sum_v, sf_sum_i;
++static uint32_t sf_n, sf_entries;
++static uint64_t sf_entry_start_ms;
++static struct sweet_qg_status last;
++static int charge_counter_uah;
++
++/* ---------------- register access (reads only) ---------------- */
++static int
++rd(unsigned addr, uint8_t *buf, unsigned n, struct sweet_qg_status *st)
++{
++	unsigned i;
++	while (n) {
++		unsigned c = n > 4 ? 4 : n;
++		if (multibyte && (addr & 0xffu) + c <= 0x100u) {
++			if (sweet_spmi_read_n(0, addr, buf, c)) {
++				st->spmi_errors++;
++				return -1;
++			}
++		} else {
++			for (i = 0; i < c; i++) {
++				if (sweet_spmi_read(0, addr + i, buf + i)) {
++					st->spmi_errors++;
++					return -1;
++				}
++			}
++		}
++		addr += c; buf += c; n -= c;
++	}
++	return 0;
++}
++
++/* 16-bit word, two equal reads in a row (no QG hold bit: TODO(write)) */
++static int
++rd16(unsigned addr, uint16_t *v, struct sweet_qg_status *st)
++{
++	uint8_t b[2];
++	uint16_t prev = 0;
++	unsigned a;
++	for (a = 0; a < 4; a++) {
++		uint16_t w;
++		if (rd(addr, b, 2, st)) return -1;
++		w = (uint16_t)(b[0] | (b[1] << 8));
++		if (multibyte || (a && w == prev)) { *v = w; return 0; }
++		prev = w;
++	}
++	return -1;
++}
++
++static int
++rd8(unsigned addr, uint8_t *v, struct sweet_qg_status *st)
++{
++	return rd(addr, v, 1, st);
++}
++
++/* PMIC RTC seconds (0x6048..0x604B), re-read byte 0 to catch a carry */
++static int
++read_rtc(uint32_t *s, struct sweet_qg_status *st)
++{
++	uint8_t b[4], again;
++	int t;
++	for (t = 0; t < 3; t++) {
++		if (rd(0x6048, b, 4, st) || rd8(0x6048, &again, st)) return -1;
++		if (again == b[0]) {
++			*s = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++			return 0;
++		}
++	}
++	return -1;
++}
++
++static void
++read_geometry(struct sweet_qg_status *st)
++{
++	uint8_t c2, c3;
++	if (!rd8(0x4851, &c2, st) && !rd8(0x4852, &c3, st) && c3) {
++		fifo_len = qg_fifo_length(c2);
++		fifo_count = qg_sample_count(c2);
++		fifo_interval = qg_sample_interval_ms(c3);
++	}
++	K.fifo_full_ms = (int)(fifo_len * fifo_count * fifo_interval);
++}
++
++static int32_t
++iraw_to_ua(uint16_t raw)
++{
++	int32_t s = (int32_t)(int16_t)raw;
++	return subtype4 ? qg_iraw_to_ua_sub4(s) : qg_iraw_to_ua_sub3(s);
++}
++
++/* LAST_ADC_V 0x48C0, LAST_BURST_AVG_I 0x48C6, S2_NORMAL_AVG_V 0x4880 */
++static void
++read_vi(struct sweet_qg_status *st)
++{
++	uint16_t w;
++	if (!rd16(0x48c0, &w, st) && w != 0x8000) vbat_uv = (int)qg_vraw_to_uv(w);
++	if (!rd16(0x48c6, &w, st) && w != 0x8000) cur_ua = iraw_to_ua(w);
++	if (!rd16(0x4880, &w, st) && w != 0x8000) vbat_avg_uv = (int)qg_vraw_to_uv(w);
++}
++
++/* ---------------- daemon cycle (qg_device_read -> write -> udata work) ---------------- */
++static void
++fill_props(struct qg_props *p)
++{
++	memset(p, 0, sizeof(*p));
++	p->capacity = qg_kernel_reported_capacity(&K, vbat_uv);
++	p->voltage_ocv = (int32_t)K.sdam.ocv_uv;
++	p->temp = temp_dc;
++	p->voltage_min = QG_VBATT_CUTOFF_UV;
++	p->batt_full_current = QG_ITERM_UA;
++	p->current_now = cur_ua;
++	p->voltage_max = QG_FLOAT_UV;
++	p->voltage_now = vbat_uv;
++	p->batt_profile_version = 100;
++	p->charge_full = qg_kernel_charge_full_uah(&K);
++	p->charge_full_design = 4000000;
++}
++
++static void
++run_daemon(uint32_t rtc, uint64_t now, struct sweet_qg_status *st)
++{
++	struct qg_props p;
++	struct qg_user_data ud;
++	fill_props(&p);
++	st->daemon_cycles++;
++	if (qg_daemon_process(&D, &KD, &p, &ud)) {
++		st->daemon_writes++;
++		if (ud.param[QG_CHARGE_COUNTER].valid) charge_counter_uah = (int)ud.param[QG_CHARGE_COUNTER].data;
++		qg_kernel_udata(&K, &ud, vbat_avg_uv, cur_ua, temp_dc, rtc, (int64_t)now);
++		QG_LOG("SWEET QG: cycle %u len=%u src=%d: SOC=%u SYS=%u BATT=%u CC=%u FULL=%u OCV=%u RBAT=%u -> msoc=%d catch_up=%d shown=%d\n",
++		    KD.seq_no, KD.fifo_length, soft_fifo, ud.param[QG_SOC].data, ud.param[QG_SYS_SOC].data,
++		    ud.param[QG_BATT_SOC].data, ud.param[QG_CC_SOC].data, ud.param[QG_FULL_SOC].data,
++		    ud.param[QG_OCV_UV].data, ud.param[QG_RBAT_MOHM].data, K.msoc, K.catch_up_soc, K.shown);
++	} else {
++		QG_LOG("SWEET QG: cycle %u len=%u: daemon wrote nothing\n", KD.seq_no, KD.fifo_length);
++	}
++	memset(&KD, 0, sizeof(KD));           /* qg_device_read clears kdata */
++}
++
++/* read FIFO entries [from, to) into KD */
++static int
++read_fifo(uint32_t from, uint32_t to, struct sweet_qg_status *st)
++{
++	uint16_t v[16], i[16];
++	uint32_t k;
++	if (to > 16) to = 16;
++	for (k = from; k < to; k++) {
++		if (rd16(0x4890 + 2 * k, &v[k - from], st) || rd16(0x48a0 + 2 * k, &i[k - from], st))
++			return -1;
++	}
++	if (to <= from) return 0;
++	if (qg_kdata_add_fifo(&KD, v, i, (int)(to - from), fifo_interval, fifo_count, subtype4) < 0) {
++		st->fifo_rejects++;               /* Linux: "Invalid FIFO data ... FIFO rejected" */
++		memset(&KD, 0, sizeof(KD));
++		return -1;
++	}
++	K.last_fifo_i_ua = (int32_t)KD.fifo[KD.fifo_length - 1].i;
++	return 0;
++}
++
++/* ---------------- status / publishing ---------------- */
++static void
++snapshot(struct sweet_qg_status *st)
++{
++	int pct = qg_kernel_reported_capacity(&K, vbat_uv);
++	int was = st->percent, waschg = st->charging, wasext = st->external, wasfull = st->full;
++	st->percent = pct;
++	st->ps_status = K.charge_status;
++	st->charging = K.charge_status == QG_PS_CHARGING;
++	st->full = K.charge_full || K.charge_status == QG_PS_FULL;
++	st->external = K.usb_present;
++	st->critical = K.force_shutdown;
++	st->mv = vbat_uv / 1000;
++	st->ua = cur_ua;
++	st->temp_dc = temp_dc;
++	st->temp_src = temp_src;
++	st->learned_mah = qg_kernel_charge_full_uah(&K) / 1000;
++	st->charge_counter_uah = charge_counter_uah;
++	st->msoc = K.msoc; st->catch_up_soc = K.catch_up_soc; st->sys_soc = K.sys_soc;
++	st->batt_soc = K.batt_soc; st->cc_soc = K.cc_soc; st->full_soc = K.full_soc;
++	st->maint_soc = K.maint_soc; st->charge_full = K.charge_full;
++	st->charge_done = K.charge_done; st->health = K.health;
++	st->fifo_len = (int32_t)fifo_len; st->fifo_count = (int32_t)fifo_count;
++	st->fifo_interval_ms = (int32_t)fifo_interval; st->fifo_source = soft_fifo;
++	st->multibyte = multibyte;
++	st->changed = pct != was || st->charging != waschg || st->external != wasext || st->full != wasfull;
++}
++
++static void
++charger_update(uint32_t rtc, uint64_t now, struct sweet_qg_status *st)
++{
++	uint8_t r1006, r100d, r1043, r110b, r1310;
++	int s, done, health, usb, shown;
++	if (rd8(0x1006, &r1006, st) || rd8(0x100d, &r100d, st) || rd8(0x1043, &r1043, st) ||
++	    rd8(0x110b, &r110b, st) || rd8(0x1310, &r1310, st))
++		return;
++	st->charge_capable = (r110b & 0x10) && (r110b & 0x01);
++	shown = qg_kernel_reported_capacity(&K, vbat_uv);
++	s = qg_smb5_batt_status(r1006, r100d, r1043, r110b, shown);
++	done = qg_smb5_charge_done(r1006);
++	health = qg_smb5_health(r100d);
++	usb = qg_smb5_usb_present(r1310);
++	/* qg_notifier_cb: any batt/usb psy change (incl. the capacity change that
++	 * smooth tracking announces) schedules qg_status_change_work */
++	if (s != status_cache[0] || done != status_cache[1] || health != status_cache[2] ||
++	    usb != status_cache[3] || shown != status_cache[4]) {
++		if (s != status_cache[0] || usb != status_cache[3] || done != status_cache[1])
++			QG_LOG("SWEET QG: charger status=%d done=%d health=%d usb=%d (1006=%#x 100d=%#x 110b=%#x 1310=%#x)\n",
++			    s, done, health, usb, r1006, r100d, r110b, r1310);
++		status_cache[0] = s; status_cache[1] = done; status_cache[2] = health;
++		status_cache[3] = usb; status_cache[4] = shown;
++		qg_kernel_status(&K, s, done, health, usb, cur_ua, temp_dc, rtc, (int64_t)now);
++	}
++}
++
++/* ---------------- start (qpnp_qg_probe + daemon start) ---------------- */
++int
++sweet_qg_start(struct sweet_qg_status *st)
++{
++	uint8_t type = 0, present = 0, sub = 0, sdtype = 0, raw[QG_SDAM_RAW_LEN], mag[4], b2[2];
++	uint32_t rtc = 0, magic, k;
++	uint16_t s7 = 0, w;
++	struct qg_pon_in pin;
++	struct qg_pon_out pout;
++	struct qg_props p;
++	int rtc_ok, sdam_ok, magic_ok;
++	int16_t learned;
++
++	memset(st, 0, sizeof(*st));
++	memset(&last, 0, sizeof(last));
++	if (sweet_spmi_init()) return -1;
++	/* is multi-byte EXT_READL usable?  Probe on the RTC's static PERPH_TYPE/
++	 * SUBTYPE (0x6004/5) and compare with single-byte reads, so a failing
++	 * command can only cost the RTC lane, never the QG one. */
++	multibyte = 1;
++	if (rd(0x6004, b2, 2, st)) {
++		multibyte = 0;
++	} else {
++		multibyte = 0;
++		if (!rd8(0x6004, &type, st) && !rd8(0x6005, &sub, st) && b2[0] == type && b2[1] == sub)
++			multibyte = 1;
++	}
++	st->spmi_errors = 0;
++	if (rd8(0x4804, &type, st) || type != 0x0d || rd8(0x4808, &present, st) || !(present & 1) ||
++	    rd8(0x4805, &sub, st) || (sub != 3 && sub != 4)) {
++		QG_LOG("SWEET QG: no QG (type=%#x status1=%#x subtype=%#x) - fallback\n", type, present, sub);
++		return -2;
++	}
++	subtype4 = sub == 4;
++	read_geometry(st);
++	read_vi(st);
++
++	/* SDAM 0xB600 (type 0x2E), 0xB646..0xB675, MAGIC 0xB680 */
++	memset(raw, 0, sizeof(raw));
++	sdam_ok = !rd8(0xb604, &sdtype, st) && sdtype == 0x2e && !rd(0xb646, raw, QG_SDAM_RAW_LEN, st) &&
++	    !rd(0xb680, mag, 4, st);
++	magic = sdam_ok ? ((uint32_t)mag[0] | ((uint32_t)mag[1] << 8) | ((uint32_t)mag[2] << 16) | ((uint32_t)mag[3] << 24)) : 0;
++	magic_ok = sdam_ok && magic == QG_SDAM_MAGIC;
++	memset(&pin, 0, sizeof(pin));
++	if (sdam_ok) qg_sdam_unpack(raw, &pin.sdam);
++	learned = magic_ok ? (int16_t)(raw[0x22] | (raw[0x23] << 8)) : 0;   /* 0xB668 */
++	/* qg_sanitize_sdam: a bad MAGIC makes Linux clear SDAM (TODO(write)); treat as empty */
++	if (!magic_ok) memset(&pin.sdam, 0, sizeof(pin.sdam));
++
++	/* battery temperature: TODO(write) VADC bat_therm conversion.  Use the
++	 * value Linux last stored (SDAM TEMP), else 25 C. */
++	{
++		int t = (int)(int16_t)(pin.sdam.temp & 0xffff);
++		if (magic_ok && pin.sdam.valid && t > -200 && t < 600) { temp_dc = t; temp_src = 1; }
++		else { temp_dc = 250; temp_src = 0; }
++	}
++	rtc_ok = !read_rtc(&rtc, st);
++	if (rd16(0x4870, &s7, st)) s7 = 0;
++	if (rd16(0x4874, &w, st) == 0) good_ocv_raw_seen = w;
++	(void)rd8(0x4810, &int_rt_prev, st);
++
++	qg_kernel_init(&K);
++	K.rtc_valid = rtc_ok;
++	qg_kernel_profile_init(&K, learned);
++	read_geometry(st);
++	boot_ms = last_poll_ms = now_ms();
++
++	/* charger state before PON (probe: qg_status_change_work runs right after) */
++	{
++		uint8_t r1006 = 0, r100d = 0, r1043 = 0, r110b = 0, r1310 = 0;
++		(void)rd8(0x1006, &r1006, st); (void)rd8(0x100d, &r100d, st); (void)rd8(0x1043, &r1043, st);
++		(void)rd8(0x110b, &r110b, st); (void)rd8(0x1310, &r1310, st);
++		K.usb_present = qg_smb5_usb_present(r1310);
++		K.charge_status = qg_smb5_batt_status(r1006, r100d, r1043, r110b, 50);
++		K.charge_done = qg_smb5_charge_done(r1006);
++		K.health = qg_smb5_health(r100d);
++	}
++
++	pin.s7_ocv_uv = qg_vraw_to_uv(s7);
++	pin.batt_temp = temp_dc;
++	pin.rtc_sec = rtc;
++	pin.rtc_ok = rtc_ok;
++	pin.sdam_ok = magic_ok;
++	qg_kernel_pon(&K, &pin, &pout);
++	st->pon_soc = pout.pon_soc; st->pon_calc_soc = pout.calc_soc; st->pon_used_shutdown = pout.used_shutdown;
++	st->sdam_soc = (int32_t)pin.sdam.soc;
++	st->sdam_age_s = rtc_ok && magic_ok ? (int32_t)(rtc - pin.sdam.time_sec) : -1;
++	st->sdam_magic_ok = magic_ok;
++	st->rtc_s = rtc;
++	QG_LOG("SWEET QG: PON S7=%uuV T=%d (src %d) rtc=%u(%d) SDAM type=%#x magic=%#x valid=%u soc=%u ocv=%u age=%d learned=%dmAh"
++	    " -> pon_soc=%d full=%d cutoff=%d calc=%d %s soc=%d ocv=%u\n",
++	    pin.s7_ocv_uv, temp_dc, temp_src, rtc, rtc_ok, sdtype, magic, pin.sdam.valid, pin.sdam.soc,
++	    pin.sdam.ocv_uv, st->sdam_age_s, learned, pout.pon_soc, pout.full_soc, pout.cutoff_soc,
++	    pout.calc_soc, pout.used_shutdown ? "SHUTDOWN_SOC" : "S7_PON_SOC", K.msoc, pout.ocv_uv);
++
++	/* probe kdata: RT FIFO (completed entries of the current cycle; Linux holds
++	 * the master and also takes the accumulator - TODO(write), we skip it and
++	 * feed the remaining entries at the first wrap), PON OCV, SDAM ESR params */
++	memset(&KD, 0, sizeof(KD));
++	{
++		uint8_t r;
++		rt_prev = rd8(0x480a, &r, st) ? 0 : (r & 0x0fu);
++	}
++	if (rt_prev > fifo_len) rt_prev = 0;
++	if (rt_prev) (void)read_fifo(0, rt_prev, st);
++	skip_from = rt_prev;
++	KD.seq_no = seq++;
++	KD.fifo_time = rtc;
++	KD.param[QG_PON_OCV_UV].data = K.pon_ocv_uv; KD.param[QG_PON_OCV_UV].valid = 1;
++	if (magic_ok) {   /* qg_post_init -> qg_retrieve_esr_params */
++		struct qg_sdam *s = &pin.sdam;
++		if (s->esr_chg_delta) { KD.param[QG_ESR_CHARGE_DELTA].data = s->esr_chg_delta; KD.param[QG_ESR_CHARGE_DELTA].valid = 1; }
++		if (s->esr_dischg_delta) { KD.param[QG_ESR_DISCHARGE_DELTA].data = s->esr_dischg_delta; KD.param[QG_ESR_DISCHARGE_DELTA].valid = 1; }
++		if (s->esr_chg_sf) { k = s->esr_chg_sf < 5000 ? 5000 : (s->esr_chg_sf > 20000 ? 20000 : s->esr_chg_sf);
++			KD.param[QG_ESR_CHARGE_SF].data = k; KD.param[QG_ESR_CHARGE_SF].valid = 1; }
++		if (s->esr_dischg_sf) { k = s->esr_dischg_sf < 5000 ? 5000 : (s->esr_dischg_sf > 20000 ? 20000 : s->esr_dischg_sf);
++			KD.param[QG_ESR_DISCHARGE_SF].data = k; KD.param[QG_ESR_DISCHARGE_SF].valid = 1; }
++		QG_LOG("SWEET QG: SDAM ESR delta %d/%d sf %u/%u\n", (int)s->esr_chg_delta, (int)s->esr_dischg_delta,
++		    s->esr_chg_sf, s->esr_dischg_sf);
++	}
++
++	/* soc_monitor_work runs before the daemon starts: shown = msoc */
++	qg_kernel_soc_monitor(&K, cur_ua, temp_dc, (int64_t)(boot_ms / 1000));
++	charger_update(rtc, boot_ms, st);
++	/* hvdcp_opti qg_main(): init from the shown capacity, then the first read */
++	fill_props(&p);
++	qg_daemon_init(&D, &p);
++	QG_LOG("SWEET QG: daemon init capacity=%d T=%d learned=%duAh; probe FIFO %u entries (geometry %ux%ux%ums) multibyte=%d\n",
++	    p.capacity, p.temp, p.charge_full, rt_prev, fifo_len, fifo_count, fifo_interval, multibyte);
++	run_daemon(rtc, boot_ms, st);
++	last_wrap_ms = 0;                     /* first wrap: no FIFO_TIME_DELTA */
++	next_monitor_ms = boot_ms + 10000;
++	next_fs_ms = boot_ms + 300;
++	last_publish_ms = 0;
++	snapshot(st);
++	st->changed = 1;
++	st->fifo_rt = (int32_t)rt_prev;
++	return 0;
++}
++
++/* ---------------- software FIFO (HW FIFO not cycling without Linux) ---------------- */
++static void
++soft_fifo_sample(uint32_t rtc, uint64_t now, struct sweet_qg_status *st)
++{
++	uint64_t span = (uint64_t)fifo_count * fifo_interval;
++	if (!sf_entry_start_ms) sf_entry_start_ms = now;
++	sf_sum_v += vbat_uv; sf_sum_i += cur_ua; sf_n++;
++	if (now - sf_entry_start_ms < span) return;
++	{
++		uint32_t j = KD.fifo_length;
++		if (j < QG_MAX_FIFO_LENGTH) {
++			KD.fifo[j].v = (uint32_t)(sf_sum_v / (int64_t)sf_n);
++			KD.fifo[j].i = (uint32_t)(int32_t)(sf_sum_i / (int64_t)sf_n);
++			KD.fifo[j].count = 1;                                   /* dt = measured span */
++			KD.fifo[j].interval = (uint32_t)(now - sf_entry_start_ms);
++			KD.fifo_length = j + 1;
++			K.last_fifo_i_ua = (int32_t)KD.fifo[j].i;
++		}
++	}
++	sf_sum_v = sf_sum_i = 0; sf_n = 0; sf_entry_start_ms = now;
++	if (++sf_entries >= fifo_len) {
++		sf_entries = 0;
++		KD.seq_no = seq++;
++		KD.fifo_time = rtc;
++		st->fifo_cycles++;
++		run_daemon(rtc, now, st);
++	}
++}
++
++/* ---------------- one poll ---------------- */
++uint32_t
++sweet_qg_poll(struct sweet_qg_status *st)
++{
++	uint64_t now = now_ms(), gap = now - last_poll_ms;
++	uint32_t rtc = 0, rt, delay = 1000;
++	uint8_t r, acc = 0, st2 = 0, irt = 0;
++	uint16_t w;
++	uint64_t hw = (uint64_t)fifo_len * fifo_count * fifo_interval;
++
++	last_poll_ms = now;
++	if (read_rtc(&rtc, st)) rtc = K.sdam.time_sec;   /* keep moving forward-ish */
++	st->rtc_s = rtc;
++	read_vi(st);
++	/* resume (the AP slept): qpnp_qg_resume sets update_now */
++	if (gap > 5000) {
++		K.update_now = 1;
++		QG_LOG("SWEET QG: resumed after %llu ms\n", (unsigned long long)gap);
++	}
++	charger_update(rtc, now, st);
++
++	/* VBAT_EMPTY (INT_RT_STS bit 2 rising) */
++	if (!rd8(0x4810, &irt, st)) {
++		if ((irt & 0x04) && !(int_rt_prev & 0x04) && !(irt & 0x01)) {
++			QG_LOG("SWEET QG: VBAT_EMPTY -> SOC 0\n");
++			qg_kernel_vbat_empty(&K, K.sdam.ocv_uv, temp_dc, rtc, (int64_t)now);
++		}
++		int_rt_prev = irt;
++	}
++
++	/* GOOD_OCV: STATUS2 b1 and a new S3_GOOD_OCV value */
++	if (!rd8(0x4809, &st2, st) && (st2 & 0x02) && !rd16(0x4874, &w, st) && w != 0x8000 && w != good_ocv_raw_seen) {
++		good_ocv_raw_seen = w;
++		st->good_ocv_events++;
++		memset(&KD, 0, sizeof(KD));
++		KD.fifo_time = rtc;
++		KD.seq_no = seq++;
++		KD.param[QG_GOOD_OCV_UV].data = qg_vraw_to_uv(w);
++		KD.param[QG_GOOD_OCV_UV].valid = 1;
++		if (gap >= (uint64_t)QG_MIN_SLEEP_TIME_S * 1000) K.force_soc = 1;
++		QG_LOG("SWEET QG: GOOD_OCV %uuV (sleep %llu ms, force=%d)\n", KD.param[QG_GOOD_OCV_UV].data,
++		    (unsigned long long)gap, K.force_soc);
++		run_daemon(rtc, now, st);
++	}
++
++	/* FIFO */
++	if (!rd8(0x480a, &r, st)) {
++		rt = r & 0x0fu;
++		(void)rd8(0x488e, &acc, st);
++		st->fifo_rt = (int32_t)rt;
++		st->acc_count = acc;
++		K.fifo_rt_ms = (int)(rt * fifo_count * fifo_interval + (fifo_count > acc ? fifo_count - acc : 0) * fifo_interval);
++		if (rt < rt_prev) {                                   /* a FIFO completed */
++			uint32_t from = skip_from;
++			if (soft_fifo) {
++				QG_LOG("SWEET QG: HW FIFO cycling again, software FIFO off\n");
++				soft_fifo = 0;
++				memset(&KD, 0, sizeof(KD));
++				from = 0;
++			}
++			skip_from = 0;
++			rt_stall_since_ms = 0;
++			if (last_wrap_ms && now - last_wrap_ms > hw + hw / 2) {
++				uint64_t missed = (now - last_wrap_ms + hw / 2) / hw;
++				st->fifo_gaps += (int32_t)(missed - 1);
++			}
++			read_geometry(st);
++			memset(&KD, 0, sizeof(KD));
++			if (!read_fifo(from, fifo_len, st)) {
++				KD.seq_no = seq++;
++				KD.fifo_time = rtc;
++				if (last_wrap_ms && from == 0)
++					qg_kdata_fifo_time_delta(&KD, (int)hw, (int)(now - last_wrap_ms));
++				st->fifo_cycles++;
++				run_daemon(rtc, now, st);
++			}
++			last_wrap_ms = now;
++		} else if (rt == rt_prev && !soft_fifo) {
++			/* HW FIFO not advancing (QG halted without its driver?): after 3
++			 * full FIFO periods fall back to a software FIFO from LAST_ADC_V /
++			 * LAST_BURST_AVG_I sampled every poll */
++			if (!rt_stall_since_ms) rt_stall_since_ms = now;
++			else if (now - rt_stall_since_ms > 3 * hw) {
++				QG_LOG("SWEET QG: HW FIFO stuck at %u for %llu ms: software FIFO\n", rt,
++				    (unsigned long long)(now - rt_stall_since_ms));
++				soft_fifo = 1;
++				memset(&KD, 0, sizeof(KD));
++				sf_entry_start_ms = 0; sf_n = 0; sf_entries = 0; sf_sum_v = sf_sum_i = 0;
++			}
++		} else {
++			rt_stall_since_ms = 0;
++		}
++		rt_prev = rt;
++		/* poll fast just before the expected completion */
++		if (!soft_fifo && rt + 1 >= fifo_len && acc + 12 >= fifo_count) delay = 200;
++	}
++	if (soft_fifo) soft_fifo_sample(rtc, now, st);
++
++	/* msoc alarm (qpnp_msoc_timer -> scale_soc_work) */
++	if (K.scale_armed && (int64_t)now >= K.scale_due_ms)
++		qg_kernel_scale_timer(&K, cur_ua, temp_dc, rtc, (int64_t)now);
++	/* soc_monitor_work, every 10 s */
++	if (now >= next_monitor_ms) {
++		qg_kernel_soc_monitor(&K, cur_ua, temp_dc, (int64_t)(now / 1000));
++		next_monitor_ms = now + 10000;
++	}
++	/* force_shutdown_work */
++	if (now >= next_fs_ms)
++		next_fs_ms = now + (uint64_t)qg_kernel_force_shutdown(&K, vbat_uv);
++	snapshot(st);
++	if (now - last_publish_ms >= 30000) { st->changed = 1; }
++	if (st->changed) last_publish_ms = now;
++	return delay;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET || SWEET_QG_HOST */
+diff --git a/bsd/dev/sweet_qg.h b/bsd/dev/sweet_qg.h
+new file mode 100644
+index 0000000..a62469d
+--- /dev/null
++++ b/bsd/dev/sweet_qg.h
+@@ -0,0 +1,49 @@
++/*
++ * sweet_qg.h - MIUI-exact battery percentage for SweetBattery (sweetbattery=1).
++ *
++ * bsd/dev/sweet_qg.c runs the bit-exact port of the MIUI QG chain
++ * (sweet_qg_algo.c: QTI hvdcp_opti "QG-D" daemon + qpnp-qg kernel side) on
++ * PM6150 registers read through sweet_spmi.  READ ONLY: no SPMI writes.
++ * Single instance, called only from the SweetBattery work loop.
++ */
++#ifndef SWEET_QG_H
++#define SWEET_QG_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct sweet_qg_status {
++	/* what iOS shows */
++	int32_t percent;          /* POWER_SUPPLY_PROP_CAPACITY (MIUI's number) */
++	int32_t charging;         /* POWER_SUPPLY_STATUS_CHARGING */
++	int32_t full;             /* charge_full (hold-at-100) or STATUS_FULL */
++	int32_t external;         /* USB present (0x1310 b4) */
++	int32_t charge_capable;   /* USB online (0x110B USE_USBIN && VALID_INPUT) */
++	int32_t critical;         /* force-shutdown condition */
++	int32_t mv;               /* LAST_ADC_V */
++	int32_t ua;               /* LAST_BURST_AVG_I, Linux sign: + = discharge */
++	int32_t temp_dc;          /* deci-degC used by the algorithm */
++	int32_t temp_src;         /* 0 = fixed 25 C, 1 = SDAM (last Linux value); TODO ADC */
++	int32_t learned_mah;      /* charge_full */
++	int32_t charge_counter_uah;
++	/* Linux internals, for the registry */
++	int32_t msoc, catch_up_soc, sys_soc, batt_soc, cc_soc, full_soc, maint_soc;
++	int32_t charge_full, ps_status, charge_done, health;
++	int32_t fifo_rt, fifo_len, fifo_count, fifo_interval_ms, acc_count;
++	int32_t fifo_cycles, fifo_gaps, fifo_rejects, fifo_source; /* 0 HW FIFO, 1 software FIFO */
++	int32_t daemon_cycles, daemon_writes, good_ocv_events, spmi_errors, multibyte;
++	int32_t pon_soc, pon_calc_soc, pon_used_shutdown, sdam_soc, sdam_age_s, sdam_magic_ok;
++	uint32_t rtc_s;
++	int32_t changed;          /* something published changed since the last poll */
++};
++
++/* 0 = running; <0 = QG/SPMI not usable (caller keeps its fallback) */
++int sweet_qg_start(struct sweet_qg_status *st);
++/* one step; returns the delay in ms until the next call */
++uint32_t sweet_qg_poll(struct sweet_qg_status *st);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/sweet_qg_algo.c b/bsd/dev/sweet_qg_algo.c
+new file mode 100644
+index 0000000..92c956d
+--- /dev/null
++++ b/bsd/dev/sweet_qg_algo.c
+@@ -0,0 +1,1436 @@
++/* GENERATED from davinci-ios/battery/port by "make kernel-files" - edit the port, not this */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET_QG_HOST)
++#pragma clang diagnostic ignored "-Wunknown-warning-option"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++/*
++ * qg_algo.c - see qg_algo.h.
++ *
++ * Section 2 (the daemon) is a transcription of hvdcp_opti's qg_read_cb
++ * (vaddr 0x31e30..0x33ab8), qg_main init (0x31880), qg_init_params (0x345e0),
++ * read_props (0x33ab8), qg_lookup_* (0x34b84..0x35270), qg_set_rconn,
++ * qg_set_fcc_gain, qg_update_esr, from the AArch64 instructions, keeping
++ * every FP operation, its precision (s vs d registers), its order, and the
++ * exact semantics of FCMP/FCSEL/FMIN/FMAX/FCVTZS.  Comments "@xxxxx" give
++ * the instruction address the code corresponds to.
++ *
++ * Integer only.  No libc.
++ */
++#include "sweet_qg_algo.h"
++
++#define F10_KEEP_USERSPACE_TABLES
++#include "sweet_qg_f10_profile.h"
++
++/* ================================================================== */
++/* 1. profile tables + kernel qg-profile-lib.c                         */
++
++struct qg_lut {
++	int rows, cols;
++	const int16_t *col;        /* degC */
++	const uint16_t *row;       /* centi-% (NULL for 1-row tables) */
++	const uint16_t *data;      /* rows x cols */
++};
++#define LUT(t, r, c) { r, c, t##_temp_c, t##_soc_cpct, &t[0][0] }
++static const struct qg_lut lut[16] = {
++	LUT(pc_temp_v1, 56, 5), LUT(pc_temp_v2, 56, 6),
++	{ 1, 5, fcc1_temp_temp_c, 0, fcc1_temp }, { 1, 6, fcc2_temp_temp_c, 0, fcc2_temp },
++	LUT(pc_temp_z1, 56, 5), LUT(pc_temp_z2, 56, 5), LUT(pc_temp_z3, 56, 5),
++	LUT(pc_temp_z4, 56, 5), LUT(pc_temp_z5, 56, 5), LUT(pc_temp_z6, 56, 5),
++	LUT(pc_temp_y1, 56, 6), LUT(pc_temp_y2, 56, 6), LUT(pc_temp_y3, 56, 6),
++	LUT(pc_temp_y4, 56, 6), LUT(pc_temp_y5, 56, 6), LUT(pc_temp_y6, 56, 6),
++};
++#define DEGC_SCALE 10
++#define CE(l, j)   ((int)(l)->col[j])
++#define RE(l, i)   ((int)(l)->row[i])
++#define DT(l, i, j) ((int)(l)->data[(i) * (l)->cols + (j)])
++#define is_between(left, right, value) \
++	(((left) >= (right) && (left) >= (value) && (value) >= (right)) || \
++	 ((left) <= (right) && (left) <= (value) && (value) <= (right)))
++#define CAP(lo, hi, v) (((lo) > (v)) ? (lo) : (((v) > (hi)) ? (hi) : (v)))
++
++static int lin(int y0, int x0, int y1, int x1, int x)
++{
++	if (y0 == y1 || x == x0) return y0;
++	if (x1 == x0 || x == x1) return y1;
++	return y0 + ((y1 - y0) * (x - x0) / (x1 - x0));
++}
++
++static int interp_single_row(const struct qg_lut *l, int x, int scale)
++{
++	int i, cols = l->cols;
++	if (x < CE(l, 0) * scale) return DT(l, 0, 0);
++	if (x > CE(l, cols - 1) * scale) return DT(l, 0, cols - 1);
++	for (i = 0; i < cols; i++)
++		if (x <= CE(l, i) * scale) break;
++	if (x == CE(l, i) * scale) return DT(l, 0, i);
++	return lin(DT(l, 0, i - 1), CE(l, i - 1) * scale, DT(l, 0, i), CE(l, i) * scale, x);
++}
++
++static int interp_soc(const struct qg_lut *l, int t, int ocv)
++{
++	int i, j, hi, lo, rows = l->rows, cols = l->cols;
++	if (t < CE(l, 0) * DEGC_SCALE) t = CE(l, 0) * DEGC_SCALE;
++	if (t > CE(l, cols - 1) * DEGC_SCALE) t = CE(l, cols - 1) * DEGC_SCALE;
++	for (j = 0; j < cols; j++)
++		if (t <= CE(l, j) * DEGC_SCALE) break;
++	if (t == CE(l, j) * DEGC_SCALE) {
++		if (ocv >= DT(l, 0, j)) return RE(l, 0);
++		if (ocv <= DT(l, rows - 1, j)) return RE(l, rows - 1);
++		for (i = 0; i < rows; i++) {
++			if (ocv >= DT(l, i, j)) {
++				if (ocv == DT(l, i, j)) return RE(l, i);
++				return lin(RE(l, i), DT(l, i, j), RE(l, i - 1), DT(l, i - 1, j), ocv);
++			}
++		}
++	}
++	if (ocv >= DT(l, 0, j)) return RE(l, 0);
++	if (ocv <= DT(l, rows - 1, j - 1)) return RE(l, rows - 1);
++	lo = hi = 0;
++	for (i = 0; i < rows - 1; i++) {
++		if (hi == 0 && is_between(DT(l, i, j), DT(l, i + 1, j), ocv))
++			hi = lin(RE(l, i), DT(l, i, j), RE(l, i + 1), DT(l, i + 1, j), ocv);
++		if (lo == 0 && is_between(DT(l, i, j - 1), DT(l, i + 1, j - 1), ocv))
++			lo = lin(RE(l, i), DT(l, i, j - 1), RE(l, i + 1), DT(l, i + 1, j - 1), ocv);
++		if (hi && lo)
++			return lin(lo, CE(l, j - 1) * DEGC_SCALE, hi, CE(l, j) * DEGC_SCALE, t);
++	}
++	if (hi) return hi;
++	if (lo) return lo;
++	return 10000;
++}
++
++static int interp_var(const struct qg_lut *l, int t, int soc)
++{
++	int i, v1, v2, rows = l->rows, cols = l->cols, r1 = 0, r2 = 0;
++	if (soc > RE(l, 0)) { r1 = r2 = 0; }
++	else if (soc < RE(l, rows - 1)) { r1 = r2 = rows - 1; }
++	else {
++		for (i = 0; i < rows; i++) {
++			if (soc == RE(l, i)) { r1 = r2 = i; break; }
++			if (soc > RE(l, i)) { r1 = i - 1; r2 = i; break; }
++		}
++	}
++	if (t < CE(l, 0) * DEGC_SCALE) t = CE(l, 0) * DEGC_SCALE;
++	if (t > CE(l, cols - 1) * DEGC_SCALE) t = CE(l, cols - 1) * DEGC_SCALE;
++	for (i = 0; i < cols; i++)
++		if (t <= CE(l, i) * DEGC_SCALE) break;
++	if (t == CE(l, i) * DEGC_SCALE)
++		return lin(DT(l, r1, i), RE(l, r1), DT(l, r2, i), RE(l, r2), soc);
++	v1 = lin(DT(l, r1, i - 1), CE(l, i - 1) * DEGC_SCALE, DT(l, r1, i), CE(l, i) * DEGC_SCALE, t);
++	v2 = lin(DT(l, r2, i - 1), CE(l, i - 1) * DEGC_SCALE, DT(l, r2, i), CE(l, i) * DEGC_SCALE, t);
++	return lin(v1, RE(l, r1), v2, RE(l, r2), soc);
++}
++
++static int interp_slope(const struct qg_lut *l, int t, int soc)
++{
++	int i, o1, o2, rows = l->rows, cols = l->cols, r1 = 0, r2 = 0, s;
++	if (soc >= RE(l, 0)) { r1 = 0; r2 = 1; }
++	else if (soc <= RE(l, rows - 1)) { r1 = rows - 2; r2 = rows - 1; }
++	else {
++		for (i = 0; i < rows; i++)
++			if (soc >= RE(l, i)) { r1 = i - 1; r2 = i; break; }
++	}
++	if (t < CE(l, 0) * DEGC_SCALE) t = CE(l, 0) * DEGC_SCALE;
++	if (t > CE(l, cols - 1) * DEGC_SCALE) t = CE(l, cols - 1) * DEGC_SCALE;
++	for (i = 0; i < cols; i++)
++		if (t <= CE(l, i) * DEGC_SCALE) break;
++	if (t == CE(l, i) * DEGC_SCALE) {
++		s = DT(l, r1, i) - DT(l, r2, i);
++	} else {
++		o1 = lin(DT(l, r1, i - 1), CE(l, i - 1) * DEGC_SCALE, DT(l, r1, i), CE(l, i) * DEGC_SCALE, t);
++		o2 = lin(DT(l, r2, i - 1), CE(l, i - 1) * DEGC_SCALE, DT(l, r2, i), CE(l, i) * DEGC_SCALE, t);
++		s = o1 - o2;
++	}
++	if (s <= 0) s = 1;
++	s *= 10000;
++	s /= (RE(l, r1) - RE(l, r2));
++	return s;
++}
++
++/* qg-battery-profile.c ioctl semantics (UV_TO_DECIUV = /100, DECIUV_TO_UV = *100) */
++int qg_prof_soc(int ocv_uv, int temp, int charging)
++{
++	int v = interp_soc(&lut[charging ? 0 : 1], temp, ocv_uv / 100);
++	return CAP(0, 10000, v);
++}
++int qg_prof_ocv(int soc, int temp, int charging)
++{
++	int v = interp_var(&lut[charging ? 0 : 1], temp, soc) * 100;
++	return CAP(2000000, 5000000, v);
++}
++int qg_prof_fcc(int temp, int charging)
++{
++	int v = interp_single_row(&lut[charging ? 2 : 3], temp, DEGC_SCALE);
++	return CAP(100, 16000, v);
++}
++int qg_prof_slope(int soc, int temp, int charging)
++{
++	int v = interp_slope(&lut[charging ? 0 : 1], temp, soc);
++	return CAP(1, 50000, v);
++}
++int qg_prof_var(int table, int soc, int temp)
++{
++	int v;
++	if (table < 4 || table > 15) return 0;
++	v = interp_var(&lut[table], temp, soc);
++	return CAP(0, 65535, v);
++}
++/* qg-util.c lookup_soc_ocv(): DIV_ROUND_CLOSEST(soc, 100), CAP 0..100 */
++int qg_lookup_soc_ocv_pct(int ocv_uv, int temp, int charging)
++{
++	int soc = interp_soc(&lut[charging ? 0 : 1], temp, ocv_uv / 100);
++	soc = (soc + 50) / 100;   /* soc >= 0 */
++	return CAP(0, 100, soc);
++}
++
++/* ================================================================== */
++/* 2. QG daemon                                                        */
++
++#define S(n)  (d->s[QD_##n])
++#define I2F(x)   f32_from_i32((int32_t)(x))
++#define F2I(x)   f32_to_i32_rz(x)
++#define FADD     f32_add
++#define FSUB     f32_sub
++#define FMUL     f32_mul
++#define FDIV     f32_div
++#define FCMP     f32_cmp
++
++/* qg_lookup_var() param ids */
++enum { QV_SLOPE = 2, QV_RSHORT = 3, QV_RLONG = 4, QV_CSHORT = 5, QV_CLONG = 6,
++       QV_ESR = 7, QV_RBAT = 8 };
++
++/* .data @0x13bcc8: {name, table, sub, div, add, mult} as shipped */
++static const struct qd_ptab ptab_init[16] = {
++	{ 0, 1, 0, 0 }, { 0, 1, 0, 0 }, { 0, 0, 0, 0 }, { 0, 0, 0, 0 },
++	{ 8924, 35, 0, 0 }, { 8936, 1, 0, 0 }, { 19256, 12, 0, 0 },
++	{ 14578, 14, 0, 0 }, { 9581, 1, 0, 0 }, { 14027, 6, 0, 0 },
++	{ 3724, 19, 0, 0 }, { 9643, 1, 0, 0 }, { 13258, 3, 0, 0 },
++	{ 16395, 7, 0, 0 }, { 8712, 1, 0, 0 }, { 4825, 2, 0, 0 },
++};
++
++/* @0x34b84 */
++static int qd_lookup_var(struct qg_daemon *d, int param, int soc, int temp, int chg, int sf)
++{
++	int t, v, raw;
++	const struct qd_ptab *pt;
++	if (param == QV_SLOPE)          /* table index (~chg & 1): chg -> SOC_OCV1 */
++		return CAP(1, 50000, qg_prof_slope(soc, temp, chg ? 1 : 0)) ;
++	switch (param) {
++	case QV_RSHORT: t = chg ? 6 : 12; break;   /* Z3 / Y3 */
++	case QV_RLONG:  t = chg ? 7 : 13; break;   /* Z4 / Y4 */
++	case QV_CSHORT: t = chg ? 5 : 11; break;   /* Z2 / Y2 */
++	case QV_CLONG:  t = chg ? 8 : 14; break;   /* Z5 / Y5 */
++	case QV_ESR:    t = chg ? 4 : 10; break;   /* Z1 / Y1 */
++	default:        t = chg ? 9 : 15; break;   /* Z6 / Y6 (QV_RBAT) */
++	}
++	pt = &d->tab[t];
++	raw = qg_prof_var(t, soc, temp);
++	v = pt->div ? (raw - pt->sub) / pt->div : 0;
++	if (pt->add) v += pt->add;
++	if (pt->mult && sf) v = (v * pt->mult + 5000) / 10000;
++	if (v > 0xfffe) v = 0xffff;
++	if (v < 2) v = 1;
++	return v;
++}
++
++/* @0x34eac */
++static int qd_lookup_fcc(struct qg_daemon *d, int temp, int chg)
++{
++	int t = chg ? 2 : 3, v = qg_prof_fcc(temp, chg);
++	if (d->tab[t].div) v = (v * d->tab[t].div + 5000) / 10000;   /* fcc gain */
++	if (v > 15999) v = 16000;
++	if (v < 0x65) v = 100;
++	return v;
++}
++
++/* @0x35018 */
++static int qd_lookup_soc(int ocv, int temp, int chg)
++{
++	int v = qg_prof_soc(ocv, temp, chg);
++	if (v > 9999) v = 10000;
++	return v < 0 ? 0 : v;
++}
++
++/* @0x3513c */
++static int qd_lookup_ocv(int soc, int temp, int chg)
++{
++	int v = qg_prof_ocv(soc, temp, chg);
++	if (v > 4999999) v = 5000000;
++	if (v < 0x1e8481) v = 2000000;
++	return v;
++}
++
++/* @0x349ac */
++static void qd_set_rconn(struct qg_daemon *d, int r)
++{
++	d->tab[4].add = d->tab[9].add = d->tab[10].add = d->tab[15].add = r;
++}
++
++/* @0x349c8 */
++static void qd_set_fcc_gain(struct qg_daemon *d, int learned, int nominal)
++{
++	int g = 0;
++	if (learned != nominal && learned && nominal) {
++		int a = (learned / 1000) * 10000 + nominal / 2000;
++		g = (nominal / 1000) ? a / (nominal / 1000) : 0;
++	}
++	d->tab[2].div = d->tab[3].div = g;
++}
++
++/* @0x34ab8 */
++static void qd_update_esr(struct qg_daemon *d, int chg_sf, int dischg_sf)
++{
++	if (d->tab[6].mult != chg_sf)
++		d->tab[4].mult = d->tab[6].mult = d->tab[7].mult = d->tab[9].mult = chg_sf;
++	if (d->tab[12].mult != dischg_sf)
++		d->tab[10].mult = d->tab[12].mult = d->tab[13].mult = d->tab[15].mult = dischg_sf;
++}
++
++/* read_props() @0x33ab8: configuration defaults + bms properties */
++static void qd_read_props(struct qg_daemon *d, const struct qg_props *p, struct qg_props *dst)
++{
++	d->fg_type = p->fg_type >= 0 ? p->fg_type : 0;
++	d->clk_skew_pct = 5;
++	d->vwt = 50; d->ccwt = 50;
++	if (d->fg_type) { d->vwt = 100; d->ccwt = 0; }
++	d->gain_dischg_high = d->gain_dischg_med = d->gain_dischg_low = F32_0_35;
++	d->gain_chg_high = d->gain_chg_med = d->gain_chg_low = F32_0_35;
++	if (d->fg_type) {
++		d->gain_dischg_high = d->gain_dischg_med = d->gain_dischg_low = 0;
++		d->gain_chg_high = d->gain_chg_med = d->gain_chg_low = 0;
++	}
++	d->chg_med2low_ua = -1000000; d->chg_hi2med_ua = -1500000;
++	d->dischg_med2low_ua = 100000; d->dischg_hi2med_ua = 250000;
++	d->fullsoc = 9900; d->fullsoc_margin = 0; d->fullsoc_gain = F32_2;
++	d->coff_soc = 200; d->coff_gain = F32_2; d->cld_coff_gain = F32_10;
++	d->cold_temp = 0; d->full_soc_cold_temp = 0;
++	d->coff_ibat_ma = 250; d->coff_cold_ibat_ma = 500;
++	d->rconn = p->resistance_capacitive;
++	d->esr_delta_limit = 3; d->esr_sf_max = 20000; d->esr_sf_min = 5000;
++	d->esr_use_discharge = 0;
++	*dst = *p;
++	dst->batt_full_current = p->batt_full_current >= 0 ? -p->batt_full_current : -100000;
++	if (p->charge_full >= 0 && p->charge_full != d->learned_uah) {
++		d->learned_uah = p->charge_full;
++		d->design_uah = p->charge_full_design >= 0 ? p->charge_full_design : 0;
++	}
++}
++
++/* @0x345e0 */
++static int qd_init_params(struct qg_daemon *d, int ocv, int temp, uint32_t fifo_time)
++{
++	int n, soc;
++	f32 ocvf;
++	for (n = 0; n < QD_NSLOT; n++) { d->s[n].i = 0; d->s[n].f = 0; }
++	if (ocv > 4999999) ocv = 5000000;
++	if (ocv < 0x1e8481) ocv = 2000000;
++	soc = qd_lookup_soc(ocv, temp, 0);
++	S(B_TEMP).i = temp; S(B_TEMP).f = I2F(temp);
++	ocvf = FDIV(I2F(ocv), F32_1E6);
++	S(INIT_OCV).f = ocvf; S(V_OCV).f = ocvf;
++	S(TIMESTAMP).i = (int32_t)fifo_time; S(TIMESTAMP).f = I2F(fifo_time);
++	S(CUTOFF_SOC).i = d->coff_soc; S(FULL_SOC).i = d->fullsoc;
++	S(INIT_OCV).i = ocv; S(V_OCV).i = ocv;
++	S(CUTOFF_SOC).f = I2F(d->coff_soc); S(FULL_SOC).f = I2F(d->fullsoc);
++	S(INIT_SOC).i = soc; S(VOLTAGE_SOC).i = soc; S(CC_SOC).i = soc;
++	S(INIT_SOC).f = S(VOLTAGE_SOC).f = S(CC_SOC).f = I2F(soc);
++	return 0;
++}
++
++int qg_daemon_init(struct qg_daemon *d, const struct qg_props *p)
++{
++	int n, cut, full, soc, ocv;
++	uint8_t *z = (uint8_t *)d;
++	for (n = 0; n < (int)sizeof(*d); n++) z[n] = 0;
++	for (n = 0; n < 16; n++) d->tab[n] = ptab_init[n];
++	qd_read_props(d, p, &d->p);
++	/* CUTOFF_SOC_START / FULL_SOC_START */
++	if (d->p.voltage_min > 0)
++		d->coff_soc = qd_lookup_soc(d->p.voltage_min, d->p.temp, 0);
++	if (d->p.voltage_max > 0) {
++		full = qd_lookup_soc(d->p.voltage_max, d->p.temp, 1);
++		if (full >= 0x26ac) full = 0x26ac;
++		else if (full < 1) full = 0;
++		d->fullsoc = full;
++	}
++	cut = d->coff_soc; full = d->fullsoc;
++	soc = (d->p.capacity * (full - cut) + 50) / 100 + cut;
++	ocv = qd_lookup_ocv(soc, d->p.temp, 0);
++	/* TIMESTAMP comes from the (still empty) kdata buffer: 0 */
++	qd_init_params(d, ocv, d->p.temp, 0);
++	return 0;
++}
++
++/* one exp-decay RC branch, @0x32dac (short) / @0x32e88 (long) */
++static void qd_rc(struct qg_daemon *d, int dt_ms, int ri, int ci, int ii, int vi, f32 ibat)
++{
++	f32 r = d->s[ri].f, s1, s0, s2, prev;
++	f64 e, dd;
++	s1 = FDIV(I2F(dt_ms), F32_M1000);
++	s0 = FMUL(r, d->s[ci].f);
++	e = sf_exp(f64_div(f32_to_f64(s1), f32_to_f64(s0)));
++	prev = d->s[ii].f;
++	s0 = f64_to_f32(e);
++	dd = f64_sub(F64_1, f32_to_f64(s0));
++	s2 = FSUB(ibat, prev);
++	dd = f64_mul(dd, f32_to_f64(s2));
++	s0 = f64_to_f32(dd);
++	s2 = FADD(prev, s0);            /* new branch current */
++	s1 = FMUL(r, s2);               /* branch voltage */
++	d->s[ii].i = F2I(FMUL(s2, F32_1E6));
++	d->s[ii].f = s2;
++	d->s[vi].f = s1;
++	d->s[vi].i = F2I(FMUL(s1, F32_1E6));
++}
++
++/* clamp v to [2.0, vcap] the way @0x32a08 / @0x330f0 do */
++static f32 qd_clamp_vbat(struct qg_daemon *d, f32 v)
++{
++	if (sf_mi(FCMP(v, F32_2))) return F32_2;
++	return sf_gt(FCMP(v, S(V_CAP).f)) ? S(V_CAP).f : v;
++}
++
++/* one FIFO entry, @0x32740 .. @0x3371c; returns 0 (entries are independent) */
++static void qd_fifo(struct qg_daemon *d, const struct qg_fifo_data *ff)
++{
++	const struct qg_props *p = &d->p;
++	int32_t ich, ibref, fcc, ocv100, rb100, dt, v, rs, bs, vs, ccs, ma, w3, w9;
++	int chg, temp;
++	f32 s0, s1, s2, s3, s4, s5, s6, s7, s14, s15, iterm_f, gain;
++	int64_t t64;
++
++	/* @0x32740 */
++	S(FIFO_I).i = (int32_t)ff->i; S(FIFO_I).f = FDIV(I2F(ff->i), F32_1E6);
++	S(FIFO_V).i = (int32_t)ff->v; S(FIFO_V).f = FDIV(I2F(ff->v), F32_1E6);
++	S(FIFO_INT).i = (int32_t)ff->interval; S(FIFO_INT).f = FDIV(I2F(ff->interval), F32_1000);
++	temp = p->temp;
++	S(B_TEMP).i = temp; S(B_TEMP).f = I2F(temp);
++	S(FIFO_CNT).i = (int32_t)ff->count; S(FIFO_CNT).f = I2F(ff->count);
++	ich = d->fg_type ? S(V_IBAT).i : (int32_t)ff->i;
++	chg = ich < -5000;
++	d->is_charging = (uint8_t)chg;
++	if (ff->v == 0) return;
++
++	/* FCC  @0x327c4 */
++	fcc = qd_lookup_fcc(d, temp, chg);
++	S(FCC).i = fcc; S(FCC).f = FDIV(I2F(fcc), F32_1000);
++
++	/* VBAT_CAP  @0x327fc */
++	ibref = d->fg_type ? S(V_IBAT).i : S(FIFO_I).i;
++	ocv100 = qd_lookup_ocv(10000, temp, 1);
++	rb100 = qd_lookup_var(d, QV_RBAT, 10000, temp, 1, 1);
++	s1 = FDIV(I2F(rb100), F32_1000);
++	s3 = FDIV(I2F(p->batt_full_current), F32_1E6);
++	s0 = FDIV(I2F(ocv100), F32_1E6);
++	s2 = FMUL(s1, s3);
++	s6 = FSUB(s0, s2);
++	s5 = f64_to_f32(f64_add(f32_to_f64(s6), F64_M0_005));
++	if (S(V_CAP).i == 0) {
++		S(V_CAP).i = F2I(FMUL(s5, F32_1E6));
++		S(V_CAP).f = s5;
++	}
++	s4 = FDIV(I2F(p->voltage_max), F32_1E6);
++	if (!sf_le(FCMP(s3, I2F(ibref)))) {
++		s7 = S(FIFO_V).f;
++		s4 = sf_gt(FCMP(s4, s7)) ? s4 : s7;
++		s6 = FSUB(s6, s4);
++		s5 = sf_mi(f64_cmp(f32_to_f64(s6), F64_0_005)) ? s5 : s4;
++		S(V_CAP).i = F2I(FMUL(s5, F32_1E6));
++		S(V_CAP).f = s5;
++	}
++
++	/* V_SOC  @0x32930 */
++	v = qd_lookup_var(d, QV_SLOPE, S(VOLTAGE_SOC).i, temp, 0, 1);
++	S(SLOPE).i = v; S(SLOPE).f = FDIV(I2F(v), F32_10000);
++	v = qd_lookup_var(d, QV_RBAT, S(VOLTAGE_SOC).i, temp, chg, 1);
++	S(T_RBAT).i = v; s0 = FDIV(I2F(v), F32_1000); S(T_RBAT).f = s0;
++	dt = (int32_t)(ff->count * ff->interval) + d->fifo_delta;
++	s1 = FDIV(I2F(dt), F32_1000);
++	s1 = FMUL(s1, S(SLOPE).f);
++	s2 = FMUL(S(FCC).f, F32_3600);
++	s1 = FDIV(s1, s2);
++	s2 = qd_clamp_vbat(d, S(FIFO_V).f);
++	s4 = S(V_OCV).f;
++	s0 = FADD(s0, s0);
++	s2 = FSUB(s4, s2);
++	s3 = FADD(s2, s2);
++	s2 = FADD(s0, s1);
++	s15 = FDIV(s3, s2);
++	s0 = FMUL(s1, s15);
++	s14 = FSUB(s4, s0);
++	S(V_IBAT).f = s15; S(V_OCV).f = s14;
++	S(V_IBAT).i = F2I(FMUL(s15, F32_1E6));
++	S(V_OCV).i = F2I(FMUL(s14, F32_1E6));
++	v = qd_lookup_soc(S(V_OCV).i, temp, 0);
++	S(VOLTAGE_SOC).i = v; S(VOLTAGE_SOC).f = I2F(v);
++
++	/* CC_SOC  @0x32b00 */
++	dt = (int32_t)(ff->count * ff->interval) + d->fifo_delta;
++	s0 = I2F(S(FIFO_I).i);
++	s1 = FDIV(I2F(dt), F32_1000);
++	s0 = FMUL(s1, s0);
++	s0 = FDIV(s0, F32_3600);
++	s2 = FADD(S(CC_UAH).f, s0);
++	s1 = I2F(fcc * -2000);
++	if (!sf_mi(FCMP(s2, s1))) {
++		s3 = I2F(fcc * 2000);
++		s1 = sf_le(FCMP(s2, s3)) ? s2 : s3;
++	}
++	s3 = I2F(fcc);
++	s2 = FMUL(s1, F32_M10);
++	S(CC_FIFO).f = s0; S(CC_FIFO).i = F2I(s0);
++	s2 = FDIV(s2, s3);
++	S(CC_UAH).f = s1; S(CC_UAH).i = F2I(s1);
++	s2 = FADD(S(INIT_SOC).f, s2);
++	s0 = f32_min(s2, F32_20000);
++	if (sf_mi(FCMP(s2, F32_M10000))) s0 = F32_M10000;
++	S(CC_SOC).f = s0; S(CC_SOC).i = F2I(s0);
++
++	/* R_SOC  @0x32c18 */
++	vs = S(VOLTAGE_SOC).i; vs = vs < 10000 ? vs : 10000; if (vs < 0) vs = 0;
++	ccs = S(CC_SOC).i; ccs = ccs < 11500 ? ccs : 11500; ccs = ccs > -1500 ? ccs : -1500;
++	rs = (vs * d->vwt + ccs * d->ccwt) / 100;
++	rs = rs < 11500 ? rs : 11500; rs = rs > -1500 ? rs : -1500;
++	S(R_SOC).i = rs; S(R_SOC).f = I2F(rs);
++
++	/* B_SOC  @0x32ce4 */
++	bs = rs + S(SOC_CORR).i; bs = bs < 10000 ? bs : 10000; if (bs < 0) bs = 0;
++	s14 = d->fg_type ? S(V_IBAT).f : S(FIFO_I).f;
++	S(B_SOC).i = bs; S(B_SOC).f = I2F(bs);
++	/* qg_get_rbat_all + set_intval */
++	v = qd_lookup_var(d, QV_RSHORT, bs, temp, chg, 1); S(RSHORT).i = v; S(RSHORT).f = FDIV(I2F(v), F32_1000);
++	v = qd_lookup_var(d, QV_RLONG, bs, temp, chg, 1);  S(RLONG).i = v;  S(RLONG).f = FDIV(I2F(v), F32_1000);
++	v = qd_lookup_var(d, QV_CLONG, bs, temp, chg, 1);  S(CLONG).i = v;  S(CLONG).f = I2F(v);
++	v = qd_lookup_var(d, QV_CSHORT, bs, temp, chg, 1); S(CSHORT).i = v; S(CSHORT).f = I2F(v);
++	v = qd_lookup_var(d, QV_ESR, bs, temp, chg, 1);    S(ESR).i = v;    S(ESR).f = FDIV(I2F(v), F32_1000);
++	v = qd_lookup_var(d, QV_RBAT, bs, temp, chg, 1);   S(T_RBAT).i = v; S(T_RBAT).f = FDIV(I2F(v), F32_1000);
++
++	dt = (int32_t)(ff->count * ff->interval) + d->fifo_delta;
++	qd_rc(d, dt, QD_RSHORT, QD_CSHORT, QD_I_RSHORT, QD_V_RSHORT, s14);
++	qd_rc(d, dt, QD_RLONG, QD_CLONG, QD_I_RLONG, QD_V_RLONG, s14);
++
++	/* M_ESR / V_ESR  @0x33020 */
++	s0 = FADD(S(RLONG).f, S(RSHORT).f);
++	s0 = FADD(s0, S(ESR).f);
++	s0 = FSUB(S(T_RBAT).f, s0);
++	s1 = f32_max(s0, F32_0);
++	S(M_ESR).i = F2I(FMUL(s1, F32_1000));
++	s0 = FADD(S(ESR).f, s1);
++	s0 = FMUL(s14, s0);
++	S(M_ESR).f = s1; S(V_ESR).f = s0;
++	S(V_ESR).i = F2I(FMUL(s0, F32_1E6));
++
++	/* VBAT_ERR  @0x330a4 */
++	v = qd_lookup_ocv(S(B_SOC).i, temp, chg);
++	s3 = FDIV(I2F(v), F32_1E6);
++	S(B_OCV).f = s3;
++	s1 = FSUB(s3, S(V_ESR).f);
++	s1 = FSUB(s1, S(V_RLONG).f);
++	s1 = FSUB(s1, S(V_RSHORT).f);
++	S(B_OCV).i = v;
++	s2 = qd_clamp_vbat(d, S(FIFO_V).f);
++	s0 = FSUB(s2, s1);
++	S(VBAT_ERR).f = s0; S(VBAT_ERR).i = F2I(FMUL(s0, F32_1E6));
++
++	/* SOC_CORR  @0x33160 */
++	if (chg) {
++		if (d->chg_hi2med_ua > S(FIFO_I).i) gain = d->gain_chg_high;
++		else gain = d->chg_med2low_ua > S(FIFO_I).i ? d->gain_chg_med : d->gain_chg_low;
++	} else {
++		if (d->dischg_hi2med_ua < S(FIFO_I).i) gain = d->gain_dischg_high;
++		else gain = d->dischg_med2low_ua < S(FIFO_I).i ? d->gain_dischg_med : d->gain_dischg_low;
++	}
++	s0 = S(VBAT_ERR).f;
++	S(SOC_GAIN).i = F2I(FMUL(gain, F32_1000));
++	s1 = S(SOC_CORR).f;
++	s0 = FMUL(gain, s0);
++	s0 = FMUL(s0, F32_100);
++	s0 = FADD(s1, s0);
++	s2 = FADD(s0, S(R_SOC).f);
++	s1 = f32_min(s2, F32_10000);
++	if (sf_mi(FCMP(s2, F32_0))) s1 = F32_0;
++	S(SOC_CORR).i = F2I(s0);
++	S(SOC_GAIN).f = gain;
++	S(SOC_CORR).f = s0;
++	S(B_SOC).f = s1; S(B_SOC).i = F2I(s1);
++	v = qd_lookup_ocv(S(B_SOC).i, temp, chg);
++	S(B_OCV).i = v; S(B_OCV).f = FDIV(I2F(v), F32_1E6);
++
++	/* CUTOFF_SOC  @0x332e4 */
++	ich = d->fg_type ? S(V_IBAT).i : S(FIFO_I).i;
++	if (temp < d->cold_temp) {
++		ma = ich / 1000; ma = d->coff_cold_ibat_ma > ma ? d->coff_cold_ibat_ma : ma;
++		gain = d->cld_coff_gain;
++	} else {
++		ma = ich / 1000; ma = d->coff_ibat_ma > ma ? d->coff_ibat_ma : ma;
++		gain = d->coff_gain;
++	}
++	ma *= 1000;
++	S(CUTOFF_IBAT).i = ma; S(CUTOFF_IBAT).f = FDIV(I2F(ma), F32_1E6);
++	v = qd_lookup_ocv(S(CUTOFF_SOC).i, temp, 0);
++	S(CUTOFF_OCV).i = v; S(CUTOFF_OCV).f = FDIV(I2F(v), F32_1E6);
++	v = qd_lookup_var(d, QV_RBAT, S(CUTOFF_SOC).i, temp, 0, 1);
++	s1 = FDIV(I2F(v), F32_1000);
++	s3 = FMUL(s1, S(CUTOFF_IBAT).f);
++	s3 = FSUB(S(CUTOFF_OCV).f, s3);
++	s2 = FDIV(I2F(p->voltage_min), F32_1E6);
++	w9 = F2I(FMUL(s3, F32_1E6));
++	s4 = FSUB(s2, s3);
++	s5 = FMUL(gain, s4);
++	S(CUTOFF_RBAT).i = v;
++	s5 = FMUL(s5, F32_100);
++	s5 = FADD(S(CUTOFF_SOC).f, s5);
++	s6 = f32_min(s5, F32_10000);
++	s5 = sf_mi(FCMP(s5, F32_0)) ? F32_0 : s6;
++	S(CUTOFF_RBAT).f = s1;
++	S(CUTOFF_VPREDICT).f = s3; S(CUTOFF_VPREDICT).i = w9;
++	S(CUTOFF_SOC).f = s5; S(CUTOFF_SOC).i = F2I(s5);
++
++	/* FULL_SOC  @0x334d4 */
++	v = qd_lookup_ocv(S(FULL_SOC).i, temp, 1);
++	S(FULL_OCV).i = v; S(FULL_OCV).f = FDIV(I2F(v), F32_1E6);
++	v = qd_lookup_var(d, QV_RBAT, S(FULL_SOC).i, temp, 1, 1);
++	iterm_f = I2F(p->batt_full_current);
++	s2 = FDIV(I2F(v), F32_1000);
++	s0 = FDIV(iterm_f, F32_1E6);
++	S(FULLSOC_RBAT).i = v;
++	s1 = FMUL(s2, s0);
++	s3 = FSUB(S(FULL_OCV).f, s1);
++	w9 = F2I(FMUL(s3, F32_1E6));
++	s5 = F32_0;
++	S(FULLSOC_RBAT).f = s2;
++	S(FULLSOC_VPREDICT).f = s3; S(FULLSOC_VPREDICT).i = w9;
++	if (!(temp < d->full_soc_cold_temp) && S(FIFO_I).i < 0) s5 = d->fullsoc_gain;
++	s4 = FSUB(S(V_CAP).f, s3);
++	s5 = FMUL(s5, s4);
++	s5 = FMUL(s5, F32_100);
++	s5 = FADD(S(FULL_SOC).f, s5);
++	s6 = f32_min(s5, F32_10000);
++	s5 = sf_mi(FCMP(s5, F32_200)) ? F32_200 : s6;
++	w9 = F2I(s5);
++	S(FULL_SOC).f = s5; S(FULL_SOC).i = w9;
++	if (S(FIFO_I).i < 0 && S(S_SOC).i >= 10000) {
++		s5 = I2F(S(B_SOC).i - d->fullsoc_margin);
++		w9 = F2I(s5);
++		s5 = I2F(w9);
++		S(FULL_SOC).i = w9; S(FULL_SOC).f = s5;
++	}
++	w3 = S(CUTOFF_SOC).i;
++	if (!(w3 < w9)) {
++		w3 = w9 - 100;
++		S(CUTOFF_SOC).i = w3; S(CUTOFF_SOC).f = I2F(w3);
++	}
++
++	/* SYS_SOC  @0x33680 */
++	v = S(B_SOC).i - w3;
++	if (v < 0) v = 0;
++	t64 = (int64_t)v * 100 * 100;
++	v = S(FULL_SOC).i - w3;
++	S(S_SOC).i = v ? (int32_t)(t64 / v) : 0;
++	S(S_SOC).f = I2F(S(S_SOC).i);
++	(void)s7;
++}
++
++int qg_daemon_process(struct qg_daemon *d, const struct qg_kernel_data *kd,
++		      const struct qg_props *pin, struct qg_user_data *ud)
++{
++	const struct qg_param *P = kd->param;
++	int32_t v, n, len, r, cc;
++	int k;
++
++	qd_read_props(d, pin, &d->p);
++	/* @0x31f08 */
++	S(B_TEMP).i = d->p.temp; S(B_TEMP).f = I2F(d->p.temp);
++	v = d->p.capacity * 100;
++	S(M_SOC).i = v; S(M_SOC).f = I2F(v);
++	d->have_soc = 0;
++	d->fifo_delta = 0;
++	S(TIMESTAMP).i = (int32_t)kd->fifo_time; S(TIMESTAMP).f = I2F(kd->fifo_time);
++	S(SEQNO).i = (int32_t)kd->seq_no; S(SEQNO).f = I2F(kd->seq_no);
++	S(QG_MODE).i = d->fg_type; S(QG_MODE).f = I2F(d->fg_type);
++
++	/* FIFO_TIME_DELTA  @0x31f74 */
++	if (P[QG_FIFO_TIME_DELTA].valid) {
++		len = (int32_t)kd->fifo_length;
++		v = 0;
++		if (len) {
++			uint32_t hw = kd->fifo_length * kd->fifo[0].interval * kd->fifo[0].count;
++			int32_t margin = (int32_t)((int32_t)hw * d->clk_skew_pct) / 100;
++			int32_t sw = (int32_t)P[QG_FIFO_TIME_DELTA].data - (int32_t)hw;
++			int32_t c = sw > margin ? margin : sw;
++			if (sw < -margin) c = -margin;
++			d->fifo_delta = c / len;
++			v = d->fifo_delta;
++		}
++		S(FIFO_DELTA).i = v; S(FIFO_DELTA).f = FDIV(I2F(v), F32_1000);
++	}
++
++	/* CLEAR_LEARNT_DATA  @0x32080 */
++	if (P[QG_CLEAR_LEARNT_DATA].valid) {
++		d->esr_chg_delta = d->esr_dischg_delta = d->esr_chg_sf = d->esr_dischg_sf = 0;
++		qd_update_esr(d, 0, 0);
++		d->learned_uah = d->design_uah = 0;
++		qd_set_fcc_gain(d, 0, 0);
++	}
++
++	/* GOOD_OCV  @0x320cc */
++	if (P[QG_GOOD_OCV_UV].valid) {
++		int32_t ocv = (int32_t)P[QG_GOOD_OCV_UV].data, cut, full, vcap, x;
++		ocv = ocv < 5000000 ? ocv : 5000000;
++		ocv = ocv > 2000000 ? ocv : 2000000;
++		cut = S(CUTOFF_SOC).i; full = S(FULL_SOC).i; vcap = S(V_CAP).i;
++		qd_init_params(d, ocv, d->p.temp, kd->fifo_time);
++		S(GOOD_OCV).i = ocv; S(GOOD_OCV).f = FDIV(I2F(ocv), F32_1E6);
++		if (cut) { S(CUTOFF_SOC).i = cut; S(CUTOFF_SOC).f = I2F(cut); }
++		if (full) { S(FULL_SOC).i = full; S(FULL_SOC).f = I2F(full); }
++		if (vcap) { S(V_CAP).i = vcap; S(V_CAP).f = FDIV(I2F(vcap), F32_1E6); }
++		x = (S(VOLTAGE_SOC).i * d->vwt + S(CC_SOC).i * d->ccwt) / 100;
++		x = x < 10000 ? x : 10000; if (x < 0) x = 0;
++		S(R_SOC).i = x; S(R_SOC).f = I2F(x);
++		S(B_SOC).i = x; S(B_SOC).f = I2F(x);
++		v = qd_lookup_ocv(x, S(B_TEMP).i, 0);
++		S(B_OCV).i = v; S(B_OCV).f = FDIV(I2F(v), F32_1E6);
++		x = S(B_SOC).i - S(CUTOFF_SOC).i;
++		{
++			int32_t num = x * 100 * 100, den = S(FULL_SOC).i - S(CUTOFF_SOC).i;
++			x = den ? num / den : 0;
++		}
++		x = x < 10000 ? x : 10000; if (x < 0) x = 0;
++		S(S_SOC).i = x; S(S_SOC).f = I2F(x);
++		v = d->p.capacity * 100;
++		S(M_SOC).i = v; S(M_SOC).f = I2F(v);
++		d->have_soc = 1;
++	}
++
++	/* ESR deltas from kernel (SDAM)  @0x32358 */
++	if (P[QG_ESR_CHARGE_DELTA].valid && P[QG_ESR_CHARGE_SF].valid && d->esr_chg_delta == 0) {
++		d->esr_chg_delta = (int32_t)P[QG_ESR_CHARGE_DELTA].data;
++		d->esr_chg_sf = (int32_t)P[QG_ESR_CHARGE_SF].data;
++	}
++	if (P[QG_ESR_DISCHARGE_DELTA].valid && P[QG_ESR_DISCHARGE_SF].valid && d->esr_dischg_delta == 0) {
++		d->esr_dischg_delta = (int32_t)P[QG_ESR_DISCHARGE_DELTA].data;
++		d->esr_dischg_sf = (int32_t)P[QG_ESR_DISCHARGE_SF].data;
++	}
++
++	/* HW ESR measurement  @0x323d8 */
++	if (P[QG_ESR].valid) {
++		int32_t cur = d->p.current_now, sw_esr = (int32_t)P[QG_ESR].data, lut_esr, raw, cap;
++		int ischg = cur < 0;
++		lut_esr = qd_lookup_var(d, QV_ESR, S(B_SOC).i, S(B_TEMP).i, ischg, 0);
++		raw = sw_esr - lut_esr;
++		if (ischg) {
++			cap = raw - d->esr_chg_delta;
++			cap = cap > d->esr_delta_limit ? d->esr_delta_limit : cap;
++			cap = cap < -d->esr_delta_limit ? -d->esr_delta_limit : cap;
++			d->esr_chg_delta += cap;
++			v = (d->esr_chg_delta + lut_esr) * 100 * 100;
++			v = (v + lut_esr / 2) / lut_esr;
++			d->esr_chg_sf = v < d->esr_sf_min ? d->esr_sf_min : (v > d->esr_sf_max ? d->esr_sf_max : v);
++		} else {
++			cap = raw - d->esr_dischg_delta;
++			cap = cap > d->esr_delta_limit ? d->esr_delta_limit : cap;
++			cap = cap < -d->esr_delta_limit ? -d->esr_delta_limit : cap;
++			d->esr_dischg_delta += cap;
++			v = (d->esr_dischg_delta + lut_esr) * 100 * 100;
++			v = (v + lut_esr / 2) / lut_esr;
++			d->esr_dischg_sf = v < d->esr_sf_min ? d->esr_sf_min : (v > d->esr_sf_max ? d->esr_sf_max : v);
++		}
++		if (d->esr_use_discharge == 0) {
++			d->esr_dischg_delta = d->esr_chg_delta;
++			d->esr_dischg_sf = d->esr_chg_sf;
++		}
++	}
++	S(ESR_CHG_DELTA).i = d->esr_chg_delta;   S(ESR_CHG_DELTA).f = I2F(d->esr_chg_delta);
++	S(ESR_CHG_SF).i = d->esr_chg_sf;         S(ESR_CHG_SF).f = I2F(d->esr_chg_sf);
++	S(ESR_DISCHG_DELTA).i = d->esr_dischg_delta; S(ESR_DISCHG_DELTA).f = I2F(d->esr_dischg_delta);
++	S(ESR_DISCHG_SF).i = d->esr_dischg_sf;   S(ESR_DISCHG_SF).f = I2F(d->esr_dischg_sf);
++	qd_set_rconn(d, d->rconn);
++	qd_set_fcc_gain(d, d->learned_uah, d->design_uah);
++	qd_update_esr(d, d->esr_chg_sf, d->esr_dischg_sf);
++
++	/* FIFO loop  @0x326a0 */
++	len = (int32_t)kd->fifo_length;
++	if (len == 0) {
++		if (!d->have_soc) return 0;
++	} else {
++		S(FIFO_LENGTH).i = len; S(FIFO_LENGTH).f = I2F(len);
++		if (len > QG_MAX_FIFO_LENGTH) len = QG_MAX_FIFO_LENGTH;   /* kernel never sends more */
++		for (k = 0; k < len; k++)
++			qd_fifo(d, &kd->fifo[k]);
++		d->have_soc = 1;
++	}
++
++	/* report  @0x337a0 */
++	v = S(S_SOC).i + 50;
++	r = v > 10099 ? 100 : v / 100;
++	if (v < -99) r = 0;
++	{
++		int32_t ib = d->fg_type ? S(V_IBAT).i : S(FIFO_I).i;
++		int32_t lim = d->p.batt_full_current - 30000;
++		if (r == 0) {
++			if (d->p.voltage_now >= 1 && d->p.voltage_min >= 1)
++				r = d->p.voltage_now >= d->p.voltage_min + 20000;
++		} else if (r >= 99) {
++			int32_t w = ib >= lim ? 100 : 99;
++			if (S(FIFO_LENGTH).i != 0 && ib < 0) r = w;
++		}
++	}
++	d->last_soc = r;
++	for (n = 0; n < QG_MAX; n++) { ud->param[n].data = 0; ud->param[n].valid = 0; }
++	if (r < 0) return 0;
++	ud->param[QG_SOC].data = r; ud->param[QG_SOC].valid = 1;
++	ud->param[QG_OCV_UV].data = S(B_OCV).i; ud->param[QG_OCV_UV].valid = 1;
++	ud->param[QG_RBAT_MOHM].data = S(T_RBAT).i; ud->param[QG_RBAT_MOHM].valid = 1;
++	v = S(CC_SOC).i + 50;
++	cc = v > 10099 ? 100 : v / 100;
++	if (v < -99) cc = 0;
++	ud->param[QG_CHARGE_COUNTER].data = S(FCC).i * cc * 10;
++	ud->param[QG_CHARGE_COUNTER].valid = 1;
++	ud->param[QG_BATT_SOC].data = S(B_SOC).i; ud->param[QG_BATT_SOC].valid = 1;
++	ud->param[QG_CC_SOC].data = S(CC_SOC).i; ud->param[QG_CC_SOC].valid = 1;
++	if (S(FULL_SOC).i) { ud->param[QG_FULL_SOC].data = S(FULL_SOC).i; ud->param[QG_FULL_SOC].valid = 1; }
++	ud->param[QG_SYS_SOC].data = S(S_SOC).i; ud->param[QG_SYS_SOC].valid = 1;
++	if (S(ESR_CHG_DELTA).i && S(ESR_CHG_SF).i) {
++		ud->param[QG_ESR_CHARGE_DELTA].data = S(ESR_CHG_DELTA).i; ud->param[QG_ESR_CHARGE_DELTA].valid = 1;
++		ud->param[QG_ESR_CHARGE_SF].data = S(ESR_CHG_SF).i; ud->param[QG_ESR_CHARGE_SF].valid = 1;
++	}
++	if (S(ESR_DISCHG_DELTA).i && S(ESR_DISCHG_SF).i) {
++		ud->param[QG_ESR_DISCHARGE_DELTA].data = S(ESR_DISCHG_DELTA).i; ud->param[QG_ESR_DISCHARGE_DELTA].valid = 1;
++		ud->param[QG_ESR_DISCHARGE_SF].data = S(ESR_DISCHG_SF).i; ud->param[QG_ESR_DISCHARGE_SF].valid = 1;
++	}
++	ud->param[QG_ESR].data = qd_lookup_var(d, QV_ESR, S(B_SOC).i, S(B_TEMP).i, d->p.current_now < 0, 0);
++	ud->param[QG_ESR].valid = 1;
++	return 1;
++}
++
++/* ================================================================== */
++/* 3. kernel side (qpnp-qg.c / qg-soc.c, Xiaomi lineage-24.0 tree)      */
++/*    DT: hold-soc-while-full, linearize-soc, cl-feedback-on,           */
++/*    shutdown-delay-enable; TCSS/FVSS/BASS disabled; delta_soc = 1.    */
++
++#define DIV_ROUND_CLOSEST_POS(x, d) (((x) + (d) / 2) / (d))
++static int iabs(int v) { return v < 0 ? -v : v; }
++
++static void rd_le(const uint8_t *p, int n, uint32_t *v)
++{
++	int i; *v = 0;
++	for (i = 0; i < n; i++) *v |= (uint32_t)p[i] << (8 * i);
++}
++static void wr_le(uint8_t *p, int n, uint32_t v)
++{
++	int i;
++	for (i = 0; i < n; i++) p[i] = (uint8_t)(v >> (8 * i));
++}
++/* raw[0] = 0xB646 */
++void qg_sdam_unpack(const uint8_t raw[QG_SDAM_RAW_LEN], struct qg_sdam *s)
++{
++	rd_le(raw + 0x00, 1, &s->valid);
++	rd_le(raw + 0x01, 1, &s->soc);
++	rd_le(raw + 0x02, 2, &s->temp);
++	rd_le(raw + 0x04, 2, &s->rbat_mohm);
++	rd_le(raw + 0x06, 4, &s->ocv_uv);
++	rd_le(raw + 0x0a, 4, &s->ibat_ua);
++	rd_le(raw + 0x0e, 4, &s->time_sec);
++	rd_le(raw + 0x24, 4, &s->esr_chg_delta);
++	rd_le(raw + 0x28, 4, &s->esr_dischg_delta);
++	rd_le(raw + 0x2c, 2, &s->esr_chg_sf);
++	rd_le(raw + 0x2e, 2, &s->esr_dischg_sf);
++}
++void qg_sdam_pack(const struct qg_sdam *s, uint8_t raw[QG_SDAM_RAW_LEN])
++{
++	wr_le(raw + 0x00, 1, s->valid);
++	wr_le(raw + 0x01, 1, s->soc);
++	wr_le(raw + 0x02, 2, s->temp);
++	wr_le(raw + 0x04, 2, s->rbat_mohm);
++	wr_le(raw + 0x06, 4, s->ocv_uv);
++	wr_le(raw + 0x0a, 4, s->ibat_ua);
++	wr_le(raw + 0x0e, 4, s->time_sec);
++	wr_le(raw + 0x24, 4, s->esr_chg_delta);
++	wr_le(raw + 0x28, 4, s->esr_dischg_delta);
++	wr_le(raw + 0x2c, 2, s->esr_chg_sf);
++	wr_le(raw + 0x2e, 2, s->esr_dischg_sf);
++}
++
++void qg_kernel_init(struct qg_kernel *k)
++{
++	uint8_t *z = (uint8_t *)k;
++	int n;
++	for (n = 0; n < (int)sizeof(*k); n++) z[n] = 0;
++	k->maint_soc = QG_EINVAL;        /* probe: chip->maint_soc = -EINVAL */
++	k->batt_soc = (int)0x80000000;   /* INT_MIN */
++	k->cc_soc = (int)0x80000000;
++	k->shown = QG_EINVAL;            /* param.batt_soc = -EINVAL */
++	k->recharge_soc = 95;            /* DEFAULT_RECHARGE_SOC until status work */
++	k->health = QG_HEALTH_GOOD;
++	k->fifo_full_ms = 5 * 128 * 98;  /* default S2: 5 entries x 128 x 98 ms */
++	k->rtc_valid = 1;
++}
++
++static int lookup_soc_ocv(int ocv, int temp, int chg) { return qg_lookup_soc_ocv_pct(ocv, temp, chg); }
++
++static void qg_write_monotonic_soc(struct qg_kernel *k, int msoc) { k->soc_monotonic_reg = (msoc * 255) / 100; }
++
++static void qg_store_soc_params(struct qg_kernel *k, uint32_t rtc, int batt_temp)
++{
++	if (k->rtc_valid) k->sdam.time_sec = rtc;
++	k->sdam.temp = (uint32_t)batt_temp;
++	k->sdam_dirty |= 1;
++}
++
++void qg_kernel_pon(struct qg_kernel *k, const struct qg_pon_in *in, struct qg_pon_out *out)
++{
++	int batt_temp = in->batt_temp, shutdown_temp, use_pon_ocv = 1, state = 0, d;
++	uint32_t ocv_uv = 0, soc = 0, pon_soc = 0, full_soc = 0, cutoff_soc = 0, calc = 0, soc_raw = 0;
++	struct qg_sdam sh;
++	uint8_t *z = (uint8_t *)&sh;
++	for (d = 0; d < (int)sizeof sh; d++) z[d] = 0;
++
++	if (!in->rtc_ok) goto use_pon_ocv;
++	if (!in->sdam_ok) goto use_pon_ocv;
++	sh = in->sdam;
++	shutdown_temp = (int)(int16_t)(sh.temp & 0xffff);   /* sign_extend32(.., 15) */
++	pon_soc = lookup_soc_ocv(in->s7_ocv_uv, batt_temp, 0);
++	if (!sh.valid) goto use_pon_ocv;
++	{
++		unsigned long dt = (unsigned long)in->rtc_sec - sh.time_sec;
++		if (!(dt <= (unsigned long)QG_IGNORE_SHUTDOWN_S)) state = 1;
++	}
++	d = iabs(shutdown_temp - batt_temp);
++	if (!(d >= 0 && d <= QG_SHUTDOWN_TEMP_DIFF) && (shutdown_temp < 0 || batt_temp < 0))
++		goto use_pon_ocv;
++	d = iabs((int)(pon_soc - sh.soc));
++	if (state == 1 && !(d >= 0 && d <= QG_SHUTDOWN_SOC_THR))
++		goto use_pon_ocv;
++	use_pon_ocv = 0;
++	ocv_uv = sh.ocv_uv;
++	soc = sh.soc;
++	soc_raw = sh.soc * 100;
++use_pon_ocv:
++	/* no QG_PON_OCV_WA on PM6150: use S7 PON OCV */
++	ocv_uv = in->s7_ocv_uv;
++	ocv_uv = CAP(2000000u, 5000000u, ocv_uv);
++	pon_soc = lookup_soc_ocv((int)ocv_uv, batt_temp, 0);
++	full_soc = lookup_soc_ocv(QG_FLOAT_UV, batt_temp, 1);
++	full_soc = CAP(0u, 99u, full_soc);
++	cutoff_soc = lookup_soc_ocv(QG_VBATT_CUTOFF_UV, batt_temp, 0);
++	if (full_soc > cutoff_soc && pon_soc > cutoff_soc) {
++		uint32_t num = (pon_soc - cutoff_soc) * 100, den = full_soc - cutoff_soc;
++		calc = (num + den - 1) / den;              /* DIV_ROUND_UP */
++		soc_raw = soc * 100;
++	} else {
++		calc = pon_soc;
++		soc_raw = pon_soc * 100;
++	}
++	if (!use_pon_ocv) {
++		soc = calc < sh.soc ? sh.soc - 1 : sh.soc;
++		soc = soc == 0 ? 1 : soc;
++		ocv_uv = sh.ocv_uv;
++	} else {
++		soc = calc;
++	}
++	k->cc_soc = k->sys_soc = (int)soc_raw;
++	k->last_adj_ssoc = k->catch_up_soc = k->msoc = (int)soc;
++	k->pon_ocv_uv = ocv_uv;
++	k->sdam.soc = soc;
++	k->sdam.ocv_uv = ocv_uv;
++	k->sdam.valid = 1;
++	qg_write_monotonic_soc(k, k->msoc);
++	qg_store_soc_params(k, in->rtc_sec, batt_temp);
++	k->soc_reporting_ready = 1;
++	if (out) {
++		out->pon_soc = (int)pon_soc; out->full_soc = (int)full_soc;
++		out->cutoff_soc = (int)cutoff_soc; out->calc_soc = (int)calc;
++		out->used_shutdown = !use_pon_ocv; out->ocv_uv = ocv_uv;
++	}
++}
++
++/* qg-soc.c */
++static int qg_adjust_sys_soc(struct qg_kernel *k, int vbat_avg_uv)
++{
++	int soc;
++	k->sys_soc = CAP(0, 10000, k->sys_soc);
++	/* TCSS disabled */
++	if (k->sys_soc == 10000)
++		soc = 100;
++	else if (k->sys_soc >= 10000 - 100)
++		soc = (k->last_adj_ssoc == 100) ? 100 : 99;
++	else
++		soc = DIV_ROUND_CLOSEST_POS(k->sys_soc, 100);
++	/* FVSS, BASS disabled */
++	if (soc == 0 && vbat_avg_uv >= QG_VBATT_CUTOFF_UV + 5000)
++		soc = 1;
++	k->last_adj_ssoc = soc;
++	return soc;
++}
++
++static void get_next_update_time(struct qg_kernel *k, int batt_temp)
++{
++	int soc_points, min_ms = 40000, full = k->fifo_full_ms - k->fifo_rt_ms;
++	full = CAP(0, 64000, full);
++	soc_points = iabs(k->msoc - k->catch_up_soc);
++	if (k->maint_soc > 0) {
++		int m = iabs(k->msoc - k->maint_soc);
++		soc_points = m > soc_points ? m : soc_points;
++	}
++	soc_points /= QG_DELTA_SOC;
++	if (batt_temp < QG_COLD_TEMP_THRESH)
++		min_ms = 25000;
++	else if (k->maint_soc > 0 && k->maint_soc >= k->recharge_soc)
++		min_ms = 120000;
++	k->next_wakeup_ms = (full / (soc_points + 1)) - 2000;
++	if (k->next_wakeup_ms < min_ms) k->next_wakeup_ms = min_ms;
++}
++
++static int is_scaling_required(struct qg_kernel *k)
++{
++	int input = k->usb_present;
++	if (k->maint_soc > 0 && iabs(k->maint_soc - k->msoc) >= QG_DELTA_SOC) return 1;
++	if (iabs(k->catch_up_soc - k->msoc) < QG_DELTA_SOC &&
++	    k->catch_up_soc != 0 && k->catch_up_soc != 100) return 0;
++	if (k->catch_up_soc == k->msoc) return 0;
++	if (k->catch_up_soc > k->msoc && !input) return 0;
++	if (k->catch_up_soc > k->msoc && input &&
++	    k->charge_status != QG_PS_CHARGING && k->charge_status != QG_PS_FULL) return 0;
++	return 1;
++}
++
++static int maint_soc_timeout(struct qg_kernel *k, uint32_t now)
++{
++	if (k->maint_soc < 0) return 0;
++	if (!k->rtc_valid) return 1;
++	if (k->maint_soc < k->recharge_soc) return 1;
++	if ((unsigned long)(now - k->last_maint_soc_update_time) >= 120000 / 1000) {
++		k->last_maint_soc_update_time = now;
++		return 1;
++	}
++	return 0;
++}
++
++/* ---- capacity learning: fg-alg.c (cl_wt disabled, no prime_cc_soc) + QG callbacks ---- */
++#define CL_MIN_START_SOC 10
++#define CL_MAX_START_SOC 15
++#define CL_MIN_TEMP      150
++#define CL_MAX_TEMP      500
++#define CL_MAX_INC       10      /* deci-% */
++#define CL_MAX_DEC       20
++#define CL_MIN_LIM       500
++#define CL_MAX_LIM       100
++
++static int64_t sdiv64(int64_t a, int64_t b) { return a / b; }   /* div64_s64: trunc */
++static int64_t i64abs(int64_t v) { return v < 0 ? -v : v; }
++
++static void qg_store_learned_capacity(struct qg_kernel *k, int64_t uah)
++{
++	if (!uah) return;
++	k->sdam_learned_mah = (int16_t)sdiv64(uah, 1000);
++	k->sdam_dirty |= 8;
++}
++static int64_t qg_get_learned_capacity(const struct qg_kernel *k) { return (int64_t)k->sdam_learned_mah * 1000; }
++
++int qg_kernel_charge_full_uah(const struct qg_kernel *k) { return (int)qg_get_learned_capacity(k); }
++
++void qg_kernel_profile_init(struct qg_kernel *k, int16_t sdam_learned_mah)
++{
++	int64_t d, pct;
++	k->sdam_learned_mah = sdam_learned_mah;
++	k->cl.nom_cap_uah = (int64_t)qg_prof_fcc(250, 1) * 1000;     /* qg_get_nominal_capacity(250, true) */
++	k->cl.learned_cap_uah = qg_get_learned_capacity(k);
++	if (k->cl.learned_cap_uah != k->cl.nom_cap_uah) {
++		if (k->cl.learned_cap_uah == 0) k->cl.learned_cap_uah = k->cl.nom_cap_uah;
++		d = i64abs(k->cl.learned_cap_uah - k->cl.nom_cap_uah);
++		pct = sdiv64(k->cl.nom_cap_uah * 500, 1000);
++		if (k->cl.nom_cap_uah && d > pct) k->cl.learned_cap_uah = k->cl.nom_cap_uah;
++		qg_store_learned_capacity(k, k->cl.learned_cap_uah);
++	}
++}
++
++static void cap_learning_post_process(struct qg_kernel *k)
++{
++	int64_t inc = (int64_t)((uint64_t)(k->cl.learned_cap_uah * (1000 + CL_MAX_INC)) / 1000);
++	int64_t dec = (int64_t)((uint64_t)(k->cl.learned_cap_uah * (1000 - CL_MAX_DEC)) / 1000);
++	if (k->cl.final_cap_uah > inc) k->cl.learned_cap_uah = inc;
++	else if (k->cl.final_cap_uah < dec) k->cl.learned_cap_uah = dec;
++	else k->cl.learned_cap_uah = k->cl.final_cap_uah;
++	inc = (int64_t)((uint64_t)(k->cl.nom_cap_uah * (1000 + CL_MAX_LIM)) / 1000);
++	if (k->cl.final_cap_uah > inc) k->cl.learned_cap_uah = inc;
++	dec = (int64_t)((uint64_t)(k->cl.nom_cap_uah * (1000 - CL_MIN_LIM)) / 1000);
++	if (k->cl.final_cap_uah < dec) k->cl.learned_cap_uah = dec;
++	qg_store_learned_capacity(k, k->cl.learned_cap_uah);
++}
++
++static int cap_learning_process_full_data(struct qg_kernel *k, int batt_soc_cp)
++{
++	int cc, pct, frac;
++	int64_t num;
++	(void)batt_soc_cp;
++	if (k->cc_soc == (int)0x80000000) return -1;               /* qg_get_cc_soc */
++	cc = k->cc_soc;
++	num = (int64_t)(cc - k->cl.init_cc_soc_sw) * 100;
++	pct = (int)(num / 10000);
++	frac = (int)(num % 10000);                                  /* div_s64_rem */
++	k->cl.delta_cap_uah = sdiv64(k->cl.learned_cap_uah * pct, 100) +
++			      sdiv64(k->cl.learned_cap_uah * frac, (int64_t)10000 * 100);
++	if (pct < 50) return -1;
++	k->cl.final_cap_uah = k->cl.init_cap_uah + k->cl.delta_cap_uah;
++	return 0;
++}
++
++static int cap_learning_begin(struct qg_kernel *k, uint32_t batt_soc_cp)
++{
++	int pct;
++	if (!(k->last_fifo_i_ua < -100000)) return -1;              /* qg_cl_ok_to_begin */
++	pct = (int)DIV_ROUND_CLOSEST_POS(batt_soc_cp, 100u);
++	if (pct > CL_MAX_START_SOC || pct < CL_MIN_START_SOC) return -1;
++	k->cl.init_cap_uah = sdiv64(k->cl.learned_cap_uah * batt_soc_cp, 10000);
++	if (k->cc_soc == (int)0x80000000) return -1;
++	k->cl.init_cc_soc_sw = k->cc_soc;
++	k->cl.init_batt_soc = pct;
++	k->cl.init_batt_soc_cp = (int)batt_soc_cp;
++	return 0;
++}
++
++static void cap_learning_update(struct qg_kernel *k, int batt_temp, int batt_soc_cp,
++				int charge_status, int charge_done, int input_present)
++{
++	if (batt_temp > CL_MAX_TEMP || batt_temp < CL_MIN_TEMP || !k->cl.learned_cap_uah) {
++		k->cl.active = 0; k->cl.init_cap_uah = 0;
++		return;
++	}
++	if (!k->cl.active) {
++		if (charge_status == QG_PS_CHARGING)
++			k->cl.active = cap_learning_begin(k, (uint32_t)batt_soc_cp) == 0;
++	} else {
++		if (charge_done) {
++			if (cap_learning_process_full_data(k, batt_soc_cp) == 0)
++				cap_learning_post_process(k);
++			k->cl.active = 0; k->cl.init_cap_uah = 0;
++		}
++		if (charge_status == QG_PS_DISCHARGING && !input_present) {
++			k->cl.active = 0; k->cl.init_cap_uah = 0;
++		}
++		if (charge_status == QG_PS_NOT_CHARGING) {
++			k->cl.active = 0; k->cl.init_cap_uah = 0;
++		}
++	}
++}
++
++static void update_msoc(struct qg_kernel *k, int batt_cur, int batt_temp, uint32_t rtc)
++{
++	int input = k->usb_present;
++	if (k->catch_up_soc > k->msoc) {
++		if (input) k->msoc += QG_DELTA_SOC;
++	} else if (k->catch_up_soc < k->msoc) {
++		if (batt_cur > 0) k->msoc -= QG_DELTA_SOC;
++	}
++	k->msoc = CAP(0, 100, k->msoc);
++	if (k->maint_soc > 0 && k->msoc < k->maint_soc && maint_soc_timeout(k, rtc)) {
++		k->maint_soc -= QG_DELTA_SOC;
++		k->maint_soc = CAP(0, 100, k->maint_soc);
++	}
++	if (k->maint_soc <= k->msoc) k->maint_soc = QG_EINVAL;
++	qg_write_monotonic_soc(k, k->msoc);
++	k->sdam.soc = (uint32_t)((k->maint_soc > 0) ? k->maint_soc : k->msoc);
++	k->sdam_dirty |= 2;
++	if (k->cl.active && k->batt_soc >= 0)
++		cap_learning_update(k, batt_temp, k->batt_soc, k->charge_status, k->charge_done, input);
++	/* cycle_count_update(): SDAM cycle buckets, not modelled (see doc) */
++}
++
++static void scale_soc_stop(struct qg_kernel *k) { k->next_wakeup_ms = 0; k->scale_armed = 0; }
++
++static void qg_scale_soc(struct qg_kernel *k, int force, int batt_cur, int batt_temp, uint32_t rtc, int64_t now)
++{
++	if (force) {
++		k->msoc = k->catch_up_soc;
++		qg_write_monotonic_soc(k, k->msoc);
++		return;
++	}
++	if (!is_scaling_required(k)) { scale_soc_stop(k); return; }
++	update_msoc(k, batt_cur, batt_temp, rtc);
++	if (is_scaling_required(k)) {
++		get_next_update_time(k, batt_temp);
++		k->scale_armed = 1; k->scale_due_ms = now + k->next_wakeup_ms;
++	} else {
++		scale_soc_stop(k);
++	}
++}
++
++void qg_kernel_scale_timer(struct qg_kernel *k, int batt_cur, int batt_temp, uint32_t rtc, int64_t now)
++{
++	k->scale_armed = 0;
++	if (!is_scaling_required(k)) { scale_soc_stop(k); return; }
++	update_msoc(k, batt_cur, batt_temp, rtc);
++	if (is_scaling_required(k)) {
++		k->scale_armed = 1; k->scale_due_ms = now + k->next_wakeup_ms;
++	} else {
++		scale_soc_stop(k);
++	}
++}
++
++void qg_kernel_udata(struct qg_kernel *k, const struct qg_user_data *ud, int vbat_avg_uv,
++		     int batt_cur, int batt_temp, uint32_t rtc, int64_t now)
++{
++	const struct qg_param *P = ud->param;
++	if (P[QG_CC_SOC].valid) k->cc_soc = (int)P[QG_CC_SOC].data;
++	if (P[QG_BATT_SOC].valid) k->batt_soc = (int)P[QG_BATT_SOC].data;
++	if (P[QG_FULL_SOC].valid) k->full_soc = (int)P[QG_FULL_SOC].data;
++	if (P[QG_SOC].valid || P[QG_SYS_SOC].valid) {
++		if (P[QG_SYS_SOC].valid) {
++			k->sys_soc = (int)P[QG_SYS_SOC].data;
++			k->catch_up_soc = qg_adjust_sys_soc(k, vbat_avg_uv);
++		} else {
++			k->catch_up_soc = (int)P[QG_SOC].data;
++		}
++		qg_scale_soc(k, k->force_soc, batt_cur, batt_temp, rtc, now);
++		k->force_soc = 0;
++		k->sdam.soc = (uint32_t)k->msoc;
++		k->sdam.ocv_uv = P[QG_OCV_UV].data;
++		k->sdam.rbat_mohm = P[QG_RBAT_MOHM].data;
++		k->sdam.valid = 1;
++		qg_store_soc_params(k, rtc, batt_temp);
++	}
++	if (P[QG_ESR].valid) k->esr_last = (int)P[QG_ESR].data;
++	/* qg_store_esr_params() (esr not disabled) */
++	if (P[QG_ESR_CHARGE_DELTA].valid) { k->sdam.esr_chg_delta = P[QG_ESR_CHARGE_DELTA].data; k->sdam_dirty |= 4; }
++	if (P[QG_ESR_DISCHARGE_DELTA].valid) { k->sdam.esr_dischg_delta = P[QG_ESR_DISCHARGE_DELTA].data; k->sdam_dirty |= 4; }
++	if (P[QG_ESR_CHARGE_SF].valid) { k->sdam.esr_chg_sf = P[QG_ESR_CHARGE_SF].data; k->sdam_dirty |= 4; }
++	if (P[QG_ESR_DISCHARGE_SF].valid) { k->sdam.esr_dischg_sf = P[QG_ESR_DISCHARGE_SF].data; k->sdam_dirty |= 4; }
++}
++
++void qg_kernel_vbat_empty(struct qg_kernel *k, uint32_t sdam_ocv_uv, int batt_temp, uint32_t rtc, int64_t now)
++{
++	k->catch_up_soc = 0;
++	qg_scale_soc(k, 1, 0, batt_temp, rtc, now);
++	k->sdam.soc = 0;
++	k->sdam.ocv_uv = sdam_ocv_uv;
++	k->sdam.valid = 1;
++	qg_store_soc_params(k, rtc, batt_temp);
++}
++
++/* qg_charge_full_update() */
++static void qg_charge_full_update(struct qg_kernel *k, int batt_cur, int batt_temp, uint32_t rtc, int64_t now)
++{
++	int recharge_soc = QG_RECHARGE_SOC, input = k->usb_present;
++	k->recharge_soc = recharge_soc;
++	if (k->charge_done && !k->charge_full) {
++		if (k->msoc >= 99 && k->health == QG_HEALTH_GOOD)
++			k->charge_full = 1;
++		/* else: JEITA termination, or force-recharge request to the charger */
++	} else if ((!k->charge_done || k->msoc <= recharge_soc) && k->charge_full) {
++		/* (force recharge request to the charger when input && msoc <= recharge
++		 *  && not charging: charger side, not modelled) */
++		if (k->charge_done) return;
++		if (k->msoc < recharge_soc || !input) {
++			if (k->rtc_valid) k->last_maint_soc_update_time = rtc;
++			k->maint_soc = 100;
++			qg_scale_soc(k, 0, batt_cur, batt_temp, rtc, now);
++			k->charge_full = 0;
++		}
++	}
++}
++
++void qg_kernel_status(struct qg_kernel *k, int charge_status, int charge_done, int health,
++		      int usb_present, int batt_cur, int batt_temp, uint32_t rtc, int64_t now)
++{
++	k->charge_status = charge_status;
++	k->charge_done = charge_done;
++	k->health = health;
++	/* qg_input_status_update() */
++	if (k->usb_present != usb_present) {
++		k->usb_present = usb_present;   /* is_input_present() reads the live psy */
++		qg_scale_soc(k, 0, batt_cur, batt_temp, rtc, now);
++	}
++	k->usb_present = usb_present;
++	if (k->batt_soc >= 0)
++		cap_learning_update(k, batt_temp, k->batt_soc, k->charge_status, k->charge_done, usb_present);
++	qg_charge_full_update(k, batt_cur, batt_temp, rtc, now);
++}
++
++int qg_kernel_capacity(const struct qg_kernel *k)
++{
++	if (k->charge_full) return 100;
++	if (k->maint_soc > 0) return k->maint_soc;   /* linearize-soc */
++	return k->msoc;
++}
++
++/* calculate_average_current() */
++static void calculate_average_current(struct qg_kernel *k)
++{
++	int i, iavg;
++	if (k->batt_ma == k->batt_ma_prev) return;
++	k->batt_ma_prev = k->batt_ma;
++	k->batt_ma_avg_samples[k->samples_index] = k->batt_ma;
++	k->samples_index = (k->samples_index + 1) % 8;
++	k->samples_num++;
++	if (k->samples_num >= 8) k->samples_num = 8;
++	if (k->samples_num) {
++		iavg = 0;
++		for (i = 0; i < k->samples_num; i++) iavg += k->batt_ma_avg_samples[i];
++		/* DIV_ROUND_CLOSEST(signed, positive) */
++		k->batt_ma_avg = iavg >= 0 ? (iavg + k->samples_num / 2) / k->samples_num
++					   : (iavg - k->samples_num / 2) / k->samples_num;
++	}
++}
++
++/* qg_battery_soc_smooth_tracking() */
++static void smooth_tracking(struct qg_kernel *k, int64_t now_s)
++{
++	int delta_time, soc_changed, last = k->shown, tsince;
++	int64_t lct = k->last_change_s;
++	tsince = (int)(now_s - lct);
++	lct = now_s;
++	if (k->batt_temp > 150) {
++		if (k->batt_ma < 0 || iabs(k->raw_soc - k->shown) > 2) delta_time = tsince / 20;
++		else delta_time = tsince / 60;
++	} else {
++		calculate_average_current(k);
++		if (k->batt_ma_avg > 1000 || iabs(k->raw_soc - k->shown > 2)) delta_time = tsince / 10;
++		else delta_time = tsince / 20;
++	}
++	if (delta_time < 0) delta_time = 0;
++	soc_changed = delta_time < 1 ? delta_time : 1;
++	if (last >= 0) {
++		if (last != 100 && k->raw_soc >= 95 && k->charge_status == QG_PS_FULL)
++			last = k->update_now ? 100 : last + soc_changed;
++		else if (last < k->raw_soc && k->batt_ma < -25)
++			last = k->update_now ? k->raw_soc : last + soc_changed;
++		else if (last > k->raw_soc && k->batt_ma > 25)
++			last = k->update_now ? k->raw_soc : last - soc_changed;
++		k->update_now = 0;
++	} else {
++		last = k->raw_soc;
++	}
++	if (last > 100) last = 100;
++	else if (last < 0) last = 0;
++	if (k->shown != last) {
++		k->shown = last;
++		k->last_change_s = lct;
++	}
++}
++
++void qg_kernel_soc_monitor(struct qg_kernel *k, int batt_ua, int batt_temp, int64_t boot_s)
++{
++	k->batt_ma = batt_ua / 1000;
++	k->batt_temp = batt_temp;
++	k->raw_soc = qg_kernel_capacity(k);
++	if (k->soc_reporting_ready) smooth_tracking(k, boot_s);
++}
++
++int qg_kernel_force_shutdown(struct qg_kernel *k, int vbat_uv)
++{
++	int msoc = k->msoc;
++	if (msoc <= 1 && k->shown <= 1 && vbat_uv < 3380000 && !k->usb_present) k->fs_count++;
++	else k->fs_count = 0;
++	k->force_shutdown = k->fs_count >= 10;
++	if (vbat_uv >= 3600000) return 30000;
++	if (vbat_uv >= 3500000) return 5000;
++	return 300;
++}
++
++int qg_kernel_reported_capacity(struct qg_kernel *k, int vbat_uv)
++{
++	int v = qg_kernel_capacity(k);
++	if (k->shown >= 0) v = k->shown;
++	if (k->force_shutdown) v = 0;
++	/* shutdown-delay-enable */
++	if (v == 0) {
++		if (vbat_uv / 1000 > 3300 && k->charge_status != QG_PS_CHARGING) {
++			k->shutdown_delay = 1; v = 1;
++		} else if (k->charge_status == QG_PS_CHARGING && k->shutdown_delay) {
++			k->shutdown_delay = 0; k->shutdown_delay_cancel = 1; v = 1;
++		} else {
++			k->shutdown_delay = 0;
++			if (k->shutdown_delay_cancel) v = 1;
++		}
++	} else {
++		k->shutdown_delay = 0;
++		k->shutdown_delay_cancel = 0;
++	}
++	if (k->last_shutdown_delay != k->shutdown_delay) k->last_shutdown_delay = k->shutdown_delay;
++	return v;
++}
++
++/* ---- smb5-lib.c (davinci) ---- */
++/* POWER_SUPPLY_HEALTH_* values of this kernel (include/linux/power_supply.h, msm-4.14):
++ * UNKNOWN 0, GOOD 1, OVERHEAT 2, DEAD 3, OVERVOLTAGE 4, UNSPEC_FAILURE 5, COLD 6,
++ * WATCHDOG_TIMER_EXPIRE 7, SAFETY_TIMER_EXPIRE 8, OVERCURRENT 9, WARM 10, COOL 11 */
++#define PSH_GOOD 1
++#define PSH_OVERHEAT 2
++#define PSH_COLD 6
++#define PSH_WARM 10
++#define PSH_COOL 11
++int qg_smb5_health(uint8_t r100d)
++{
++	/* (BAT_OV check needs fv vote state: skipped) */
++	if (r100d & 0x04) return PSH_COLD;          /* BAT_TEMP_STATUS_TOO_COLD */
++	if (r100d & 0x08) return PSH_OVERHEAT;      /* TOO_HOT */
++	if (r100d & 0x10) return PSH_COOL;          /* COLD_SOFT */
++	if (r100d & 0x20) return PSH_WARM;          /* HOT_SOFT */
++	return PSH_GOOD;
++}
++int qg_smb5_usb_present(uint8_t r1310) { return (r1310 & 0x10) != 0; }   /* USBIN_PLUGIN_RT_STS */
++int qg_smb5_charge_done(uint8_t r1006) { return (r1006 & 7) == 5; }      /* TERMINATE_CHARGE */
++int qg_smb5_batt_status(uint8_t r1006, uint8_t r100d, uint8_t r1043, uint8_t r110b, int capacity)
++{
++	int usb_online = (r110b & 0x10) && (r110b & 0x01);     /* USE_USBIN && VALID_INPUT */
++	int st = r1006 & 7, health = qg_smb5_health(r100d), v;
++	if (!usb_online) return QG_PS_DISCHARGING;
++	switch (st) {
++	case 1: case 2: case 3: case 4: v = QG_PS_CHARGING; break;
++	case 5: case 0:
++		v = (health == PSH_WARM || capacity <= 98 || health == PSH_OVERHEAT) ? QG_PS_CHARGING : QG_PS_FULL;
++		break;
++	default:  /* DISABLE / PAUSE: smblib_is_jeita_warm_charging() */
++		v = (health == PSH_WARM) ? QG_PS_CHARGING : QG_PS_NOT_CHARGING;
++		break;
++	}
++	if (r1043 & 1) return QG_PS_CHARGING;                   /* is_charging_paused() */
++	return v;
++}
++
++/* qg_process_fifo() body (FIFO entries appended like after suspend) */
++int qg_kdata_add_fifo(struct qg_kernel_data *kd, const uint16_t *v_raw, const uint16_t *i_raw,
++		      int len, uint32_t interval_ms, uint32_t count, int subtype4)
++{
++	int i, j = (int)kd->fifo_length;
++	for (i = 0; i < len; i++, j++) {
++		int32_t s;
++		if (v_raw[i] == 0x8000 || i_raw[i] == 0x8000) return -1;
++		if (j >= QG_MAX_FIFO_LENGTH) return -1;
++		s = (int16_t)i_raw[i];
++		kd->fifo[j].v = qg_vraw_to_uv(v_raw[i]);
++		kd->fifo[j].i = (uint32_t)(subtype4 ? qg_iraw_to_ua_sub4(s) : qg_iraw_to_ua_sub3(s));
++		kd->fifo[j].interval = interval_ms;
++		kd->fifo[j].count = count;
++	}
++	kd->fifo_length += (uint32_t)len;
++	return 0;
++}
++
++/* qg_process_accumulator() */
++int qg_kdata_add_accum(struct qg_kernel_data *kd, uint32_t v_acc, uint32_t i_acc, uint8_t cnt,
++		       uint32_t interval_ms, int subtype4)
++{
++	int idx = (int)kd->fifo_length;
++	int64_t ti;
++	if (!cnt || cnt < 10) return 0;
++	if (idx >= QG_MAX_FIFO_LENGTH) return -1;
++	ti = (int64_t)(int32_t)(i_acc << 8) >> 8;                 /* sign_extend64(.., 23) */
++	kd->fifo[idx].v = qg_vraw_to_uv((uint32_t)((uint64_t)(v_acc & 0xffffff) / cnt));
++	kd->fifo[idx].i = (uint32_t)(subtype4 ? qg_iraw_to_ua_sub4((int32_t)(ti / cnt))
++					      : qg_iraw_to_ua_sub3((int32_t)(ti / cnt)));
++	kd->fifo[idx].interval = interval_ms;
++	kd->fifo[idx].count = cnt;
++	kd->fifo_length++;
++	if (kd->fifo_length == QG_MAX_FIFO_LENGTH) kd->fifo_length = QG_MAX_FIFO_LENGTH - 1;
++	return 0;
++}
++
++void qg_kdata_fifo_time_delta(struct qg_kernel_data *kd, int hw_delta_ms, int sw_delta_ms)
++{
++	int margin = (hw_delta_ms * 10) / 100;    /* MAX_FIFO_DELTA_PERCENT */
++	if (iabs(hw_delta_ms - sw_delta_ms) < margin) {
++		kd->param[QG_FIFO_TIME_DELTA].data = (uint32_t)sw_delta_ms;
++		kd->param[QG_FIFO_TIME_DELTA].valid = 1;
++	}
++}
++#endif
+diff --git a/bsd/dev/sweet_qg_algo.h b/bsd/dev/sweet_qg_algo.h
+new file mode 100644
+index 0000000..a7e0016
+--- /dev/null
++++ b/bsd/dev/sweet_qg_algo.h
+@@ -0,0 +1,306 @@
++/* GENERATED from davinci-ios/battery/port by "make kernel-files" - edit the port, not this */
++/*
++ * qg_algo.h - exact port of the Android/MIUI battery-percentage computation on
++ * Xiaomi Mi 9T "davinci" (SM7150 + PM6150 QGauge, battery profile f10_swd):
++ *
++ *   1. the profile lookups of the kernel driver (qg-profile-lib.c, /dev/qg_battery)
++ *   2. the closed-source QTI userspace QG daemon inside /vendor/bin/hvdcp_opti
++ *      ("QG-D", hvdcp_opti Version 3:0:0), reverse engineered from the AArch64
++ *      binary and reproduced bit for bit (its float math runs through
++ *      qg_softfloat.c, so this file is integer only)
++ *   3. the kernel side of qpnp-qg (Xiaomi lineage-24.0 tree): PON SOC,
++ *      process_udata_work, qg_adjust_sys_soc, msoc scaling, hold-full /
++ *      linearize, Xiaomi smooth tracking and force-shutdown.
++ *
++ * Pure C, no libc, no floating point: drops into XNU (SweetBattery.cpp) and
++ * builds on the host for the replay tests in test/.
++ */
++#ifndef QG_ALGO_H
++#define QG_ALGO_H
++
++#include <stdint.h>
++#include "sweet_qg_softfloat.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ------------------------------------------------------------------ */
++/* uapi (include/uapi/linux/qg.h, this tree has QG_MAX = 18)          */
++enum {
++	QG_SOC, QG_OCV_UV, QG_RBAT_MOHM, QG_PON_OCV_UV, QG_GOOD_OCV_UV, QG_ESR,
++	QG_CHARGE_COUNTER, QG_FIFO_TIME_DELTA, QG_BATT_SOC, QG_CC_SOC,
++	QG_ESR_CHARGE_DELTA, QG_ESR_DISCHARGE_DELTA, QG_ESR_CHARGE_SF,
++	QG_ESR_DISCHARGE_SF, QG_FULL_SOC, QG_CLEAR_LEARNT_DATA, QG_SYS_SOC,
++	QG_RESERVED_10, QG_MAX
++};
++#define QG_MAX_FIFO_LENGTH 16
++struct qg_fifo_data { uint32_t v, i, count, interval; };
++struct qg_param     { uint32_t data; uint8_t valid; uint8_t pad_[3]; };
++struct qg_kernel_data {
++	uint32_t seq_no, fifo_time, fifo_length;
++	struct qg_fifo_data fifo[QG_MAX_FIFO_LENGTH];
++	struct qg_param param[QG_MAX];
++};
++struct qg_user_data { struct qg_param param[QG_MAX]; };
++
++/* bms power-supply properties the daemon reads every cycle (read_props()) */
++struct qg_props {
++	int32_t capacity;              /* POWER_SUPPLY_PROP_CAPACITY (shown %)      */
++	int32_t voltage_ocv;           /* SDAM OCV, uV (read, unused by algorithm)  */
++	int32_t temp;                  /* deci-degC                                 */
++	int32_t voltage_min;           /* vbatt_cutoff_mv*1000 = 3400000            */
++	int32_t batt_full_current;     /* iterm_ma*1000 = 350000 (positive)         */
++	int32_t current_now;           /* uA, + = discharge (LAST_BURST_AVG_I)      */
++	int32_t voltage_max;           /* float voltage = 4400000                   */
++	int32_t voltage_now;           /* uV (LAST_ADC_V)                           */
++	int32_t batt_profile_version;  /* 100                                       */
++	int32_t fg_type;               /* 0 (QG)                                    */
++	int32_t resistance_capacitive; /* rbat_conn_mohm = 0                        */
++	int32_t charge_full;           /* learned capacity, uAh                     */
++	int32_t charge_full_design;    /* nom capacity, uAh = 4000000               */
++	int32_t debug_battery;         /* 0                                         */
++};
++
++/* ------------------------------------------------------------------ */
++/* 1. battery profile (kernel /dev/qg_battery semantics)               */
++int qg_prof_soc(int ocv_uv, int temp, int charging);   /* BPIOCXSOC, cpct  */
++int qg_prof_ocv(int soc, int temp, int charging);      /* BPIOCXOCV, uV    */
++int qg_prof_fcc(int temp, int charging);               /* BPIOCXFCC, mAh   */
++int qg_prof_slope(int soc, int temp, int charging);    /* BPIOCXSLOPE      */
++int qg_prof_var(int table /* 4..15 = Z1..Y6 */, int soc, int temp); /* BPIOCXVAR */
++/* Linux lookup_soc_ocv(): % (0..100), rounded */
++int qg_lookup_soc_ocv_pct(int ocv_uv, int temp, int charging);
++
++/* ------------------------------------------------------------------ */
++/* 2. the QG daemon                                                    */
++
++/* the 55 int/float pairs of the daemon state ("*_DUMP" names in the binary),
++ * in binary order, at info+0x2cc */
++enum {
++	QD_TIMESTAMP, QD_SEQNO, QD_FIFO_LENGTH, QD_FIFO_DELTA, QD_FIFO_V, QD_FIFO_I,
++	QD_FIFO_INT, QD_FIFO_CNT, QD_B_TEMP, QD_FCC, QD_INIT_OCV, QD_GOOD_OCV,
++	QD_CUTOFF_OCV, QD_CUTOFF_IBAT, QD_FULL_OCV, QD_INIT_SOC, QD_CUTOFF_SOC,
++	QD_FULL_SOC, QD_VOLTAGE_SOC, QD_CC_SOC, QD_R_SOC, QD_B_SOC, QD_S_SOC,
++	QD_M_SOC, QD_SLOPE, QD_V_OCV, QD_V_IBAT, QD_CC_FIFO, QD_CC_UAH, QD_B_OCV,
++	QD_T_RBAT, QD_RLONG, QD_RSHORT, QD_ESR, QD_M_ESR, QD_CSHORT, QD_CLONG,
++	QD_I_RSHORT, QD_I_RLONG, QD_V_RSHORT, QD_V_RLONG, QD_V_ESR, QD_VBAT_ERR,
++	QD_SOC_CORR, QD_CUTOFF_VPREDICT, QD_FULLSOC_VPREDICT, QD_CUTOFF_RBAT,
++	QD_FULLSOC_RBAT, QD_ESR_CHG_DELTA, QD_ESR_CHG_SF, QD_ESR_DISCHG_DELTA,
++	QD_ESR_DISCHG_SF, QD_V_CAP, QD_QG_MODE, QD_SOC_GAIN, QD_NSLOT
++};
++struct qd_slot { int32_t i; f32 f; };
++
++/* per-table decode of the Z/Y profile tables (daemon .data @0x13bcc8) */
++struct qd_ptab { int32_t sub, div, add, mult; };
++
++struct qg_daemon {
++	struct qd_slot s[QD_NSLOT];       /* info+0x2cc .. 0x483 */
++	uint8_t  is_charging;             /* +0x484 */
++	uint8_t  have_soc;                /* +0x485 */
++	int32_t  fifo_delta;              /* +0x488 per-entry ms correction */
++	int32_t  last_soc;                /* +0x48c */
++	int32_t  fg_type;                 /* +0x490 */
++	int32_t  esr_chg_delta;           /* +0x494 */
++	int32_t  esr_dischg_delta;        /* +0x498 */
++	int32_t  esr_chg_sf;              /* +0x49c */
++	int32_t  esr_dischg_sf;           /* +0x4a0 */
++	/* configuration (persist.vendor.qg.* - all unset on davinci) */
++	int32_t  clk_skew_pct, vwt, ccwt, coff_ibat_ma, coff_cold_ibat_ma;
++	int32_t  coff_soc, fullsoc, fullsoc_margin, rconn, cold_temp;
++	int32_t  full_soc_cold_temp, esr_delta_limit, esr_sf_max, esr_sf_min;
++	int32_t  esr_use_discharge, chg_med2low_ua, chg_hi2med_ua;
++	int32_t  dischg_med2low_ua, dischg_hi2med_ua;
++	f32      gain_dischg_high, gain_dischg_med, gain_dischg_low;
++	f32      gain_chg_high, gain_chg_med, gain_chg_low;
++	f32      coff_gain, cld_coff_gain, fullsoc_gain;
++	int32_t  learned_uah, design_uah;  /* +0x520 / +0x524 */
++	struct qg_props p;                 /* +0x74 snapshot of this cycle */
++	struct qd_ptab tab[16];            /* profile decode/scale state   */
++};
++
++/* qg_main() initialisation; returns 0 */
++int qg_daemon_init(struct qg_daemon *d, const struct qg_props *p);
++/* qg_read_cb(): consume one kdata, returns 1 and fills *ud when the daemon
++ * writes udata back to the kernel, 0 when it does not */
++int qg_daemon_process(struct qg_daemon *d, const struct qg_kernel_data *kd,
++		      const struct qg_props *p, struct qg_user_data *ud);
++
++/* ------------------------------------------------------------------ */
++/* 3. kernel side (qpnp-qg.c / qg-soc.c, Xiaomi lineage-24.0)          */
++
++/* QG SDAM (base 0xB600) fields used by the SOC code, qg-sdam.c layout */
++struct qg_sdam {
++	uint32_t valid;          /* 0xB646  u8  */
++	uint32_t soc;            /* 0xB647  u8  */
++	uint32_t temp;           /* 0xB648  u16 (s16 deci-C) */
++	uint32_t rbat_mohm;      /* 0xB64A  u16 */
++	uint32_t ocv_uv;         /* 0xB64C  u32 */
++	uint32_t ibat_ua;        /* 0xB650  u32 */
++	uint32_t time_sec;       /* 0xB654  u32 (PMIC RTC) */
++	uint32_t esr_chg_delta;  /* 0xB66A  u32 (signed) */
++	uint32_t esr_dischg_delta; /* 0xB66E u32 (signed) */
++	uint32_t esr_chg_sf;     /* 0xB672  u16 */
++	uint32_t esr_dischg_sf;  /* 0xB674  u16 */
++};
++#define QG_SDAM_BASE        0xB600
++#define QG_SDAM_VALID_REG   0xB646
++#define QG_SDAM_SOC_REG     0xB647
++#define QG_SDAM_TEMP_REG    0xB648
++#define QG_SDAM_RBAT_REG    0xB64A
++#define QG_SDAM_OCV_REG     0xB64C
++#define QG_SDAM_IBAT_REG    0xB650
++#define QG_SDAM_TIME_REG    0xB654
++#define QG_SDAM_MAGIC_REG   0xB680
++#define QG_SDAM_MAGIC       0x12345678u
++/* raw SDAM bytes 0xB646..0xB675 (48 bytes) <-> struct; pack only touches the
++ * fields Linux's qg_store_soc_params()/qg_store_esr_params() write */
++#define QG_SDAM_RAW_LEN 48
++void qg_sdam_unpack(const uint8_t raw[QG_SDAM_RAW_LEN], struct qg_sdam *s);
++void qg_sdam_pack(const struct qg_sdam *s, uint8_t raw[QG_SDAM_RAW_LEN]);
++
++/* constants of this phone (base dts + dtbo 14, driver defaults otherwise) */
++#define QG_VBATT_CUTOFF_UV     3400000
++#define QG_FLOAT_UV            4400000
++#define QG_ITERM_UA            350000
++#define QG_IGNORE_SHUTDOWN_S   360     /* DEFAULT_SHUTDOWN_SOC_SECS */
++#define QG_SHUTDOWN_SOC_THR    3       /* qcom,shutdown-soc-threshold */
++#define QG_SHUTDOWN_TEMP_DIFF  50      /* DEFAULT_SHUTDOWN_TEMP_DIFF, deci-C */
++#define QG_DELTA_SOC           1
++#define QG_COLD_TEMP_THRESH    0       /* DEFAULT_COLD_TEMP_THRESHOLD, deci-C */
++#define QG_MIN_SLEEP_TIME_S    1800    /* DEFAULT_SLEEP_TIME_SECS */
++#define QG_RECHARGE_SOC        99      /* smb5 qcom,auto-recharge-soc */
++#define QG_EINVAL              (-22)
++
++enum { QG_PS_UNKNOWN = 0, QG_PS_CHARGING = 1, QG_PS_DISCHARGING = 2,
++       QG_PS_NOT_CHARGING = 3, QG_PS_FULL = 4 };   /* POWER_SUPPLY_STATUS_* */
++#define QG_HEALTH_GOOD 1                            /* POWER_SUPPLY_HEALTH_GOOD */
++
++struct qg_kernel {
++	/* SOC state (struct qpnp_qg) */
++	int msoc, catch_up_soc, last_adj_ssoc, maint_soc, recharge_soc;
++	int sys_soc, batt_soc, cc_soc, full_soc, esr_last;
++	int charge_full, charge_done, charge_status, health;
++	int usb_present, force_soc, soc_reporting_ready;
++	int rtc_valid;             /* PMIC RTC readable (get_rtc_time() rc == 0); default 1 */
++	uint32_t last_maint_soc_update_time;   /* RTC s */
++	/* msoc scaling alarm (alarm_timer) */
++	int scale_armed;
++	int64_t scale_due_ms;                  /* monotonic ms */
++	int next_wakeup_ms;
++	/* fifo geometry for get_next_update_time(): get_fifo_done_time(false/true) */
++	int fifo_full_ms, fifo_rt_ms;
++	/* Xiaomi smooth tracking (chip->param) */
++	int shown;                 /* param.batt_soc, -EINVAL until first run */
++	int raw_soc, batt_ma, batt_temp, update_now;
++	int64_t last_change_s;     /* param.last_soc_change_time.tv_sec (boottime) */
++	int batt_ma_prev, batt_ma_avg, samples_index, samples_num;
++	int batt_ma_avg_samples[8];
++	/* force shutdown + shutdown-delay (qg_psy_get_property statics) */
++	int force_shutdown, fs_count;
++	int shutdown_delay, shutdown_delay_cancel, last_shutdown_delay;
++	/* SDAM mirror: what Linux would have written (write it back to keep
++	 * MIUI and iOS consistent) */
++	struct qg_sdam sdam;
++	int sdam_dirty;            /* bit0 SOC/TEMP/RBAT/OCV/IBAT/TIME/VALID, bit1 SOC only, bit2 ESR */
++	int soc_monotonic_reg;     /* value for QG_SOC_MONOTONIC (0x48BF) */
++	/* kdata params the kernel hands the daemon at its next read */
++	uint32_t pon_ocv_uv;       /* QG_PON_OCV_UV (daemon ignores it) */
++	/* capacity learning (fg-alg.c, qcom,cl-feedback-on) */
++	int last_fifo_i_ua;        /* chip->last_fifo_i_ua: i of the last FIFO/ACC entry */
++	struct {
++		int active, init_cc_soc_sw, init_batt_soc, init_batt_soc_cp;
++		int64_t nom_cap_uah, init_cap_uah, final_cap_uah, learned_cap_uah, delta_cap_uah;
++	} cl;
++	int16_t sdam_learned_mah;  /* SDAM 0xB668 (s16 mAh), sdam_dirty bit3 when written */
++};
++
++struct qg_pon_in {
++	uint32_t s7_ocv_uv;        /* QG_S7_PON_OCV (0x4870) converted */
++	int batt_temp;             /* deci-C */
++	uint32_t rtc_sec;          /* PMIC RTC now */
++	int rtc_ok, sdam_ok;
++	struct qg_sdam sdam;       /* read at PON */
++};
++struct qg_pon_out {
++	int pon_soc, full_soc, cutoff_soc, calc_soc, used_shutdown;
++	uint32_t ocv_uv;
++};
++
++/* probe defaults (msoc etc. are set by qg_kernel_pon).  sdam_learned_mah =
++ * SDAM 0xB668 as read at boot; runs cap_learning_post_profile_init() with the
++ * nominal capacity (fcc1 @ 25 degC). */
++void qg_kernel_init(struct qg_kernel *k);
++void qg_kernel_profile_init(struct qg_kernel *k, int16_t sdam_learned_mah);
++/* POWER_SUPPLY_PROP_CHARGE_FULL (learned capacity, uAh) -> daemon props.charge_full */
++int qg_kernel_charge_full_uah(const struct qg_kernel *k);
++/* qg_determine_pon_soc() (Xiaomi variant).  wa_flags = 6 on PM6150, so the
++ * PON_OCV_WA branch is not taken.  Sets msoc/catch_up/sys/cc, the SDAM mirror
++ * (sdam_dirty |= 1), QG_SOC_MONOTONIC and pon_ocv_uv; soc_reporting_ready = 1. */
++void qg_kernel_pon(struct qg_kernel *k, const struct qg_pon_in *in, struct qg_pon_out *out);
++
++/* process_udata_work().  vbat_avg_uv = QG_S2_NORMAL_AVG_V (0x4880, hold-at-1 %),
++ * batt_cur_ua = LAST_BURST_AVG_I (update_msoc), batt_temp/rtc for the SDAM
++ * write, now_ms = monotonic clock for the msoc alarm. */
++void qg_kernel_udata(struct qg_kernel *k, const struct qg_user_data *ud,
++		     int vbat_avg_uv, int batt_cur_ua, int batt_temp,
++		     uint32_t rtc_sec, int64_t now_ms);
++/* scale_soc_work(): call when scale_armed && now_ms >= scale_due_ms */
++void qg_kernel_scale_timer(struct qg_kernel *k, int batt_cur_ua, int batt_temp,
++			   uint32_t rtc_sec, int64_t now_ms);
++/* qg_status_change_work() (charger STATUS / CHARGE_DONE / input change) */
++void qg_kernel_status(struct qg_kernel *k, int charge_status, int charge_done,
++		      int health, int usb_present, int batt_cur_ua, int batt_temp,
++		      uint32_t rtc_sec, int64_t now_ms);
++/* qg_vbat_empty_handler(): QG VBAT_EMPTY interrupt (INT_RT_STS 0x4810 bit2
++ * rising, threshold 3.1 V) -> SOC forced to 0, SDAM SOC=0/OCV=SDAM OCV/VALID */
++void qg_kernel_vbat_empty(struct qg_kernel *k, uint32_t sdam_ocv_uv, int batt_temp,
++			  uint32_t rtc_sec, int64_t now_ms);
++/* qg_get_battery_capacity() (linearize-soc, hold-soc-while-full) */
++int qg_kernel_capacity(const struct qg_kernel *k);
++/* soc_monitor_work(), every 10 s: Xiaomi smooth tracking -> k->shown */
++void qg_kernel_soc_monitor(struct qg_kernel *k, int batt_ua, int batt_temp, int64_t boot_s);
++/* force_shutdown_work(): returns the delay to the next call (ms) */
++int qg_kernel_force_shutdown(struct qg_kernel *k, int vbat_uv);
++/* POWER_SUPPLY_PROP_CAPACITY (what healthd/MIUI show), incl. shutdown-delay */
++int qg_kernel_reported_capacity(struct qg_kernel *k, int vbat_uv);
++
++/* charger side (davinci smb5-lib.c, ref/.../smb5/): POWER_SUPPLY_PROP_HEALTH,
++ * STATUS and CHARGE_DONE of the "battery" psy from SMB5 registers.  Votes that
++ * are invisible to a register reader (JEITA/USER/CHG_TERMINATION ICL votes,
++ * BQ pump) are taken as not set; DC input is absent on davinci.
++ *   r1006 BATTERY_CHARGER_STATUS_1, r100d BATTERY_CHARGER_STATUS_7,
++ *   r1043 CHARGING_PAUSE_CMD, r110b POWER_PATH_STATUS, r1310 USBIN_INT_RT_STS,
++ *   capacity = bms POWER_SUPPLY_PROP_CAPACITY (qg_kernel_reported_capacity) */
++/* returns POWER_SUPPLY_HEALTH_*: GOOD 1, OVERHEAT 2, COLD 6, WARM 10, COOL 11 */
++int qg_smb5_health(uint8_t r100d);
++int qg_smb5_usb_present(uint8_t r1310);
++int qg_smb5_charge_done(uint8_t r1006);
++int qg_smb5_batt_status(uint8_t r1006, uint8_t r100d, uint8_t r1043, uint8_t r110b, int capacity);
++
++/* kdata assembly (qg_process_fifo / qg_process_accumulator / fifo-done):
++ * v_raw/i_raw = QG_V_FIFO/QG_I_FIFO words; returns -1 when an entry reads 0x8000
++ * (Linux rejects the whole FIFO then).  Appends at kd->fifo_length. */
++int qg_kdata_add_fifo(struct qg_kernel_data *kd, const uint16_t *v_raw, const uint16_t *i_raw,
++		      int len, uint32_t interval_ms, uint32_t count, int subtype4);
++int qg_kdata_add_accum(struct qg_kernel_data *kd, uint32_t v_acc_raw /*u24*/, uint32_t i_acc_raw /*s24*/,
++		       uint8_t acc_cnt, uint32_t interval_ms, int subtype4);
++/* FIFO_TIME_DELTA as qg_fifo_update_done_handler() validates it */
++void qg_kdata_fifo_time_delta(struct qg_kernel_data *kd, int hw_delta_ms, int sw_delta_ms);
++
++/* ------------------------------------------------------------------ */
++/* register helpers (qg-util.c)                                        */
++static inline uint32_t qg_vraw_to_uv(uint32_t raw) { return (uint32_t)((194637ull * raw) / 1000); }
++/* PM6150 QG subtype 4 (10 A ADC): uA, + = discharge */
++static inline int32_t qg_iraw_to_ua_sub4(int32_t sraw) { return (int32_t)(((int64_t)sraw * 305176) / 1000); }
++static inline int32_t qg_iraw_to_ua_sub3(int32_t sraw) { return (int32_t)(((int64_t)sraw * 152588) / 1000); }
++/* S2_NORMAL_MEAS_CTL3 -> sample interval ms with QG_CLK_ADJUST_WA (PM6150) */
++static inline uint32_t qg_sample_interval_ms(uint8_t ctl3) { uint32_t v = ctl3 * 10u; return (v * 32000u + 32764u / 2) / 32764u; }
++/* S2_NORMAL_MEAS_CTL2 -> samples per FIFO entry and FIFO length */
++static inline uint32_t qg_sample_count(uint8_t ctl2) { return 1u << ((ctl2 & 0x7) + 1); }
++static inline uint32_t qg_fifo_length(uint8_t ctl2) { return ((ctl2 >> 3) & 0x7) + 1; }
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/bsd/dev/sweet_qg_exp_tab.inc b/bsd/dev/sweet_qg_exp_tab.inc
+new file mode 100644
+index 0000000..f41e11f
+--- /dev/null
++++ b/bsd/dev/sweet_qg_exp_tab.inc
+@@ -0,0 +1,66 @@
++/* GENERATED from davinci-ios/battery/port by "make kernel-files" - edit the port, not this */
++/* bionic libm __exp_data.tab (Android 11 arm64 libm.so @0xafd8), 2*128 entries */
++0x0000000000000000ULL, 0x3ff0000000000000ULL, 0x3c9b3b4f1a88bf6eULL, 0x3feff63da9fb3335ULL,
++0xbc7160139cd8dc5dULL, 0x3fefec9a3e778061ULL, 0xbc905e7a108766d1ULL, 0x3fefe315e86e7f85ULL,
++0x3c8cd2523567f613ULL, 0x3fefd9b0d3158574ULL, 0xbc8bce8023f98efaULL, 0x3fefd06b29ddf6deULL,
++0x3c60f74e61e6c861ULL, 0x3fefc74518759bc8ULL, 0x3c90a3e45b33d399ULL, 0x3fefbe3ecac6f383ULL,
++0x3c979aa65d837b6dULL, 0x3fefb5586cf9890fULL, 0x3c8eb51a92fdeffcULL, 0x3fefac922b7247f7ULL,
++0x3c3ebe3d702f9cd1ULL, 0x3fefa3ec32d3d1a2ULL, 0xbc6a033489906e0bULL, 0x3fef9b66affed31bULL,
++0xbc9556522a2fbd0eULL, 0x3fef9301d0125b51ULL, 0xbc5080ef8c4eea55ULL, 0x3fef8abdc06c31ccULL,
++0xbc91c923b9d5f416ULL, 0x3fef829aaea92de0ULL, 0x3c80d3e3e95c55afULL, 0x3fef7a98c8a58e51ULL,
++0xbc801b15eaa59348ULL, 0x3fef72b83c7d517bULL, 0xbc8f1ff055de323dULL, 0x3fef6af9388c8deaULL,
++0x3c8b898c3f1353bfULL, 0x3fef635beb6fcb75ULL, 0xbc96d99c7611eb26ULL, 0x3fef5be084045cd4ULL,
++0x3c9aecf73e3a2f60ULL, 0x3fef54873168b9aaULL, 0xbc8fe782cb86389dULL, 0x3fef4d5022fcd91dULL,
++0x3c8a6f4144a6c38dULL, 0x3fef463b88628cd6ULL, 0x3c807a05b0e4047dULL, 0x3fef3f49917ddc96ULL,
++0x3c968efde3a8a894ULL, 0x3fef387a6e756238ULL, 0x3c875e18f274487dULL, 0x3fef31ce4fb2a63fULL,
++0x3c80472b981fe7f2ULL, 0x3fef2b4565e27cddULL, 0xbc96b87b3f71085eULL, 0x3fef24dfe1f56381ULL,
++0x3c82f7e16d09ab31ULL, 0x3fef1e9df51fdee1ULL, 0xbc3d219b1a6fbffaULL, 0x3fef187fd0dad990ULL,
++0x3c8b3782720c0ab4ULL, 0x3fef1285a6e4030bULL, 0x3c6e149289cecb8fULL, 0x3fef0cafa93e2f56ULL,
++0x3c834d754db0abb6ULL, 0x3fef06fe0a31b715ULL, 0x3c864201e2ac744cULL, 0x3fef0170fc4cd831ULL,
++0x3c8fdd395dd3f84aULL, 0x3feefc08b26416ffULL, 0xbc86a3803b8e5b04ULL, 0x3feef6c55f929ff1ULL,
++0xbc924aedcc4b5068ULL, 0x3feef1a7373aa9cbULL, 0xbc9907f81b512d8eULL, 0x3feeecae6d05d866ULL,
++0xbc71d1e83e9436d2ULL, 0x3feee7db34e59ff7ULL, 0xbc991919b3ce1b15ULL, 0x3feee32dc313a8e5ULL,
++0x3c859f48a72a4c6dULL, 0x3feedea64c123422ULL, 0xbc9312607a28698aULL, 0x3feeda4504ac801cULL,
++0xbc58a78f4817895bULL, 0x3feed60a21f72e2aULL, 0xbc7c2c9b67499a1bULL, 0x3feed1f5d950a897ULL,
++0x3c4363ed60c2ac11ULL, 0x3feece086061892dULL, 0x3c9666093b0664efULL, 0x3feeca41ed1d0057ULL,
++0x3c6ecce1daa10379ULL, 0x3feec6a2b5c13cd0ULL, 0x3c93ff8e3f0f1230ULL, 0x3feec32af0d7d3deULL,
++0x3c7690cebb7aafb0ULL, 0x3feebfdad5362a27ULL, 0x3c931dbdeb54e077ULL, 0x3feebcb299fddd0dULL,
++0xbc8f94340071a38eULL, 0x3feeb9b2769d2ca7ULL, 0xbc87deccdc93a349ULL, 0x3feeb6daa2cf6642ULL,
++0xbc78dec6bd0f385fULL, 0x3feeb42b569d4f82ULL, 0xbc861246ec7b5cf6ULL, 0x3feeb1a4ca5d920fULL,
++0x3c93350518fdd78eULL, 0x3feeaf4736b527daULL, 0x3c7b98b72f8a9b05ULL, 0x3feead12d497c7fdULL,
++0x3c9063e1e21c5409ULL, 0x3feeab07dd485429ULL, 0x3c34c7855019c6eaULL, 0x3feea9268a5946b7ULL,
++0x3c9432e62b64c035ULL, 0x3feea76f15ad2148ULL, 0xbc8ce44a6199769fULL, 0x3feea5e1b976dc09ULL,
++0xbc8c33c53bef4da8ULL, 0x3feea47eb03a5585ULL, 0xbc845378892be9aeULL, 0x3feea34634ccc320ULL,
++0xbc93cedd78565858ULL, 0x3feea23882552225ULL, 0x3c5710aa807e1964ULL, 0x3feea155d44ca973ULL,
++0xbc93b3efbf5e2228ULL, 0x3feea09e667f3bcdULL, 0xbc6a12ad8734b982ULL, 0x3feea012750bdabfULL,
++0xbc6367efb86da9eeULL, 0x3fee9fb23c651a2fULL, 0xbc80dc3d54e08851ULL, 0x3fee9f7df9519484ULL,
++0xbc781f647e5a3ecfULL, 0x3fee9f75e8ec5f74ULL, 0xbc86ee4ac08b7db0ULL, 0x3fee9f9a48a58174ULL,
++0xbc8619321e55e68aULL, 0x3fee9feb564267c9ULL, 0x3c909ccb5e09d4d3ULL, 0x3feea0694fde5d3fULL,
++0xbc7b32dcb94da51dULL, 0x3feea11473eb0187ULL, 0x3c94ecfd5467c06bULL, 0x3feea1ed0130c132ULL,
++0x3c65ebe1abd66c55ULL, 0x3feea2f336cf4e62ULL, 0xbc88a1c52fb3cf42ULL, 0x3feea427543e1a12ULL,
++0xbc9369b6f13b3734ULL, 0x3feea589994cce13ULL, 0xbc805e843a19ff1eULL, 0x3feea71a4623c7adULL,
++0xbc94d450d872576eULL, 0x3feea8d99b4492edULL, 0x3c90ad675b0e8a00ULL, 0x3feeaac7d98a6699ULL,
++0x3c8db72fc1f0eab4ULL, 0x3feeace5422aa0dbULL, 0xbc65b6609cc5e7ffULL, 0x3feeaf3216b5448cULL,
++0x3c7bf68359f35f44ULL, 0x3feeb1ae99157736ULL, 0xbc93091fa71e3d83ULL, 0x3feeb45b0b91ffc6ULL,
++0xbc5da9b88b6c1e29ULL, 0x3feeb737b0cdc5e5ULL, 0xbc6c23f97c90b959ULL, 0x3feeba44cbc8520fULL,
++0xbc92434322f4f9aaULL, 0x3feebd829fde4e50ULL, 0xbc85ca6cd7668e4bULL, 0x3feec0f170ca07baULL,
++0x3c71affc2b91ce27ULL, 0x3feec49182a3f090ULL, 0x3c6dd235e10a73bbULL, 0x3feec86319e32323ULL,
++0xbc87c50422622263ULL, 0x3feecc667b5de565ULL, 0x3c8b1c86e3e231d5ULL, 0x3feed09bec4a2d33ULL,
++0xbc91bbd1d3bcbb15ULL, 0x3feed503b23e255dULL, 0x3c90cc319cee31d2ULL, 0x3feed99e1330b358ULL,
++0x3c8469846e735ab3ULL, 0x3feede6b5579fdbfULL, 0xbc82dfcd978e9db4ULL, 0x3feee36bbfd3f37aULL,
++0x3c8c1a7792cb3387ULL, 0x3feee89f995ad3adULL, 0xbc907b8f4ad1d9faULL, 0x3feeee07298db666ULL,
++0xbc55c3d956dcaebaULL, 0x3feef3a2b84f15fbULL, 0xbc90a40e3da6f640ULL, 0x3feef9728de5593aULL,
++0xbc68d6f438ad9334ULL, 0x3feeff76f2fb5e47ULL, 0xbc91eee26b588a35ULL, 0x3fef05b030a1064aULL,
++0x3c74ffd70a5fddcdULL, 0x3fef0c1e904bc1d2ULL, 0xbc91bdfbfa9298acULL, 0x3fef12c25bd71e09ULL,
++0x3c736eae30af0cb3ULL, 0x3fef199bdd85529cULL, 0x3c8ee3325c9ffd94ULL, 0x3fef20ab5fffd07aULL,
++0x3c84e08fd10959acULL, 0x3fef27f12e57d14bULL, 0x3c63cdaf384e1a67ULL, 0x3fef2f6d9406e7b5ULL,
++0x3c676b2c6c921968ULL, 0x3fef3720dcef9069ULL, 0xbc808a1883ccb5d2ULL, 0x3fef3f0b555dc3faULL,
++0xbc8fad5d3ffffa6fULL, 0x3fef472d4a07897cULL, 0xbc900dae3875a949ULL, 0x3fef4f87080d89f2ULL,
++0x3c74a385a63d07a7ULL, 0x3fef5818dcfba487ULL, 0xbc82919e2040220fULL, 0x3fef60e316c98398ULL,
++0x3c8e5a50d5c192acULL, 0x3fef69e603db3285ULL, 0x3c843a59ac016b4bULL, 0x3fef7321f301b460ULL,
++0xbc82d52107b43e1fULL, 0x3fef7c97337b9b5fULL, 0xbc892ab93b470dc9ULL, 0x3fef864614f5a129ULL,
++0x3c74b604603a88d3ULL, 0x3fef902ee78b3ff6ULL, 0x3c83c5ec519d7271ULL, 0x3fef9a51fbc74c83ULL,
++0xbc8ff7128fd391f0ULL, 0x3fefa4afa2a490daULL, 0xbc8dae98e223747dULL, 0x3fefaf482d8e67f1ULL,
++0x3c8ec3bc41aa2008ULL, 0x3fefba1bee615a27ULL, 0x3c842b94c3a9eb32ULL, 0x3fefc52b376bba97ULL,
++0x3c8a64a931d185eeULL, 0x3fefd0765b6e4540ULL, 0xbc8e37bae43be3edULL, 0x3fefdbfdad9cbe14ULL,
++0x3c77893b4d91cd9dULL, 0x3fefe7c1819e90d8ULL, 0x3c5305c14160cc89ULL, 0x3feff3c22b8f71f1ULL
+\ No newline at end of file
+diff --git a/bsd/dev/sweet_qg_f10_profile.h b/bsd/dev/sweet_qg_f10_profile.h
+new file mode 100644
+index 0000000..c8f6037
+--- /dev/null
++++ b/bsd/dev/sweet_qg_f10_profile.h
+@@ -0,0 +1,926 @@
++/* GENERATED from davinci-ios/battery/port by "make kernel-files" - edit the port, not this */
++/*
++ * Xiaomi Mi 9T (davinci) battery profile "f10_swd"
++ * (qcom,3840738_Xiaomi_F10_Sunwoda_4000mAH_PM7150_FG, batt-id 68 kOhm,
++ *  qcom,qg-batt-profile-ver = 100).
++ *
++ * AUTO-EXTRACTED from the MIUI dtbo overlay actually used on this phone
++ * (androidboot.dtbo_idx=14 -> dtbo_ovl_14.dts, fragment@66; identical in
++ * overlays 6/27) by tools/extract.py.  Do not hand-edit.
++ *
++ * Units (same as qpnp-qg / qg-profile-lib.c):
++ *   *_temp_c      column legend, degrees C (driver compares against deci-C *10)
++ *   *_soc_cpct    row legend, centi-percent (10000 = 100.00 %)
++ *   pc_temp_v1/v2 OCV in 100 uV units ("deci-mV"; UV_TO_DECIUV = uV/100)
++ *   fcc*_temp     full-charge capacity, mAh
++ * Linux lookup_soc_ocv(): charging ? pc_temp_v1 : pc_temp_v2
++ * Linux qg_get_nominal_capacity(): charging ? fcc1 : fcc2
++ * pc-temp-z1..z6 / y1..y6 are consumed only by the closed-source QTI
++ * userspace QG daemon (via /dev/qg_battery BPIOCXVAR); kept for reference.
++ *
++ * Integer-only: safe for the XNU kernel (-mkernel => no FP/SIMD).
++ */
++#ifndef SWEET_F10_SWD_PROFILE_H
++#define SWEET_F10_SWD_PROFILE_H
++#include <stdint.h>
++
++#define F10_FLOAT_UV            4400000   /* qcom,max-voltage-uv */
++#define F10_NOM_CAP_MAH         4000      /* qcom,nom-batt-capacity-mah */
++#define F10_FASTCHG_MA          3500
++#define F10_BATT_ID_KOHM        68
++#define F10_THERM_BETA          4250
++#define F10_THERM_KOHM          100
++/* QG node (base dts + dtbo fragment@67) */
++#define QG_VBATT_CUTOFF_MV      3400
++#define QG_VBATT_LOW_MV         3300
++#define QG_VBATT_LOW_COLD_MV    3700
++#define QG_VBATT_EMPTY_MV       3100
++#define QG_ITERM_MA             350
++#define QG_S3_ENTRY_IBAT_UA     25000
++#define QG_S3_EXIT_IBAT_UA      45000
++#define QG_SHUTDOWN_SOC_THRESH  3         /* qcom,shutdown-soc-threshold */
++#define QG_IGNORE_SHUTDOWN_SECS 360       /* driver default */
++#define QG_DELTA_SOC            1
++/* flags: hold-soc-while-full, linearize-soc, cl-feedback-on, shutdown-delay-enable */
++#define SMB_AUTO_RECHARGE_SOC   99        /* qcom,auto-recharge-soc (smb5) */
++
++/* qcom,fcc1-temp-lut: rows=1 cols=5 */
++static const int16_t fcc1_temp_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t fcc1_temp[5] = {3830, 3901, 3987, 4022, 4035};
++
++/* qcom,fcc2-temp-lut: rows=1 cols=6 */
++static const int16_t fcc2_temp_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t fcc2_temp[6] = {3964, 3967, 3982, 3986, 3991, 3987};
++
++/* qcom,pc-temp-v1-lut: rows=56 cols=5 */
++static const int16_t pc_temp_v1_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t pc_temp_v1_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_v1[56][5] = {
++	{43639, 43742, 43833, 43859, 43868}, /* 100% */
++	{43443, 43527, 43618, 43664, 43668}, /* 98% */
++	{43186, 43299, 43398, 43444, 43455}, /* 96% */
++	{42923, 43062, 43172, 43220, 43236}, /* 94% */
++	{42685, 42830, 42941, 42993, 43012}, /* 92% */
++	{42457, 42600, 42709, 42763, 42783}, /* 90% */
++	{42233, 42371, 42477, 42533, 42555}, /* 88% */
++	{42015, 42143, 42245, 42302, 42326}, /* 86% */
++	{41802, 41918, 42018, 42073, 42098}, /* 84% */
++	{41595, 41698, 41793, 41845, 41870}, /* 82% */
++	{41392, 41484, 41573, 41620, 41644}, /* 80% */
++	{41197, 41277, 41357, 41401, 41422}, /* 78% */
++	{41016, 41082, 41146, 41187, 41203}, /* 76% */
++	{40835, 40904, 40945, 40981, 40992}, /* 74% */
++	{40623, 40719, 40751, 40779, 40787}, /* 72% */
++	{40370, 40496, 40558, 40582, 40589}, /* 70% */
++	{40138, 40254, 40355, 40383, 40397}, /* 68% */
++	{39970, 40060, 40158, 40188, 40212}, /* 66% */
++	{39828, 39918, 39987, 40011, 40036}, /* 64% */
++	{39689, 39782, 39842, 39864, 39880}, /* 62% */
++	{39558, 39612, 39676, 39708, 39716}, /* 60% */
++	{39420, 39418, 39436, 39487, 39499}, /* 58% */
++	{39238, 39224, 39181, 39224, 39236}, /* 56% */
++	{39008, 39012, 39000, 39028, 39035}, /* 54% */
++	{38822, 38825, 38862, 38891, 38901}, /* 52% */
++	{38704, 38714, 38746, 38773, 38786}, /* 50% */
++	{38612, 38641, 38649, 38663, 38670}, /* 48% */
++	{38539, 38574, 38563, 38562, 38559}, /* 46% */
++	{38480, 38505, 38479, 38468, 38461}, /* 44% */
++	{38428, 38440, 38397, 38377, 38373}, /* 42% */
++	{38379, 38378, 38324, 38296, 38293}, /* 40% */
++	{38333, 38317, 38258, 38227, 38221}, /* 38% */
++	{38292, 38263, 38199, 38165, 38156}, /* 36% */
++	{38254, 38216, 38145, 38106, 38091}, /* 34% */
++	{38219, 38175, 38098, 38051, 38027}, /* 32% */
++	{38185, 38137, 38051, 37997, 37964}, /* 30% */
++	{38153, 38105, 38008, 37943, 37902}, /* 28% */
++	{38113, 38067, 37963, 37888, 37839}, /* 26% */
++	{38050, 38003, 37898, 37816, 37759}, /* 24% */
++	{37967, 37908, 37806, 37720, 37656}, /* 22% */
++	{37868, 37801, 37700, 37609, 37541}, /* 20% */
++	{37741, 37675, 37581, 37488, 37419}, /* 18% */
++	{37599, 37533, 37444, 37353, 37284}, /* 16% */
++	{37438, 37368, 37281, 37191, 37116}, /* 14% */
++	{37303, 37232, 37147, 37068, 36997}, /* 12% */
++	{37223, 37152, 37067, 36988, 36933}, /* 10% */
++	{37200, 37127, 37041, 36965, 36910}, /* 9% */
++	{37186, 37109, 37023, 36946, 36889}, /* 8% */
++	{37168, 37088, 37008, 36923, 36865}, /* 7% */
++	{37110, 37033, 36939, 36837, 36761}, /* 6% */
++	{36847, 36752, 36643, 36518, 36422}, /* 5% */
++	{36378, 36289, 36184, 36057, 35960}, /* 4% */
++	{35789, 35697, 35582, 35456, 35358}, /* 3% */
++	{34977, 34871, 34757, 34631, 34529}, /* 2% */
++	{33685, 33560, 33449, 33321, 33215}, /* 1% */
++	{30000, 30000, 30000, 30000, 30000}, /* 0% */
++};
++
++/* qcom,pc-temp-v2-lut: rows=56 cols=6 */
++static const int16_t pc_temp_v2_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t pc_temp_v2_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_v2[56][6] = {
++	{43895, 43870, 43850, 43805, 43785, 43765}, /* 100% */
++	{43543, 43557, 43579, 43544, 43530, 43513}, /* 98% */
++	{43218, 43262, 43316, 43289, 43281, 43268}, /* 96% */
++	{42918, 42986, 43063, 43044, 43039, 43031}, /* 94% */
++	{42640, 42730, 42820, 42808, 42804, 42801}, /* 92% */
++	{42390, 42481, 42581, 42574, 42571, 42572}, /* 90% */
++	{42180, 42234, 42344, 42341, 42339, 42340}, /* 88% */
++	{41987, 41993, 42110, 42109, 42108, 42107}, /* 86% */
++	{41758, 41758, 41881, 41881, 41880, 41878}, /* 84% */
++	{41468, 41525, 41654, 41655, 41655, 41650}, /* 82% */
++	{41238, 41309, 41434, 41432, 41433, 41426}, /* 80% */
++	{41139, 41125, 41222, 41214, 41215, 41208}, /* 78% */
++	{41067, 40956, 41017, 41000, 41000, 40993}, /* 76% */
++	{40909, 40764, 40815, 40796, 40795, 40787}, /* 74% */
++	{40503, 40547, 40615, 40600, 40596, 40585}, /* 72% */
++	{40074, 40315, 40417, 40405, 40402, 40390}, /* 70% */
++	{39779, 40055, 40218, 40201, 40205, 40200}, /* 68% */
++	{39529, 39782, 40018, 39999, 40013, 40018}, /* 66% */
++	{39340, 39555, 39806, 39825, 39840, 39846}, /* 64% */
++	{39206, 39367, 39578, 39682, 39689, 39691}, /* 62% */
++	{39072, 39193, 39356, 39524, 39523, 39521}, /* 60% */
++	{38874, 39022, 39151, 39293, 39296, 39296}, /* 58% */
++	{38641, 38858, 38959, 39031, 39048, 39049}, /* 56% */
++	{38480, 38700, 38794, 38835, 38855, 38858}, /* 54% */
++	{38375, 38545, 38650, 38683, 38700, 38707}, /* 52% */
++	{38293, 38402, 38522, 38554, 38568, 38576}, /* 50% */
++	{38224, 38274, 38410, 38440, 38451, 38456}, /* 48% */
++	{38165, 38159, 38308, 38338, 38348, 38349}, /* 46% */
++	{38108, 38081, 38211, 38245, 38255, 38254}, /* 44% */
++	{38051, 38029, 38112, 38159, 38171, 38169}, /* 42% */
++	{37997, 37987, 38027, 38081, 38094, 38092}, /* 40% */
++	{37947, 37942, 37960, 38009, 38025, 38022}, /* 38% */
++	{37900, 37899, 37906, 37942, 37960, 37956}, /* 36% */
++	{37852, 37858, 37858, 37879, 37892, 37885}, /* 34% */
++	{37802, 37820, 37819, 37823, 37820, 37808}, /* 32% */
++	{37750, 37781, 37780, 37766, 37742, 37721}, /* 30% */
++	{37694, 37738, 37740, 37703, 37651, 37619}, /* 28% */
++	{37635, 37693, 37698, 37636, 37553, 37505}, /* 26% */
++	{37565, 37636, 37643, 37562, 37462, 37406}, /* 24% */
++	{37481, 37558, 37567, 37480, 37380, 37325}, /* 22% */
++	{37387, 37463, 37475, 37386, 37291, 37240}, /* 20% */
++	{37288, 37354, 37358, 37275, 37183, 37130}, /* 18% */
++	{37184, 37228, 37218, 37150, 37066, 37008}, /* 16% */
++	{37096, 37087, 37069, 37019, 36944, 36886}, /* 14% */
++	{37022, 36958, 36952, 36920, 36853, 36801}, /* 12% */
++	{36952, 36884, 36889, 36871, 36812, 36760}, /* 10% */
++	{36907, 36853, 36859, 36855, 36800, 36747}, /* 9% */
++	{36856, 36823, 36832, 36838, 36781, 36727}, /* 8% */
++	{36779, 36776, 36787, 36801, 36742, 36684}, /* 7% */
++	{36655, 36675, 36679, 36690, 36594, 36503}, /* 6% */
++	{36393, 36432, 36380, 36356, 36212, 36108}, /* 5% */
++	{35945, 35966, 35872, 35838, 35682, 35573}, /* 4% */
++	{35300, 35324, 35202, 35174, 34988, 34869}, /* 3% */
++	{34375, 34430, 34278, 34271, 34045, 33932}, /* 2% */
++	{32935, 33097, 32975, 32791, 32630, 32448}, /* 1% */
++	{27703, 28392, 27520, 27513, 27500, 27362}, /* 0% */
++};
++
++#ifdef F10_KEEP_USERSPACE_TABLES
++/* qcom,pc-temp-z1-lut: rows=56 cols=5 */
++static const int16_t pc_temp_z1_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t pc_temp_z1_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_z1[56][5] = {
++	{13088, 12531, 11917, 11542, 11397}, /* 100% */
++	{13133, 12581, 11958, 11594, 11459}, /* 98% */
++	{13170, 12587, 11982, 11610, 11479}, /* 96% */
++	{13190, 12580, 11982, 11613, 11487}, /* 94% */
++	{13188, 12572, 11971, 11612, 11486}, /* 92% */
++	{13182, 12560, 11959, 11610, 11485}, /* 90% */
++	{13172, 12548, 11947, 11606, 11484}, /* 88% */
++	{13140, 12543, 11936, 11600, 11483}, /* 86% */
++	{13107, 12535, 11927, 11598, 11482}, /* 84% */
++	{13097, 12525, 11920, 11597, 11480}, /* 82% */
++	{13092, 12510, 11916, 11597, 11478}, /* 80% */
++	{13088, 12491, 11914, 11595, 11477}, /* 78% */
++	{13081, 12475, 11913, 11594, 11476}, /* 76% */
++	{13070, 12459, 11911, 11592, 11476}, /* 74% */
++	{13052, 12449, 11910, 11591, 11476}, /* 72% */
++	{13009, 12446, 11908, 11590, 11475}, /* 70% */
++	{12979, 12446, 11905, 11588, 11475}, /* 68% */
++	{12977, 12446, 11901, 11587, 11477}, /* 66% */
++	{12979, 12450, 11901, 11587, 11479}, /* 64% */
++	{12980, 12456, 11903, 11588, 11479}, /* 62% */
++	{12984, 12457, 11906, 11590, 11480}, /* 60% */
++	{12991, 12459, 11909, 11590, 11483}, /* 58% */
++	{13003, 12459, 11914, 11591, 11486}, /* 56% */
++	{13024, 12461, 11917, 11592, 11487}, /* 54% */
++	{13034, 12463, 11919, 11594, 11485}, /* 52% */
++	{13026, 12467, 11922, 11597, 11484}, /* 50% */
++	{13013, 12471, 11928, 11600, 11486}, /* 48% */
++	{13011, 12473, 11935, 11604, 11491}, /* 46% */
++	{13021, 12477, 11940, 11608, 11495}, /* 44% */
++	{13033, 12481, 11945, 11615, 11498}, /* 42% */
++	{13046, 12482, 11949, 11620, 11501}, /* 40% */
++	{13064, 12482, 11956, 11624, 11505}, /* 38% */
++	{13071, 12482, 11963, 11627, 11510}, /* 36% */
++	{13059, 12490, 11968, 11631, 11515}, /* 34% */
++	{13046, 12504, 11974, 11637, 11520}, /* 32% */
++	{13045, 12512, 11979, 11643, 11526}, /* 30% */
++	{13049, 12516, 11984, 11648, 11531}, /* 28% */
++	{13054, 12518, 11989, 11653, 11536}, /* 26% */
++	{13059, 12522, 11996, 11658, 11540}, /* 24% */
++	{13065, 12528, 12006, 11665, 11543}, /* 22% */
++	{13073, 12532, 12016, 11671, 11546}, /* 20% */
++	{13092, 12534, 12026, 11675, 11549}, /* 18% */
++	{13106, 12539, 12033, 11678, 11553}, /* 16% */
++	{13126, 12550, 12035, 11684, 11557}, /* 14% */
++	{13107, 12573, 12044, 11692, 11562}, /* 12% */
++	{13101, 12566, 12050, 11696, 11564}, /* 10% */
++	{13094, 12583, 12059, 11696, 11561}, /* 9% */
++	{13100, 12577, 12054, 11694, 11563}, /* 8% */
++	{13121, 12564, 12050, 11698, 11566}, /* 7% */
++	{13128, 12572, 12057, 11705, 11572}, /* 6% */
++	{13139, 12610, 12070, 11713, 11580}, /* 5% */
++	{13125, 12583, 12082, 11719, 11586}, /* 4% */
++	{13164, 12615, 12092, 11733, 11597}, /* 3% */
++	{13201, 12636, 12114, 11749, 11611}, /* 2% */
++	{13201, 12636, 12114, 11749, 11611}, /* 1% */
++	{13201, 12636, 12114, 11749, 11611}, /* 0% */
++};
++
++/* qcom,pc-temp-z2-lut: rows=56 cols=5 */
++static const int16_t pc_temp_z2_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t pc_temp_z2_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_z2[56][5] = {
++	{10298, 10226, 10016, 10004,  9896}, /* 100% */
++	{12902, 10726, 10100, 10009,  9937}, /* 98% */
++	{11279, 10665, 10152, 10040,  9996}, /* 96% */
++	{10100, 10464, 10155, 10062, 10029}, /* 94% */
++	{10052, 10405, 10141, 10073, 10047}, /* 92% */
++	{10039, 10484, 10125, 10079, 10059}, /* 90% */
++	{10025, 10558, 10106, 10067, 10046}, /* 88% */
++	{10006, 10478, 10087, 10044, 10006}, /* 86% */
++	{ 9993, 10222, 10076, 10030,  9980}, /* 84% */
++	{ 9989, 10063, 10067, 10023,  9970}, /* 82% */
++	{ 9988, 10062, 10063, 10016,  9962}, /* 80% */
++	{ 9989, 10063, 10066,  9985,  9952}, /* 78% */
++	{10022, 10067, 10073,  9920,  9932}, /* 76% */
++	{10066, 10090, 10210,  9896,  9920}, /* 74% */
++	{10068, 10110, 10727,  9917,  9919}, /* 72% */
++	{10025, 10112, 11028,  9937,  9919}, /* 70% */
++	{ 9992, 10114, 11030,  9932,  9920}, /* 68% */
++	{10006, 10116, 10999,  9916,  9919}, /* 66% */
++	{10040, 10128, 10848,  9911,  9922}, /* 64% */
++	{10063, 10144, 10370,  9917,  9932}, /* 62% */
++	{10078, 10161, 10099,  9928,  9954}, /* 60% */
++	{10088, 10180, 10160, 10020, 10044}, /* 58% */
++	{10094, 10187, 10244, 10213, 10245}, /* 56% */
++	{10098, 10180, 10243, 10263, 10319}, /* 54% */
++	{10100, 10173, 10178, 10130, 10188}, /* 52% */
++	{10100, 10172, 10140, 10012, 10052}, /* 50% */
++	{10100, 10174, 10154, 10082, 10109}, /* 48% */
++	{10100, 10177, 10177, 10237, 10281}, /* 46% */
++	{10106, 10178, 10190, 10277, 10334}, /* 44% */
++	{10113, 10179, 10201, 10209, 10200}, /* 42% */
++	{10118, 10182, 10205, 10128, 10039}, /* 40% */
++	{10124, 10191, 10188, 10076,  9948}, /* 38% */
++	{10131, 10200, 10162, 10032,  9877}, /* 36% */
++	{10141, 10207, 10162,  9995,  9863}, /* 34% */
++	{10151, 10212, 10183,  9959,  9888}, /* 32% */
++	{10162, 10218, 10200,  9939,  9920}, /* 30% */
++	{10174, 10223, 10207,  9962,  9952}, /* 28% */
++	{10187, 10230, 10215, 10013,  9989}, /* 26% */
++	{10200, 10244, 10234, 10045, 10013}, /* 24% */
++	{10213, 10266, 10277, 10065, 10029}, /* 22% */
++	{10225, 10282, 10310, 10081, 10041}, /* 20% */
++	{10234, 10291, 10322, 10091, 10051}, /* 18% */
++	{10250, 10302, 10326, 10104, 10060}, /* 16% */
++	{10287, 10324, 10326, 10164, 10083}, /* 14% */
++	{10515, 10457, 10354, 10159, 10072}, /* 12% */
++	{10566, 10498, 10320, 10102, 10030}, /* 10% */
++	{10558, 10502, 10340, 10136, 10051}, /* 9% */
++	{10544, 10490, 10313, 10124, 10032}, /* 8% */
++	{10527, 10509, 10310, 10148, 10087}, /* 7% */
++	{10615, 10575, 10420, 10185, 10076}, /* 6% */
++	{10633, 10617, 10340, 10061,  9966}, /* 5% */
++	{10559, 10547, 10299,  9957,  9864}, /* 4% */
++	{10341, 10585, 10269,  9927,  9830}, /* 3% */
++	{10223, 10502, 10191,  9907,  9781}, /* 2% */
++	{10223, 10502, 10191,  9907,  9781}, /* 1% */
++	{10223, 10502, 10191,  9907,  9781}, /* 0% */
++};
++
++/* qcom,pc-temp-z3-lut: rows=56 cols=5 */
++static const int16_t pc_temp_z3_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t pc_temp_z3_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_z3[56][5] = {
++	{19698, 19460, 19373, 19365, 19351}, /* 100% */
++	{19401, 19519, 19429, 19367, 19358}, /* 98% */
++	{19605, 19548, 19467, 19401, 19388}, /* 96% */
++	{19765, 19588, 19481, 19423, 19410}, /* 94% */
++	{19786, 19614, 19489, 19433, 19420}, /* 92% */
++	{19797, 19639, 19493, 19439, 19427}, /* 90% */
++	{19799, 19666, 19494, 19442, 19429}, /* 88% */
++	{19792, 19665, 19496, 19443, 19431}, /* 86% */
++	{19782, 19636, 19495, 19443, 19432}, /* 84% */
++	{19773, 19612, 19491, 19441, 19428}, /* 82% */
++	{19762, 19607, 19486, 19436, 19423}, /* 80% */
++	{19757, 19603, 19477, 19429, 19418}, /* 78% */
++	{19765, 19595, 19469, 19419, 19415}, /* 76% */
++	{19776, 19574, 19473, 19414, 19411}, /* 74% */
++	{19777, 19558, 19494, 19412, 19408}, /* 72% */
++	{19767, 19564, 19505, 19411, 19404}, /* 70% */
++	{19754, 19577, 19502, 19409, 19400}, /* 68% */
++	{19734, 19580, 19496, 19408, 19396}, /* 66% */
++	{19710, 19561, 19483, 19406, 19391}, /* 64% */
++	{19699, 19543, 19453, 19396, 19383}, /* 62% */
++	{19696, 19550, 19437, 19387, 19377}, /* 60% */
++	{19694, 19575, 19447, 19393, 19381}, /* 58% */
++	{19705, 19587, 19460, 19406, 19392}, /* 56% */
++	{19741, 19584, 19459, 19409, 19395}, /* 54% */
++	{19761, 19580, 19442, 19389, 19380}, /* 52% */
++	{19756, 19575, 19433, 19371, 19364}, /* 50% */
++	{19745, 19568, 19433, 19383, 19383}, /* 48% */
++	{19734, 19564, 19435, 19410, 19432}, /* 46% */
++	{19724, 19563, 19441, 19427, 19449}, /* 44% */
++	{19713, 19564, 19458, 19438, 19442}, /* 42% */
++	{19704, 19565, 19469, 19444, 19432}, /* 40% */
++	{19695, 19570, 19470, 19439, 19423}, /* 38% */
++	{19687, 19573, 19469, 19429, 19413}, /* 36% */
++	{19680, 19572, 19467, 19419, 19403}, /* 34% */
++	{19675, 19568, 19460, 19409, 19394}, /* 32% */
++	{19671, 19563, 19453, 19401, 19386}, /* 30% */
++	{19669, 19555, 19447, 19394, 19381}, /* 28% */
++	{19666, 19548, 19441, 19389, 19377}, /* 26% */
++	{19660, 19544, 19438, 19386, 19375}, /* 24% */
++	{19653, 19541, 19437, 19385, 19374}, /* 22% */
++	{19646, 19537, 19435, 19384, 19373}, /* 20% */
++	{19640, 19531, 19430, 19386, 19376}, /* 18% */
++	{19632, 19525, 19425, 19390, 19383}, /* 16% */
++	{19613, 19517, 19425, 19395, 19392}, /* 14% */
++	{19546, 19483, 19416, 19388, 19391}, /* 12% */
++	{19510, 19464, 19391, 19373, 19371}, /* 10% */
++	{19483, 19461, 19391, 19355, 19355}, /* 9% */
++	{19425, 19456, 19392, 19351, 19352}, /* 8% */
++	{19351, 19457, 19373, 19352, 19337}, /* 7% */
++	{19348, 19425, 19358, 19349, 19348}, /* 6% */
++	{19398, 19427, 19391, 19386, 19379}, /* 5% */
++	{19401, 19440, 19402, 19391, 19383}, /* 4% */
++	{19343, 19362, 19412, 19393, 19383}, /* 3% */
++	{19338, 19360, 19402, 19381, 19382}, /* 2% */
++	{19338, 19360, 19402, 19381, 19382}, /* 1% */
++	{19338, 19360, 19402, 19381, 19382}, /* 0% */
++};
++
++/* qcom,pc-temp-z4-lut: rows=56 cols=5 */
++static const int16_t pc_temp_z4_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t pc_temp_z4_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_z4[56][5] = {
++	{15404, 15346, 15034, 14923, 14880}, /* 100% */
++	{15754, 15332, 15033, 14931, 14914}, /* 98% */
++	{15611, 15285, 15027, 14928, 14907}, /* 96% */
++	{15449, 15174, 15008, 14921, 14896}, /* 94% */
++	{15326, 15062, 14951, 14893, 14875}, /* 92% */
++	{15215, 14951, 14899, 14856, 14846}, /* 90% */
++	{15131, 14861, 14863, 14829, 14821}, /* 88% */
++	{15068, 14845, 14831, 14805, 14797}, /* 86% */
++	{15019, 14844, 14803, 14784, 14779}, /* 84% */
++	{14983, 14842, 14778, 14765, 14765}, /* 82% */
++	{14956, 14827, 14760, 14751, 14754}, /* 80% */
++	{14924, 14801, 14753, 14748, 14748}, /* 78% */
++	{14862, 14784, 14746, 14746, 14744}, /* 76% */
++	{14803, 14772, 14724, 14742, 14740}, /* 74% */
++	{14795, 14766, 14677, 14732, 14734}, /* 72% */
++	{14812, 14765, 14651, 14721, 14728}, /* 70% */
++	{14825, 14766, 14650, 14716, 14723}, /* 68% */
++	{14822, 14764, 14650, 14714, 14719}, /* 66% */
++	{14812, 14754, 14654, 14709, 14715}, /* 64% */
++	{14802, 14744, 14669, 14699, 14707}, /* 62% */
++	{14787, 14745, 14691, 14692, 14700}, /* 60% */
++	{14775, 14752, 14743, 14719, 14723}, /* 58% */
++	{14785, 14764, 14807, 14789, 14793}, /* 56% */
++	{14824, 14820, 14841, 14831, 14832}, /* 54% */
++	{14852, 14880, 14864, 14854, 14846}, /* 52% */
++	{14858, 14884, 14873, 14866, 14854}, /* 50% */
++	{14863, 14867, 14862, 14846, 14827}, /* 48% */
++	{14862, 14848, 14839, 14797, 14758}, /* 46% */
++	{14851, 14829, 14814, 14763, 14727}, /* 44% */
++	{14836, 14809, 14782, 14739, 14722}, /* 42% */
++	{14825, 14791, 14756, 14723, 14718}, /* 40% */
++	{14813, 14773, 14740, 14714, 14712}, /* 38% */
++	{14802, 14760, 14728, 14709, 14706}, /* 36% */
++	{14792, 14753, 14722, 14706, 14703}, /* 34% */
++	{14782, 14748, 14718, 14706, 14700}, /* 32% */
++	{14773, 14745, 14716, 14705, 14698}, /* 30% */
++	{14763, 14742, 14715, 14703, 14697}, /* 28% */
++	{14758, 14741, 14714, 14701, 14696}, /* 26% */
++	{14760, 14744, 14716, 14703, 14698}, /* 24% */
++	{14762, 14750, 14724, 14715, 14714}, /* 22% */
++	{14763, 14753, 14730, 14724, 14727}, /* 20% */
++	{14761, 14751, 14728, 14720, 14720}, /* 18% */
++	{14759, 14748, 14725, 14713, 14711}, /* 16% */
++	{14754, 14742, 14723, 14712, 14712}, /* 14% */
++	{14729, 14718, 14706, 14701, 14698}, /* 12% */
++	{14729, 14703, 14702, 14686, 14678}, /* 10% */
++	{14752, 14695, 14688, 14691, 14678}, /* 9% */
++	{14810, 14691, 14672, 14675, 14660}, /* 8% */
++	{14884, 14682, 14675, 14650, 14649}, /* 7% */
++	{14882, 14714, 14693, 14652, 14636}, /* 6% */
++	{14833, 14726, 14689, 14665, 14671}, /* 5% */
++	{14842, 14722, 14686, 14673, 14681}, /* 4% */
++	{14917, 14813, 14678, 14679, 14689}, /* 3% */
++	{14931, 14816, 14695, 14695, 14694}, /* 2% */
++	{14931, 14816, 14695, 14695, 14694}, /* 1% */
++	{14931, 14816, 14695, 14695, 14694}, /* 0% */
++};
++
++/* qcom,pc-temp-z5-lut: rows=56 cols=5 */
++static const int16_t pc_temp_z5_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t pc_temp_z5_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_z5[56][5] = {
++	{13374, 12310, 12733, 14082, 14017}, /* 100% */
++	{11333, 13381, 14710, 14050, 14313}, /* 98% */
++	{12978, 13902, 16154, 15980, 16270}, /* 96% */
++	{14542, 14809, 16863, 17355, 17924}, /* 94% */
++	{15211, 15603, 17270, 18010, 18784}, /* 92% */
++	{15699, 17130, 17707, 18532, 19457}, /* 90% */
++	{16017, 18918, 18278, 19059, 20085}, /* 88% */
++	{16272, 19204, 18919, 19558, 20657}, /* 86% */
++	{16426, 18912, 19694, 20170, 21213}, /* 84% */
++	{16480, 18707, 20626, 21174, 21819}, /* 82% */
++	{16655, 19207, 21121, 21927, 22375}, /* 80% */
++	{16956, 20098, 21242, 21650, 22736}, /* 78% */
++	{18130, 20296, 21353, 20791, 23037}, /* 76% */
++	{19772, 19946, 23715, 20515, 23307}, /* 74% */
++	{20884, 19652, 32353, 21343, 23908}, /* 72% */
++	{21850, 20965, 37442, 22531, 24636}, /* 70% */
++	{22378, 23792, 37192, 23622, 24986}, /* 68% */
++	{21858, 24625, 36041, 24728, 25320}, /* 66% */
++	{20724, 22998, 33868, 25184, 25676}, /* 64% */
++	{20344, 21404, 28619, 25287, 26153}, /* 62% */
++	{21189, 25507, 25709, 25399, 26805}, /* 60% */
++	{22957, 37694, 30185, 26923, 27875}, /* 58% */
++	{28882, 43197, 36308, 30044, 29382}, /* 56% */
++	{43056, 39484, 35238, 30341, 29549}, /* 54% */
++	{50759, 33702, 26329, 23046, 23057}, /* 52% */
++	{46668, 29529, 20285, 16641, 16508}, /* 50% */
++	{39370, 25555, 19040, 16974, 18462}, /* 48% */
++	{34684, 23726, 18352, 18504, 24585}, /* 46% */
++	{31416, 23645, 18711, 20549, 27149}, /* 44% */
++	{29160, 23651, 21085, 24332, 27506}, /* 42% */
++	{27904, 24197, 23745, 27100, 27663}, /* 40% */
++	{27011, 27079, 26209, 27399, 27468}, /* 38% */
++	{26760, 29983, 28546, 27535, 26999}, /* 36% */
++	{26842, 31709, 30055, 27540, 26838}, /* 34% */
++	{27014, 33043, 31253, 27279, 27069}, /* 32% */
++	{27586, 33235, 31752, 27077, 27332}, /* 30% */
++	{29114, 32129, 31406, 27052, 27563}, /* 28% */
++	{30077, 30884, 30660, 26970, 27875}, /* 26% */
++	{30130, 30332, 29766, 26692, 27731}, /* 24% */
++	{30036, 29924, 28471, 25444, 25702}, /* 22% */
++	{29699, 29279, 26911, 24188, 23987}, /* 20% */
++	{28774, 27497, 24470, 23451, 24050}, /* 18% */
++	{28396, 26347, 22846, 23048, 24663}, /* 16% */
++	{27628, 26036, 22996, 24469, 28658}, /* 14% */
++	{27491, 26498, 23145, 23680, 29794}, /* 12% */
++	{23369, 25476, 19888, 20007, 21882}, /* 10% */
++	{21377, 25294, 20518, 16788, 17652}, /* 9% */
++	{17409, 24403, 22055, 17334, 18820}, /* 8% */
++	{12662, 25668, 18737, 20523, 18880}, /* 7% */
++	{12859, 18518, 16192, 19097, 24482}, /* 6% */
++	{14848, 18523, 18635, 23260, 23678}, /* 5% */
++	{15035, 18900, 19370, 21258, 20434}, /* 4% */
++	{12343, 13215, 20482, 19427, 17970}, /* 3% */
++	{12074, 13019, 17769, 15808, 15755}, /* 2% */
++	{12074, 13019, 17769, 15808, 15755}, /* 1% */
++	{12074, 13019, 17769, 15808, 15755}, /* 0% */
++};
++
++/* qcom,pc-temp-z6-lut: rows=56 cols=5 */
++static const int16_t pc_temp_z6_temp_c[5] = {0, 10, 25, 40, 50};
++static const uint16_t pc_temp_z6_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_z6[56][5] = {
++	{15803, 15287, 14836, 14703, 14655}, /* 100% */
++	{15757, 15296, 14871, 14719, 14687}, /* 98% */
++	{15737, 15279, 14888, 14741, 14704}, /* 96% */
++	{15713, 15229, 14884, 14748, 14711}, /* 94% */
++	{15658, 15178, 14862, 14741, 14707}, /* 92% */
++	{15578, 15138, 14839, 14729, 14699}, /* 90% */
++	{15513, 15099, 14823, 14719, 14691}, /* 88% */
++	{15461, 15069, 14807, 14709, 14682}, /* 86% */
++	{15417, 15044, 14792, 14700, 14673}, /* 84% */
++	{15383, 15022, 14777, 14690, 14665}, /* 82% */
++	{15355, 15004, 14765, 14682, 14657}, /* 80% */
++	{15327, 14988, 14757, 14675, 14652}, /* 78% */
++	{15291, 14969, 14749, 14669, 14648}, /* 76% */
++	{15258, 14946, 14742, 14663, 14643}, /* 74% */
++	{15239, 14931, 14735, 14657, 14639}, /* 72% */
++	{15229, 14933, 14729, 14652, 14634}, /* 70% */
++	{15219, 14936, 14725, 14648, 14629}, /* 68% */
++	{15205, 14937, 14722, 14646, 14625}, /* 66% */
++	{15191, 14923, 14717, 14642, 14620}, /* 64% */
++	{15182, 14910, 14709, 14632, 14612}, /* 62% */
++	{15177, 14913, 14705, 14625, 14606}, /* 60% */
++	{15174, 14928, 14731, 14641, 14619}, /* 58% */
++	{15184, 14946, 14770, 14681, 14657}, /* 56% */
++	{15223, 14971, 14780, 14694, 14672}, /* 54% */
++	{15246, 14993, 14784, 14693, 14670}, /* 52% */
++	{15246, 14994, 14785, 14693, 14667}, /* 50% */
++	{15244, 14985, 14781, 14691, 14665}, /* 48% */
++	{15241, 14976, 14773, 14686, 14662}, /* 46% */
++	{15233, 14969, 14768, 14682, 14659}, /* 44% */
++	{15223, 14962, 14764, 14678, 14654}, /* 42% */
++	{15215, 14958, 14760, 14674, 14648}, /* 40% */
++	{15207, 14954, 14755, 14668, 14642}, /* 38% */
++	{15200, 14952, 14751, 14662, 14635}, /* 36% */
++	{15193, 14949, 14747, 14656, 14628}, /* 34% */
++	{15188, 14946, 14742, 14651, 14623}, /* 32% */
++	{15186, 14944, 14739, 14646, 14618}, /* 30% */
++	{15186, 14941, 14736, 14642, 14615}, /* 28% */
++	{15185, 14940, 14734, 14638, 14612}, /* 26% */
++	{15187, 14942, 14735, 14638, 14612}, /* 24% */
++	{15191, 14947, 14740, 14643, 14617}, /* 22% */
++	{15194, 14949, 14743, 14647, 14622}, /* 20% */
++	{15197, 14950, 14741, 14647, 14622}, /* 18% */
++	{15198, 14950, 14740, 14647, 14622}, /* 16% */
++	{15197, 14950, 14740, 14650, 14628}, /* 14% */
++	{15169, 14934, 14731, 14643, 14623}, /* 12% */
++	{15155, 14919, 14718, 14629, 14603}, /* 10% */
++	{15151, 14914, 14712, 14622, 14595}, /* 9% */
++	{15145, 14911, 14706, 14612, 14586}, /* 8% */
++	{15141, 14909, 14698, 14602, 14572}, /* 7% */
++	{15144, 14909, 14699, 14602, 14574}, /* 6% */
++	{15156, 14923, 14718, 14630, 14608}, /* 5% */
++	{15169, 14932, 14726, 14639, 14617}, /* 4% */
++	{15181, 14939, 14731, 14645, 14624}, /* 3% */
++	{15204, 14951, 14738, 14650, 14629}, /* 2% */
++	{15204, 14951, 14738, 14650, 14629}, /* 1% */
++	{15204, 14951, 14738, 14650, 14629}, /* 0% */
++};
++
++/* qcom,pc-temp-y1-lut: rows=56 cols=6 */
++static const int16_t pc_temp_y1_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t pc_temp_y1_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_y1[56][6] = {
++	{ 6499,  5973,  5732,  5440,  5219,  5136}, /* 100% */
++	{ 6504,  6009,  5757,  5435,  5217,  5135}, /* 98% */
++	{ 6506,  6036,  5772,  5430,  5215,  5134}, /* 96% */
++	{ 6506,  6055,  5780,  5424,  5212,  5133}, /* 94% */
++	{ 6504,  6066,  5783,  5420,  5210,  5132}, /* 92% */
++	{ 6501,  6070,  5783,  5416,  5208,  5131}, /* 90% */
++	{ 6491,  6061,  5775,  5413,  5206,  5131}, /* 88% */
++	{ 6479,  6045,  5760,  5410,  5204,  5130}, /* 86% */
++	{ 6476,  6040,  5756,  5409,  5202,  5129}, /* 84% */
++	{ 6476,  6041,  5758,  5408,  5200,  5127}, /* 82% */
++	{ 6477,  6043,  5759,  5408,  5198,  5126}, /* 80% */
++	{ 6493,  6049,  5754,  5405,  5198,  5126}, /* 78% */
++	{ 6524,  6058,  5747,  5401,  5197,  5126}, /* 76% */
++	{ 6534,  6062,  5745,  5400,  5197,  5126}, /* 74% */
++	{ 6533,  6061,  5750,  5401,  5195,  5126}, /* 72% */
++	{ 6530,  6059,  5754,  5402,  5195,  5125}, /* 70% */
++	{ 6518,  6062,  5754,  5403,  5195,  5125}, /* 68% */
++	{ 6500,  6068,  5755,  5403,  5196,  5126}, /* 66% */
++	{ 6494,  6072,  5758,  5403,  5196,  5126}, /* 64% */
++	{ 6504,  6075,  5768,  5403,  5196,  5126}, /* 62% */
++	{ 6514,  6077,  5776,  5404,  5196,  5126}, /* 60% */
++	{ 6516,  6076,  5773,  5406,  5196,  5126}, /* 58% */
++	{ 6521,  6075,  5767,  5411,  5198,  5127}, /* 56% */
++	{ 6517,  6074,  5765,  5415,  5201,  5127}, /* 54% */
++	{ 6494,  6075,  5772,  5420,  5203,  5129}, /* 52% */
++	{ 6474,  6076,  5777,  5424,  5206,  5131}, /* 50% */
++	{ 6484,  6072,  5775,  5427,  5209,  5133}, /* 48% */
++	{ 6510,  6064,  5772,  5431,  5213,  5136}, /* 46% */
++	{ 6519,  6060,  5773,  5435,  5215,  5138}, /* 44% */
++	{ 6508,  6057,  5776,  5442,  5217,  5142}, /* 42% */
++	{ 6492,  6054,  5780,  5449,  5219,  5146}, /* 40% */
++	{ 6477,  6057,  5786,  5456,  5223,  5149}, /* 38% */
++	{ 6460,  6068,  5792,  5462,  5229,  5151}, /* 36% */
++	{ 6451,  6074,  5794,  5466,  5234,  5153}, /* 34% */
++	{ 6449,  6071,  5794,  5471,  5237,  5156}, /* 32% */
++	{ 6448,  6066,  5793,  5475,  5240,  5158}, /* 30% */
++	{ 6453,  6063,  5794,  5480,  5243,  5160}, /* 28% */
++	{ 6463,  6061,  5796,  5485,  5245,  5163}, /* 26% */
++	{ 6466,  6058,  5797,  5488,  5247,  5164}, /* 24% */
++	{ 6458,  6051,  5802,  5488,  5248,  5165}, /* 22% */
++	{ 6453,  6046,  5808,  5490,  5250,  5166}, /* 20% */
++	{ 6460,  6050,  5815,  5492,  5252,  5167}, /* 18% */
++	{ 6470,  6059,  5823,  5496,  5254,  5169}, /* 16% */
++	{ 6459,  6055,  5817,  5506,  5261,  5173}, /* 14% */
++	{ 6439,  6051,  5811,  5519,  5268,  5178}, /* 12% */
++	{ 6477,  6057,  5822,  5527,  5268,  5179}, /* 10% */
++	{ 6480,  6077,  5821,  5527,  5267,  5178}, /* 9% */
++	{ 6474,  6097,  5818,  5522,  5267,  5177}, /* 8% */
++	{ 6519,  6070,  5819,  5524,  5266,  5181}, /* 7% */
++	{ 6500,  6070,  5825,  5520,  5268,  5181}, /* 6% */
++	{ 6499,  6076,  5831,  5526,  5271,  5184}, /* 5% */
++	{ 6487,  6077,  5820,  5548,  5278,  5189}, /* 4% */
++	{ 6539,  6105,  5834,  5562,  5287,  5197}, /* 3% */
++	{ 6573,  6124,  5867,  5569,  5299,  5208}, /* 2% */
++	{ 6573,  6124,  5867,  5569,  5299,  5208}, /* 1% */
++	{ 6573,  6124,  5867,  5569,  5299,  5208}, /* 0% */
++};
++
++/* qcom,pc-temp-y2-lut: rows=56 cols=6 */
++static const int16_t pc_temp_y2_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t pc_temp_y2_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_y2[56][6] = {
++	{10135, 10021, 10461, 10935, 10658, 10684}, /* 100% */
++	{10099, 10085, 10477, 10879, 10652, 10677}, /* 98% */
++	{10091, 10139, 10488, 10807, 10638, 10666}, /* 96% */
++	{10105, 10179, 10494, 10733, 10620, 10653}, /* 94% */
++	{10136, 10205, 10497, 10675, 10606, 10639}, /* 92% */
++	{10178, 10214, 10498, 10649, 10599, 10624}, /* 90% */
++	{10237, 10200, 10494, 10650, 10590, 10608}, /* 88% */
++	{10313, 10176, 10488, 10658, 10575, 10590}, /* 86% */
++	{10386, 10185, 10488, 10660, 10566, 10570}, /* 84% */
++	{10465, 10288, 10498, 10658, 10559, 10544}, /* 82% */
++	{10522, 10383, 10510, 10658, 10552, 10524}, /* 80% */
++	{10545, 10413, 10518, 10663, 10532, 10512}, /* 78% */
++	{10564, 10436, 10527, 10670, 10508, 10502}, /* 76% */
++	{10615, 10468, 10557, 10681, 10509, 10503}, /* 74% */
++	{10796, 10531, 10661, 10698, 10548, 10527}, /* 72% */
++	{10932, 10607, 10751, 10722, 10598, 10545}, /* 70% */
++	{10591, 10681, 10780, 10765, 10649, 10539}, /* 68% */
++	{ 9893, 10762, 10799, 10827, 10709, 10529}, /* 66% */
++	{ 9684, 10862, 10822, 10893, 10772, 10557}, /* 64% */
++	{ 9683, 11014, 10848, 10979, 10851, 10722}, /* 62% */
++	{ 9682, 11114, 10873, 11028, 10893, 10840}, /* 60% */
++	{ 9679, 11044, 10895, 10997, 10846, 10807}, /* 58% */
++	{ 9674, 10880, 10917, 10941, 10767, 10748}, /* 56% */
++	{ 9671, 10816, 10949, 10931, 10747, 10729}, /* 54% */
++	{ 9670, 10808, 10997, 10957, 10757, 10724}, /* 52% */
++	{ 9669, 10802, 11044, 10986, 10769, 10722}, /* 50% */
++	{ 9668, 10699, 11084, 11005, 10790, 10732}, /* 48% */
++	{ 9667, 10425, 11119, 11028, 10822, 10754}, /* 46% */
++	{ 9667, 10253, 11124, 11058, 10847, 10778}, /* 44% */
++	{ 9666,  9957, 11102, 11119, 10874, 10806}, /* 42% */
++	{ 9665,  9709, 11084, 11174, 10902, 10831}, /* 40% */
++	{ 9664,  9694, 11087, 11204, 10943, 10846}, /* 38% */
++	{ 9664,  9691, 11092, 11225, 10989, 10859}, /* 36% */
++	{ 9663,  9687, 11093, 11233, 11003, 10873}, /* 34% */
++	{ 9663,  9683, 11081, 11229, 11014, 10907}, /* 32% */
++	{ 9663,  9679, 11062, 11217, 11015, 10933}, /* 30% */
++	{ 9663,  9676, 11043, 11192, 10978, 10905}, /* 28% */
++	{ 9662,  9672, 11019, 11155, 10925, 10848}, /* 26% */
++	{ 9662,  9670, 10994, 11130, 10909, 10830}, /* 24% */
++	{ 9661,  9668, 10965, 11109, 10905, 10835}, /* 22% */
++	{ 9661,  9666, 10928, 11091, 10901, 10839}, /* 20% */
++	{ 9661,  9664, 10866, 11077, 10893, 10815}, /* 18% */
++	{ 9660,  9663, 10769, 11056, 10876, 10756}, /* 16% */
++	{ 9660,  9661, 10677, 11015, 10822, 10682}, /* 14% */
++	{ 9660,  9660, 10540, 10945, 10726, 10588}, /* 12% */
++	{ 9659,  9659, 10346, 10917, 10677, 10555}, /* 10% */
++	{ 9659,  9659, 10162, 10918, 10685, 10547}, /* 9% */
++	{ 9659,  9659, 10050, 10922, 10705, 10529}, /* 8% */
++	{ 9658,  9658,  9990, 10928, 10756, 10568}, /* 7% */
++	{ 9658,  9657, 10126, 10946, 10734, 10573}, /* 6% */
++	{ 9657,  9657,  9853, 10893, 10661, 10540}, /* 5% */
++	{ 9656,  9656,  9719, 10818, 10615, 10474}, /* 4% */
++	{ 9655,  9656,  9685, 10765, 10541, 10393}, /* 3% */
++	{ 9653,  9655,  9672, 10715, 10454, 10282}, /* 2% */
++	{ 9653,  9655,  9672, 10715, 10454, 10282}, /* 1% */
++	{ 9653,  9655,  9672, 10715, 10454, 10282}, /* 0% */
++};
++
++/* qcom,pc-temp-y3-lut: rows=56 cols=6 */
++static const int16_t pc_temp_y3_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t pc_temp_y3_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_y3[56][6] = {
++	{13974, 13596, 13379, 13306, 13292, 13284}, /* 100% */
++	{13927, 13594, 13380, 13304, 13290, 13285}, /* 98% */
++	{13883, 13591, 13382, 13302, 13289, 13286}, /* 96% */
++	{13847, 13588, 13383, 13302, 13288, 13287}, /* 94% */
++	{13821, 13584, 13384, 13302, 13288, 13288}, /* 92% */
++	{13811, 13580, 13385, 13303, 13288, 13288}, /* 90% */
++	{13821, 13572, 13386, 13304, 13289, 13289}, /* 88% */
++	{13837, 13563, 13386, 13305, 13291, 13289}, /* 86% */
++	{13817, 13564, 13386, 13306, 13292, 13289}, /* 84% */
++	{13659, 13582, 13384, 13307, 13293, 13290}, /* 82% */
++	{13540, 13596, 13383, 13307, 13294, 13291}, /* 80% */
++	{13543, 13548, 13385, 13308, 13296, 13292}, /* 78% */
++	{13554, 13459, 13389, 13310, 13298, 13293}, /* 76% */
++	{13556, 13440, 13388, 13312, 13300, 13295}, /* 74% */
++	{13547, 13469, 13374, 13315, 13301, 13296}, /* 72% */
++	{13535, 13491, 13364, 13317, 13302, 13297}, /* 70% */
++	{13509, 13481, 13367, 13315, 13303, 13298}, /* 68% */
++	{13474, 13455, 13370, 13312, 13304, 13298}, /* 66% */
++	{13467, 13431, 13370, 13311, 13303, 13298}, /* 64% */
++	{13487, 13406, 13363, 13313, 13302, 13299}, /* 62% */
++	{13505, 13384, 13355, 13314, 13300, 13299}, /* 60% */
++	{13497, 13367, 13348, 13311, 13296, 13294}, /* 58% */
++	{13475, 13354, 13342, 13305, 13290, 13287}, /* 56% */
++	{13465, 13351, 13337, 13301, 13289, 13285}, /* 54% */
++	{13463, 13355, 13332, 13300, 13288, 13286}, /* 52% */
++	{13463, 13359, 13328, 13298, 13288, 13286}, /* 50% */
++	{13474, 13355, 13324, 13297, 13287, 13285}, /* 48% */
++	{13501, 13345, 13321, 13296, 13286, 13284}, /* 46% */
++	{13525, 13337, 13320, 13296, 13286, 13284}, /* 44% */
++	{13542, 13329, 13318, 13296, 13285, 13285}, /* 42% */
++	{13560, 13322, 13317, 13296, 13285, 13286}, /* 40% */
++	{13582, 13328, 13317, 13295, 13286, 13286}, /* 38% */
++	{13608, 13347, 13318, 13295, 13287, 13286}, /* 36% */
++	{13633, 13365, 13318, 13295, 13288, 13286}, /* 34% */
++	{13656, 13380, 13318, 13295, 13289, 13287}, /* 32% */
++	{13679, 13395, 13319, 13295, 13289, 13287}, /* 30% */
++	{13704, 13413, 13320, 13295, 13288, 13287}, /* 28% */
++	{13732, 13434, 13322, 13295, 13287, 13286}, /* 26% */
++	{13762, 13457, 13323, 13296, 13287, 13286}, /* 24% */
++	{13794, 13481, 13324, 13296, 13288, 13288}, /* 22% */
++	{13826, 13509, 13325, 13296, 13289, 13290}, /* 20% */
++	{13856, 13546, 13325, 13296, 13290, 13289}, /* 18% */
++	{13885, 13594, 13324, 13296, 13290, 13288}, /* 16% */
++	{13922, 13645, 13327, 13295, 13288, 13288}, /* 14% */
++	{13972, 13705, 13331, 13297, 13289, 13289}, /* 12% */
++	{14022, 13762, 13334, 13302, 13296, 13294}, /* 10% */
++	{13998, 13748, 13331, 13305, 13299, 13296}, /* 9% */
++	{14050, 13804, 13338, 13311, 13301, 13298}, /* 8% */
++	{14108, 13859, 13350, 13315, 13303, 13299}, /* 7% */
++	{14176, 13919, 13365, 13316, 13299, 13295}, /* 6% */
++	{14241, 13968, 13374, 13310, 13296, 13295}, /* 5% */
++	{14342, 14029, 13397, 13312, 13299, 13298}, /* 4% */
++	{14507, 14142, 13438, 13319, 13305, 13304}, /* 3% */
++	{14903, 14279, 13504, 13333, 13316, 13315}, /* 2% */
++	{14903, 14279, 13504, 13333, 13316, 13315}, /* 1% */
++	{14903, 14279, 13504, 13333, 13316, 13315}, /* 0% */
++};
++
++/* qcom,pc-temp-y4-lut: rows=56 cols=6 */
++static const int16_t pc_temp_y4_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t pc_temp_y4_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_y4[56][6] = {
++	{17292, 16938, 16636, 16487, 16470, 16482}, /* 100% */
++	{17367, 16945, 16649, 16488, 16472, 16481}, /* 98% */
++	{17400, 16955, 16657, 16490, 16473, 16480}, /* 96% */
++	{17402, 16966, 16663, 16493, 16474, 16479}, /* 94% */
++	{17380, 16976, 16665, 16495, 16475, 16479}, /* 92% */
++	{17346, 16981, 16666, 16496, 16476, 16478}, /* 90% */
++	{17258, 16983, 16663, 16497, 16476, 16478}, /* 88% */
++	{17144, 16985, 16658, 16497, 16476, 16478}, /* 86% */
++	{17151, 16974, 16657, 16499, 16477, 16479}, /* 84% */
++	{17372, 16903, 16659, 16505, 16479, 16479}, /* 82% */
++	{17549, 16851, 16662, 16511, 16482, 16480}, /* 80% */
++	{17573, 16979, 16666, 16515, 16484, 16482}, /* 78% */
++	{17586, 17214, 16672, 16521, 16487, 16484}, /* 76% */
++	{17550, 17263, 16691, 16528, 16491, 16486}, /* 74% */
++	{17250, 17158, 16766, 16540, 16498, 16490}, /* 72% */
++	{17008, 17040, 16818, 16554, 16505, 16495}, /* 70% */
++	{17016, 16964, 16812, 16572, 16512, 16501}, /* 68% */
++	{17042, 16902, 16795, 16592, 16520, 16509}, /* 66% */
++	{17045, 16874, 16769, 16613, 16537, 16523}, /* 64% */
++	{16988, 16864, 16716, 16639, 16575, 16552}, /* 62% */
++	{16910, 16854, 16664, 16654, 16599, 16571}, /* 60% */
++	{16828, 16832, 16626, 16612, 16572, 16551}, /* 58% */
++	{16743, 16796, 16595, 16533, 16520, 16513}, /* 56% */
++	{16719, 16750, 16579, 16499, 16493, 16492}, /* 54% */
++	{16726, 16668, 16570, 16486, 16477, 16480}, /* 52% */
++	{16732, 16602, 16565, 16480, 16470, 16474}, /* 50% */
++	{16728, 16586, 16563, 16482, 16471, 16474}, /* 48% */
++	{16717, 16581, 16562, 16487, 16475, 16475}, /* 46% */
++	{16713, 16587, 16557, 16492, 16480, 16477}, /* 44% */
++	{16716, 16621, 16539, 16497, 16491, 16484}, /* 42% */
++	{16721, 16652, 16524, 16502, 16502, 16492}, /* 40% */
++	{16723, 16655, 16524, 16508, 16511, 16505}, /* 38% */
++	{16724, 16654, 16526, 16514, 16518, 16518}, /* 36% */
++	{16726, 16655, 16530, 16517, 16519, 16522}, /* 34% */
++	{16730, 16662, 16543, 16519, 16518, 16522}, /* 32% */
++	{16735, 16671, 16558, 16520, 16515, 16522}, /* 30% */
++	{16740, 16681, 16571, 16516, 16503, 16510}, /* 28% */
++	{16745, 16692, 16584, 16509, 16485, 16487}, /* 26% */
++	{16747, 16696, 16589, 16505, 16481, 16482}, /* 24% */
++	{16740, 16695, 16590, 16504, 16485, 16490}, /* 22% */
++	{16731, 16694, 16591, 16504, 16488, 16497}, /* 20% */
++	{16726, 16689, 16590, 16504, 16486, 16494}, /* 18% */
++	{16723, 16677, 16586, 16504, 16481, 16485}, /* 16% */
++	{16726, 16663, 16578, 16502, 16470, 16466}, /* 14% */
++	{16739, 16655, 16576, 16503, 16468, 16463}, /* 12% */
++	{16759, 16655, 16582, 16505, 16494, 16511}, /* 10% */
++	{16750, 16655, 16597, 16515, 16525, 16545}, /* 9% */
++	{16772, 16675, 16623, 16542, 16560, 16581}, /* 8% */
++	{16800, 16707, 16654, 16576, 16588, 16604}, /* 7% */
++	{16817, 16740, 16673, 16582, 16562, 16551}, /* 6% */
++	{16811, 16742, 16671, 16528, 16493, 16493}, /* 5% */
++	{16786, 16722, 16665, 16523, 16488, 16490}, /* 4% */
++	{16787, 16727, 16688, 16546, 16496, 16493}, /* 3% */
++	{16899, 16756, 16740, 16594, 16542, 16545}, /* 2% */
++	{16899, 16756, 16740, 16594, 16542, 16545}, /* 1% */
++	{16899, 16756, 16740, 16594, 16542, 16545}, /* 0% */
++};
++
++/* qcom,pc-temp-y5-lut: rows=56 cols=6 */
++static const int16_t pc_temp_y5_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t pc_temp_y5_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_y5[56][6] = {
++	{14230, 12035, 14717, 18923, 21990, 17494}, /* 100% */
++	{12932, 12428, 15022, 18564, 20707, 18657}, /* 98% */
++	{12349, 12911, 15377, 17987, 19354, 19364}, /* 96% */
++	{12331, 13387, 15732, 17353, 18105, 19729}, /* 94% */
++	{12728, 13757, 16034, 16823, 17135, 19865}, /* 92% */
++	{13391, 13923, 16232, 16560, 16621, 19885}, /* 90% */
++	{15459, 13883, 16356, 16444, 16552, 19539}, /* 88% */
++	{18252, 13802, 16444, 16253, 16642, 18825}, /* 86% */
++	{18338, 13977, 16409, 15975, 16640, 18187}, /* 84% */
++	{14707, 15134, 16089, 15461, 16444, 17516}, /* 82% */
++	{11979, 15986, 15719, 14988, 16295, 17056}, /* 80% */
++	{13250, 14923, 15314, 14683, 16383, 16929}, /* 78% */
++	{16139, 12966, 14856, 14446, 16487, 16867}, /* 76% */
++	{18385, 12945, 14615, 14313, 16288, 16676}, /* 74% */
++	{20468, 16637, 14463, 14205, 15764, 16356}, /* 72% */
++	{21643, 19583, 14394, 14138, 15321, 15972}, /* 70% */
++	{19461, 18861, 16234, 14042, 15079, 15420}, /* 68% */
++	{15022, 17291, 19546, 13942, 14896, 14863}, /* 66% */
++	{14009, 16789, 20518, 14354, 14864, 14762}, /* 64% */
++	{16803, 16749, 20570, 16799, 14987, 14861}, /* 62% */
++	{19239, 16744, 20480, 19216, 15284, 15034}, /* 60% */
++	{18212, 17028, 20243, 20547, 16764, 15930}, /* 58% */
++	{15459, 17911, 19875, 21518, 18991, 17580}, /* 56% */
++	{13733, 19365, 19484, 21611, 19866, 18863}, /* 54% */
++	{12720, 23296, 18974, 20945, 20112, 20077}, /* 52% */
++	{12160, 26434, 18670, 20123, 20030, 20735}, /* 50% */
++	{12293, 23791, 18933, 19274, 18930, 19537}, /* 48% */
++	{12667, 17008, 19529, 18404, 17263, 17283}, /* 46% */
++	{12802, 13833, 19944, 18157, 16469, 16466}, /* 44% */
++	{12752, 13032, 20483, 18385, 15904, 16228}, /* 42% */
++	{12702, 12652, 20805, 18569, 15613, 16129}, /* 40% */
++	{12793, 12712, 20393, 18709, 16131, 16219}, /* 38% */
++	{13095, 12959, 19623, 19044, 17299, 16493}, /* 36% */
++	{13341, 13226, 19308, 19252, 18399, 17046}, /* 34% */
++	{13548, 13507, 18872, 19713, 19668, 18698}, /* 32% */
++	{13740, 13808, 18473, 20039, 20362, 20052}, /* 30% */
++	{13906, 14154, 18469, 19987, 20082, 20310}, /* 28% */
++	{14130, 14550, 18602, 19823, 19587, 20454}, /* 26% */
++	{14259, 14712, 18557, 19519, 19393, 20737}, /* 24% */
++	{14256, 14537, 18371, 18661, 19276, 21348}, /* 22% */
++	{14164, 14305, 18144, 17854, 19258, 22046}, /* 20% */
++	{13836, 14307, 17547, 17458, 20149, 23138}, /* 18% */
++	{13240, 14410, 16729, 17045, 21238, 24067}, /* 16% */
++	{13015, 14139, 16783, 16260, 18827, 21403}, /* 14% */
++	{12966, 13717, 16771, 16036, 16528, 18163}, /* 12% */
++	{13220, 13972, 15929, 16543, 16569, 15610}, /* 10% */
++	{13236, 13830, 14410, 16911, 16151, 15037}, /* 9% */
++	{13375, 13993, 14285, 17520, 15825, 14672}, /* 8% */
++	{13477, 13926, 14471, 17640, 15870, 14663}, /* 7% */
++	{14073, 14149, 15806, 18014, 15543, 14707}, /* 6% */
++	{13997, 14427, 14931, 18212, 16930, 16093}, /* 5% */
++	{13804, 14128, 14566, 18854, 17572, 16420}, /* 4% */
++	{13507, 13988, 14538, 19667, 18705, 17374}, /* 3% */
++	{13029, 14263, 15107, 22152, 23922, 24346}, /* 2% */
++	{13029, 14263, 15107, 22152, 23922, 24346}, /* 1% */
++	{13029, 14263, 15107, 22152, 23922, 24346}, /* 0% */
++};
++
++/* qcom,pc-temp-y6-lut: rows=56 cols=6 */
++static const int16_t pc_temp_y6_temp_c[6] = {-10, 0, 10, 25, 40, 50};
++static const uint16_t pc_temp_y6_soc_cpct[56] = {10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400, 7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600, 4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800, 1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0};
++static const uint16_t pc_temp_y6[56][6] = {
++	{ 6322,  5653,  5290,  5075,  5036,  5024}, /* 100% */
++	{ 6288,  5657,  5289,  5075,  5035,  5025}, /* 98% */
++	{ 6255,  5658,  5288,  5075,  5034,  5026}, /* 96% */
++	{ 6224,  5657,  5286,  5075,  5034,  5027}, /* 94% */
++	{ 6197,  5653,  5283,  5075,  5034,  5027}, /* 92% */
++	{ 6175,  5648,  5280,  5075,  5034,  5028}, /* 90% */
++	{ 6159,  5641,  5275,  5076,  5035,  5028}, /* 88% */
++	{ 6145,  5632,  5271,  5077,  5036,  5028}, /* 86% */
++	{ 6124,  5624,  5267,  5078,  5037,  5028}, /* 84% */
++	{ 6088,  5616,  5264,  5079,  5038,  5029}, /* 82% */
++	{ 6066,  5612,  5262,  5081,  5040,  5030}, /* 80% */
++	{ 6078,  5616,  5262,  5083,  5041,  5031}, /* 78% */
++	{ 6103,  5625,  5263,  5085,  5043,  5033}, /* 76% */
++	{ 6101,  5627,  5266,  5088,  5046,  5035}, /* 74% */
++	{ 6034,  5620,  5276,  5093,  5049,  5036}, /* 72% */
++	{ 5964,  5610,  5283,  5099,  5052,  5038}, /* 70% */
++	{ 5929,  5591,  5283,  5103,  5054,  5041}, /* 68% */
++	{ 5904,  5564,  5282,  5106,  5057,  5043}, /* 66% */
++	{ 5898,  5547,  5278,  5111,  5061,  5047}, /* 64% */
++	{ 5898,  5536,  5258,  5120,  5071,  5055}, /* 62% */
++	{ 5899,  5528,  5236,  5126,  5076,  5060}, /* 60% */
++	{ 5886,  5519,  5221,  5111,  5065,  5052}, /* 58% */
++	{ 5857,  5511,  5209,  5084,  5046,  5035}, /* 56% */
++	{ 5848,  5504,  5203,  5072,  5037,  5027}, /* 54% */
++	{ 5855,  5498,  5199,  5068,  5032,  5024}, /* 52% */
++	{ 5866,  5494,  5197,  5066,  5030,  5022}, /* 50% */
++	{ 5880,  5495,  5197,  5066,  5030,  5022}, /* 48% */
++	{ 5900,  5500,  5199,  5068,  5031,  5022}, /* 46% */
++	{ 5919,  5507,  5199,  5069,  5032,  5023}, /* 44% */
++	{ 5936,  5526,  5198,  5072,  5035,  5025}, /* 42% */
++	{ 5953,  5550,  5198,  5074,  5038,  5029}, /* 40% */
++	{ 5972,  5572,  5201,  5076,  5042,  5032}, /* 38% */
++	{ 5992,  5594,  5209,  5079,  5045,  5036}, /* 36% */
++	{ 6012,  5618,  5217,  5081,  5046,  5038}, /* 34% */
++	{ 6032,  5644,  5228,  5083,  5046,  5039}, /* 32% */
++	{ 6052,  5673,  5241,  5084,  5046,  5039}, /* 30% */
++	{ 6075,  5703,  5253,  5084,  5043,  5036}, /* 28% */
++	{ 6099,  5735,  5267,  5083,  5037,  5029}, /* 26% */
++	{ 6124,  5768,  5280,  5083,  5036,  5027}, /* 24% */
++	{ 6148,  5800,  5293,  5083,  5039,  5032}, /* 22% */
++	{ 6173,  5835,  5307,  5084,  5040,  5035}, /* 20% */
++	{ 6198,  5874,  5322,  5086,  5040,  5034}, /* 18% */
++	{ 6224,  5919,  5339,  5088,  5039,  5031}, /* 16% */
++	{ 6259,  5964,  5362,  5090,  5036,  5026}, /* 14% */
++	{ 6306,  6018,  5392,  5095,  5037,  5027}, /* 12% */
++	{ 6357,  6073,  5406,  5100,  5050,  5044}, /* 10% */
++	{ 6345,  6066,  5411,  5105,  5061,  5056}, /* 9% */
++	{ 6394,  6118,  5443,  5117,  5072,  5067}, /* 8% */
++	{ 6451,  6174,  5477,  5129,  5081,  5074}, /* 7% */
++	{ 6515,  6234,  5513,  5131,  5071,  5057}, /* 6% */
++	{ 6569,  6280,  5529,  5113,  5050,  5041}, /* 5% */
++	{ 6653,  6331,  5566,  5117,  5052,  5043}, /* 4% */
++	{ 6806,  6433,  5647,  5136,  5060,  5049}, /* 3% */
++	{ 7217,  6566,  5754,  5167,  5083,  5075}, /* 2% */
++	{ 7217,  6566,  5754,  5167,  5083,  5075}, /* 1% */
++	{ 7217,  6566,  5754,  5167,  5083,  5075}, /* 0% */
++};
++
++#endif /* F10_KEEP_USERSPACE_TABLES */
++
++#endif /* SWEET_F10_SWD_PROFILE_H */
+diff --git a/bsd/dev/sweet_qg_softfloat.c b/bsd/dev/sweet_qg_softfloat.c
+new file mode 100644
+index 0000000..2a2dd5e
+--- /dev/null
++++ b/bsd/dev/sweet_qg_softfloat.c
+@@ -0,0 +1,571 @@
++/* GENERATED from davinci-ios/battery/port by "make kernel-files" - edit the port, not this */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET_QG_HOST)
++#pragma clang diagnostic ignored "-Wunknown-warning-option"
++#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
++/*
++ * qg_softfloat.c - see qg_softfloat.h.  Integer only (uses unsigned __int128
++ * for multiplication/shifts only, which clang lowers inline on arm64; no
++ * 128-bit division, no libgcc/compiler-rt float helpers).
++ */
++#include "sweet_qg_softfloat.h"
++
++typedef unsigned __int128 u128;
++
++#define F64_SIGN(a)  ((int)((a) >> 63))
++#define F64_EXP(a)   ((int)(((a) >> 52) & 0x7ff))
++#define F64_FRAC(a)  ((a) & 0x000fffffffffffffull)
++#define F64_PACK(s, e, m) (((uint64_t)(s) << 63) + ((uint64_t)(e) << 52) + (m))
++#define F64_DEFNAN   0x7ff8000000000000ull
++#define F64_INF      0x7ff0000000000000ull
++#define F64_QBIT     0x0008000000000000ull
++
++#define F32_SIGN(a)  ((int)((a) >> 31))
++#define F32_EXP(a)   ((int)(((a) >> 23) & 0xff))
++#define F32_FRAC(a)  ((a) & 0x007fffffu)
++
++static int f64_isnan(f64 a) { return F64_EXP(a) == 0x7ff && F64_FRAC(a); }
++static int f64_issnan(f64 a) { return f64_isnan(a) && !(a & F64_QBIT); }
++
++/* AArch64 FPProcessNaNs (two operands): SNaN first (op order), then QNaN. */
++static f64 nan2(f64 a, f64 b)
++{
++	if (f64_issnan(a)) return a | F64_QBIT;
++	if (f64_issnan(b)) return b | F64_QBIT;
++	if (f64_isnan(a)) return a;
++	return b | F64_QBIT;
++}
++
++static int clz64(uint64_t x)
++{
++	int n = 0;
++	if (!x) return 64;
++	while (!(x & 0x8000000000000000ull)) { x <<= 1; n++; }
++	return n;
++}
++
++static uint64_t shr_jam64(uint64_t a, int n)
++{
++	if (n <= 0) return a;
++	if (n >= 64) return a != 0;
++	return (a >> n) | ((a << (64 - n)) != 0);
++}
++
++static u128 shr_jam128(u128 a, int n)
++{
++	if (n <= 0) return a;
++	if (n >= 128) return a != 0;
++	return (a >> n) | ((a << (128 - n)) != 0);
++}
++
++/*
++ * Round and pack.  sig has the leading 1 at bit 62 when exp is the true
++ * (biased) exponent of the value sig * 2^(exp - 1023 - 62); 10 extra bits
++ * below the 53-bit significand.  Handles overflow and subnormals (RNE).
++ */
++static f64 round_pack64(int sign, int exp, uint64_t sig)
++{
++	unsigned rbits;
++	if ((unsigned)exp >= 0x7fd) {
++		if (exp < 0) {
++			sig = shr_jam64(sig, -exp);
++			exp = 0;
++		} else if (exp > 0x7fd || (sig + 0x200) >= 0x8000000000000000ull) {
++			return F64_PACK(sign, 0x7ff, 0);
++		}
++	}
++	rbits = sig & 0x3ff;
++	sig = (sig + 0x200) >> 10;
++	if (rbits == 0x200) sig &= ~1ull;      /* ties to even */
++	if (!sig) exp = 0;
++	/* exp is "biased exponent - 1" style: pack adds the hidden bit */
++	return F64_PACK(sign, 0, 0) + ((uint64_t)exp << 52) + sig;
++}
++
++/* normalise so the leading one is at bit 62 and return round_pack */
++static f64 norm_round_pack64(int sign, int exp, uint64_t sig)
++{
++	int sh = clz64(sig) - 1;
++	return round_pack64(sign, exp - sh, sig << sh);
++}
++
++static f64 add_mags64(f64 a, f64 b, int sign)
++{
++	int ea = F64_EXP(a), eb = F64_EXP(b), e, d;
++	uint64_t ma = F64_FRAC(a), mb = F64_FRAC(b);
++
++	if (ea == 0x7ff) { if (ma || (eb == 0x7ff && mb)) return nan2(a, b); return a; }
++	if (eb == 0x7ff) { if (mb) return nan2(a, b); return F64_PACK(sign, 0x7ff, 0); }
++	if (!ea && !ma && !eb && !mb) return F64_PACK(sign, 0, 0);
++	/* leading one at bit 61 (9 guard bits); subnormals use exponent 1 */
++	ma = ea ? (ma | 0x0010000000000000ull) << 9 : ma << 9;
++	mb = eb ? (mb | 0x0010000000000000ull) << 9 : mb << 9;
++	if (!ea) ea = 1;
++	if (!eb) eb = 1;
++	d = ea - eb;
++	if (d > 0) { mb = shr_jam64(mb, d); e = ea; }
++	else if (d < 0) { ma = shr_jam64(ma, -d); e = eb; }
++	else e = ea;
++	/* value = (ma+mb)/2^61 * 2^(e-1023) */
++	return norm_round_pack64(sign, e, ma + mb);
++}
++
++static f64 sub_mags64(f64 a, f64 b, int sign)
++{
++	int ea = F64_EXP(a), eb = F64_EXP(b), e;
++	uint64_t ma = F64_FRAC(a), mb = F64_FRAC(b), m;
++	int d;
++
++	if (ea == 0x7ff) {
++		if (ma) return nan2(a, b);
++		if (eb == 0x7ff) { if (mb) return nan2(a, b); return F64_DEFNAN; }
++		return a;
++	}
++	if (eb == 0x7ff) { if (mb) return nan2(a, b); return F64_PACK(sign ^ 1, 0x7ff, 0); }
++	ma = ea ? (ma | 0x0010000000000000ull) << 9 : ma << 9;
++	mb = eb ? (mb | 0x0010000000000000ull) << 9 : mb << 9;
++	if (!ea) ea = 1;
++	if (!eb) eb = 1;
++	d = ea - eb;
++	if (d > 0) { mb = shr_jam64(mb, d); e = ea; }
++	else if (d < 0) { ma = shr_jam64(ma, -d); e = eb; sign ^= 1; m = ma; ma = mb; mb = m; }
++	else {
++		e = ea;
++		if (ma == mb) return F64_PACK(0, 0, 0);     /* x - x = +0 (RNE) */
++		if (ma < mb) { sign ^= 1; m = ma; ma = mb; mb = m; }
++	}
++	m = ma - mb;
++	return norm_round_pack64(sign, e, m);
++}
++
++f64 f64_add(f64 a, f64 b)
++{
++	int sa = F64_SIGN(a), sb = F64_SIGN(b);
++	return sa == sb ? add_mags64(a, b, sa) : sub_mags64(a, b, sa);
++}
++
++f64 f64_sub(f64 a, f64 b)
++{
++	return f64_add(a, b ^ 0x8000000000000000ull);
++}
++
++/* unpack a finite nonzero f64 into (exp, sig) with leading one at bit 52 */
++static void unpack_norm64(f64 a, int *e, uint64_t *m)
++{
++	int ex = F64_EXP(a);
++	uint64_t fr = F64_FRAC(a);
++	if (ex) { *e = ex; *m = fr | 0x0010000000000000ull; return; }
++	{
++		int sh = clz64(fr) - 11;
++		*e = 1 - sh;
++		*m = fr << sh;
++	}
++}
++
++f64 f64_mul(f64 a, f64 b)
++{
++	int s = F64_SIGN(a) ^ F64_SIGN(b), ea, eb;
++	uint64_t ma, mb;
++	u128 p;
++	uint64_t sig;
++
++	if (f64_isnan(a) || f64_isnan(b)) return nan2(a, b);
++	if (F64_EXP(a) == 0x7ff) {
++		if (!F64_EXP(b) && !F64_FRAC(b)) return F64_DEFNAN;
++		return F64_PACK(s, 0x7ff, 0);
++	}
++	if (F64_EXP(b) == 0x7ff) {
++		if (!F64_EXP(a) && !F64_FRAC(a)) return F64_DEFNAN;
++		return F64_PACK(s, 0x7ff, 0);
++	}
++	if ((!F64_EXP(a) && !F64_FRAC(a)) || (!F64_EXP(b) && !F64_FRAC(b)))
++		return F64_PACK(s, 0, 0);
++	unpack_norm64(a, &ea, &ma);
++	unpack_norm64(b, &eb, &mb);
++	/* ma, mb in [2^52, 2^53): product in [2^104, 2^106) */
++	p = (u128)ma * mb;
++	/* want leading one at bit 62 (+ possibly 63) of a 64-bit sig */
++	sig = (uint64_t)shr_jam128(p, 42);   /* [2^62, 2^64) */
++	{
++		int e = ea + eb - 0x3ff;        /* biased exponent for leading bit 104 */
++		if (sig & 0x8000000000000000ull) { sig = shr_jam64(sig, 1); e++; }
++		/* now leading one at bit 62 representing 2^(e-1023) */
++		return round_pack64(s, e - 1, sig);
++	}
++}
++
++f64 f64_div(f64 a, f64 b)
++{
++	int s = F64_SIGN(a) ^ F64_SIGN(b), ea, eb, e, i;
++	uint64_t ma, mb, q = 0, r;
++
++	if (f64_isnan(a) || f64_isnan(b)) return nan2(a, b);
++	if (F64_EXP(a) == 0x7ff) {
++		if (F64_EXP(b) == 0x7ff) return F64_DEFNAN;
++		return F64_PACK(s, 0x7ff, 0);
++	}
++	if (F64_EXP(b) == 0x7ff) return F64_PACK(s, 0, 0);
++	if (!F64_EXP(b) && !F64_FRAC(b)) {
++		if (!F64_EXP(a) && !F64_FRAC(a)) return F64_DEFNAN;
++		return F64_PACK(s, 0x7ff, 0);
++	}
++	if (!F64_EXP(a) && !F64_FRAC(a)) return F64_PACK(s, 0, 0);
++	unpack_norm64(a, &ea, &ma);
++	unpack_norm64(b, &eb, &mb);
++	e = ea - eb + 0x3ff;
++	if (ma < mb) { ma <<= 1; e--; }
++	/* ma/mb in [1, 2): produce 63 quotient bits -> leading one at bit 62 */
++	r = ma;
++	for (i = 0; i < 63; i++) {
++		q <<= 1;
++		if (r >= mb) { r -= mb; q |= 1; }
++		r <<= 1;
++	}
++	if (r) q |= 1;
++	return round_pack64(s, e - 1, q);
++}
++
++f64 f64_fma(f64 a, f64 b, f64 c)
++{
++	int sp = F64_SIGN(a) ^ F64_SIGN(b), sc = F64_SIGN(c), ea, eb, ec, ep, s;
++	uint64_t ma, mb, mc;
++	u128 p, cc, m;
++	int prod_zero, d;
++
++	/* NaN handling per FPMulAdd: addend NaN considered first for SNaN/QNaN
++	 * except 0*inf + QNaN which is invalid -> default NaN */
++	if (f64_isnan(a) || f64_isnan(b) || f64_isnan(c)) {
++		int inf_zero = ((F64_EXP(a) == 0x7ff && !F64_FRAC(a)) && (!F64_EXP(b) && !F64_FRAC(b))) ||
++			       ((F64_EXP(b) == 0x7ff && !F64_FRAC(b)) && (!F64_EXP(a) && !F64_FRAC(a)));
++		if (f64_isnan(c) && !f64_issnan(c) && inf_zero) return F64_DEFNAN;
++		if (f64_issnan(c)) return c | F64_QBIT;
++		if (f64_issnan(a)) return a | F64_QBIT;
++		if (f64_issnan(b)) return b | F64_QBIT;
++		if (f64_isnan(c)) return c;
++		if (f64_isnan(a)) return a;
++		return b;
++	}
++	if (F64_EXP(a) == 0x7ff || F64_EXP(b) == 0x7ff) {
++		if ((!F64_EXP(a) && !F64_FRAC(a)) || (!F64_EXP(b) && !F64_FRAC(b))) return F64_DEFNAN;
++		if (F64_EXP(c) == 0x7ff && sc != sp) return F64_DEFNAN;
++		return F64_PACK(sp, 0x7ff, 0);
++	}
++	if (F64_EXP(c) == 0x7ff) return c;
++	prod_zero = (!F64_EXP(a) && !F64_FRAC(a)) || (!F64_EXP(b) && !F64_FRAC(b));
++	if (prod_zero) {
++		if (!F64_EXP(c) && !F64_FRAC(c)) return F64_PACK(sp & sc, 0, 0);
++		return c;
++	}
++	unpack_norm64(a, &ea, &ma);
++	unpack_norm64(b, &eb, &mb);
++	p = (u128)ma * mb;            /* [2^104, 2^106), value p * 2^(ep-1023-104) */
++	ep = ea + eb - 0x3ff;
++	if (!F64_EXP(c) && !F64_FRAC(c)) {
++		/* round the exact product */
++		uint64_t sig = (uint64_t)shr_jam128(p, 42);
++		int e = ep;
++		if (sig & 0x8000000000000000ull) { sig = shr_jam64(sig, 1); e++; }
++		return round_pack64(sp, e - 1, sig);
++	}
++	unpack_norm64(c, &ec, &mc);
++	/* express both with leading one near bit 124 of a 128-bit value:
++	 * product: p << 18 -> leading bit at 122/123 with exponent ep (bit 122)
++	 * addend:  mc << 70 -> leading bit at 122 with exponent ec */
++	p <<= 18;
++	cc = (u128)mc << 70;
++	d = ep - ec;
++	if (d >= 0) {
++		cc = shr_jam128(cc, d);
++	} else {
++		p = shr_jam128(p, -d);
++		ep = ec;
++	}
++	if (sp == sc) {
++		m = p + cc;
++		s = sp;
++	} else {
++		if (p >= cc) { m = p - cc; s = sp; }
++		else { m = cc - p; s = sc; }
++		if (!m) return F64_PACK(0, 0, 0);
++	}
++	/* normalise: leading one to bit 126, then take top 64 bits with jam */
++	{
++		int lz = 0;
++		u128 t = m;
++		uint64_t sig;
++		int e;
++		while (!(t >> 127)) { t <<= 1; lz++; }
++		/* t leading one at bit 127; value bit index (127 - lz) of m.
++		 * m bit 122 corresponds to exponent ep. */
++		e = ep + (127 - lz) - 122;
++		sig = (uint64_t)(t >> 65) | ((t << 63) != 0);   /* leading at bit 62 */
++		return round_pack64(s, e - 1, sig);
++	}
++}
++
++f64 f64_rinta(f64 a)
++{
++	int e = F64_EXP(a), s = F64_SIGN(a);
++	uint64_t m, half, mask;
++	if (e == 0x7ff) return f64_isnan(a) ? (a | F64_QBIT) : a;
++	if (e < 0x3fe) return F64_PACK(s, 0, 0);                 /* |a| < 0.5 */
++	if (e == 0x3fe) return F64_PACK(s, 0x3ff, 0);            /* 0.5 <= |a| < 1 */
++	if (e >= 0x433) return a;                                /* integral */
++	m = a & 0x7fffffffffffffffull;
++	mask = (1ull << (0x433 - e)) - 1;
++	half = 1ull << (0x432 - e);
++	m += half;
++	m &= ~mask;
++	return m | ((uint64_t)s << 63);
++}
++
++int64_t f64_to_i64_rna(f64 a)
++{
++	int e = F64_EXP(a), s = F64_SIGN(a);
++	uint64_t m;
++	if (f64_isnan(a)) return 0;
++	if (e >= 0x43e) {
++		if (s && a == 0xc3e0000000000000ull) return INT64_MIN;
++		return s ? INT64_MIN : INT64_MAX;
++	}
++	a = f64_rinta(a);
++	e = F64_EXP(a);
++	if (!e) return 0;
++	m = F64_FRAC(a) | 0x0010000000000000ull;
++	if (e >= 0x433) m <<= (e - 0x433);
++	else m >>= (0x433 - e);
++	return s ? -(int64_t)m : (int64_t)m;
++}
++
++f64 f64_from_i32(int32_t v)
++{
++	int s = v < 0, sh;
++	uint64_t m = s ? (uint64_t)(-(int64_t)v) : (uint64_t)v;
++	if (!v) return 0;
++	sh = clz64(m) - 11;          /* leading one to bit 52 */
++	m <<= sh;
++	return F64_PACK(s, 0x3ff + 52 - sh - 1, 0) + m;   /* hidden bit adds 1 to exp */
++}
++
++f64 f32_to_f64(f32 a)
++{
++	int s = F32_SIGN(a), e = F32_EXP(a);
++	uint64_t m = F32_FRAC(a);
++	if (e == 0xff) {
++		if (m) return F64_PACK(s, 0x7ff, m << 29) | F64_QBIT;
++		return F64_PACK(s, 0x7ff, 0);
++	}
++	if (!e) {
++		int sh;
++		if (!m) return F64_PACK(s, 0, 0);
++		sh = clz64(m) - 40;      /* leading one to bit 23 */
++		m <<= sh;
++		e = 1 - sh;
++		m &= 0x7fffff;
++	}
++	return F64_PACK(s, e - 127 + 1023, m << 29);
++}
++
++f32 f64_to_f32(f64 a)
++{
++	int s = F64_SIGN(a), e = F64_EXP(a);
++	uint64_t m = F64_FRAC(a);
++	uint32_t sig, rb;
++	int ex;
++	if (e == 0x7ff) {
++		if (m) return ((uint32_t)s << 31) | 0x7fc00000u | (uint32_t)(m >> 29);
++		return ((uint32_t)s << 31) | 0x7f800000u;
++	}
++	if (!e && !m) return (uint32_t)s << 31;
++	/* 64-bit sig with leading one at bit 62 */
++	if (e) { m = (m | 0x0010000000000000ull) << 10; }
++	else { int sh = clz64(m) - 1; m <<= sh; e = 1 - (sh - 10); }
++	/* value = m/2^62 * 2^(e-1023); f32 biased exponent = e - 1023 + 127 */
++	ex = e - 1023 + 127;
++	/* round to 24 bits: keep sig in bits 62..39, round bits 38..0 */
++	if (ex <= 0) {
++		/* subnormal: shift right by 1 - ex */
++		m = shr_jam64(m, 1 - ex);
++		ex = 0;
++	} else if (ex >= 0xff) {
++		return ((uint32_t)s << 31) | 0x7f800000u;
++	}
++	{
++		uint64_t keep = m >> 39;               /* 24 bits incl. hidden */
++		uint64_t rem = m & ((1ull << 39) - 1);
++		uint64_t halfv = 1ull << 38;
++		sig = (uint32_t)keep;
++		if (rem > halfv || (rem == halfv && (sig & 1))) sig++;
++		rb = 0;
++		(void)rb;
++		if (ex == 0) {
++			/* sig < 2^23 unless rounding carried into the normal range */
++			return ((uint32_t)s << 31) + sig;
++		}
++		if (sig >= 0x1000000u) { sig >>= 1; ex++; if (ex >= 0xff) return ((uint32_t)s << 31) | 0x7f800000u; }
++		return ((uint32_t)s << 31) + ((uint32_t)(ex - 1) << 23) + sig;
++	}
++}
++
++/* binary32 arithmetic via binary64 (53 >= 2*24+2, so double rounding is exact) */
++f32 f32_add(f32 a, f32 b) { return f64_to_f32(f64_add(f32_to_f64(a), f32_to_f64(b))); }
++f32 f32_sub(f32 a, f32 b) { return f64_to_f32(f64_sub(f32_to_f64(a), f32_to_f64(b))); }
++f32 f32_mul(f32 a, f32 b) { return f64_to_f32(f64_mul(f32_to_f64(a), f32_to_f64(b))); }
++f32 f32_div(f32 a, f32 b) { return f64_to_f32(f64_div(f32_to_f64(a), f32_to_f64(b))); }
++f32 f32_from_i32(int32_t v) { return f64_to_f32(f64_from_i32(v)); }
++
++static int f32_isnan(f32 a) { return F32_EXP(a) == 0xff && F32_FRAC(a); }
++
++static f32 f32_nan2(f32 a, f32 b)
++{
++	if (f32_isnan(a) && !(a & 0x400000)) return a | 0x400000;
++	if (f32_isnan(b) && !(b & 0x400000)) return b | 0x400000;
++	if (f32_isnan(a)) return a;
++	return b | 0x400000;
++}
++
++/* total order helper on non-NaN values: returns <0, 0, >0 ; -0 == +0 */
++static int f32_order(f32 a, f32 b)
++{
++	int32_t ia, ib;
++	if (!((a | b) & 0x7fffffffu)) return 0;
++	ia = (a & 0x80000000u) ? -(int32_t)(a & 0x7fffffffu) : (int32_t)a;
++	ib = (b & 0x80000000u) ? -(int32_t)(b & 0x7fffffffu) : (int32_t)b;
++	return ia < ib ? -1 : ia > ib ? 1 : 0;
++}
++
++f32 f32_min(f32 a, f32 b)
++{
++	int o;
++	if (f32_isnan(a) || f32_isnan(b)) return f32_nan2(a, b);
++	if (!((a | b) & 0x7fffffffu)) return a | b;          /* min(-0,+0) = -0 */
++	o = f32_order(a, b);
++	return o <= 0 ? a : b;
++}
++
++f32 f32_max(f32 a, f32 b)
++{
++	int o;
++	if (f32_isnan(a) || f32_isnan(b)) return f32_nan2(a, b);
++	if (!((a | b) & 0x7fffffffu)) return a & b;          /* max(-0,+0) = +0 */
++	o = f32_order(a, b);
++	return o >= 0 ? a : b;
++}
++
++int32_t f32_to_i32_rz(f32 a)
++{
++	int s = F32_SIGN(a), e = F32_EXP(a);
++	uint32_t m;
++	if (f32_isnan(a)) return 0;
++	if (e < 127) return 0;
++	if (e >= 127 + 31) {
++		return s ? INT32_MIN : INT32_MAX;
++	}
++	m = F32_FRAC(a) | 0x800000u;
++	if (e >= 150) m <<= (e - 150);
++	else m >>= (150 - e);
++	return s ? -(int32_t)m : (int32_t)m;
++}
++
++unsigned f32_cmp(f32 a, f32 b)
++{
++	int o;
++	if (f32_isnan(a) || f32_isnan(b)) return SF_C | SF_V;
++	o = f32_order(a, b);
++	if (o < 0) return SF_N;
++	if (o == 0) return SF_Z | SF_C;
++	return SF_C;
++}
++
++unsigned f64_cmp(f64 a, f64 b)
++{
++	int64_t ia, ib;
++	if (f64_isnan(a) || f64_isnan(b)) return SF_C | SF_V;
++	if (!((a | b) & 0x7fffffffffffffffull)) return SF_Z | SF_C;
++	ia = (a >> 63) ? -(int64_t)(a & 0x7fffffffffffffffull) : (int64_t)a;
++	ib = (b >> 63) ? -(int64_t)(b & 0x7fffffffffffffffull) : (int64_t)b;
++	if (ia < ib) return SF_N;
++	if (ia == ib) return SF_Z | SF_C;
++	return SF_C;
++}
++
++/* ------------------------------------------------------------------ */
++/* bionic exp (arm64 libm.so, Android 11, address 0x31ec4), bit exact.  */
++
++static const uint64_t exp_tab[256] = {
++#include "sweet_qg_exp_tab.inc"
++};
++#define EXP_INVLN2N   0x40671547652b82feull
++#define EXP_NEGLN2HI  0xbf762e42fefa0000ull
++#define EXP_NEGLN2LO  0xbd0cf79abc9e3b3aull
++#define EXP_C2        0x3fdffffffffffdbdull
++#define EXP_C3        0x3fc555555555543cull
++#define EXP_C4        0x3fa55555cf172b91ull
++#define EXP_C5        0x3f81111167a4d017ull
++
++f64 sf_exp(f64 x)
++{
++	unsigned abstop = (unsigned)(x >> 52) & 0x7ff;
++	int special = 0;
++	f64 z, kd, r, r2, tail, tmp, scale, p1, t1, p2;
++	int64_t ki;
++	uint64_t idx, sbits;
++
++	if (abstop - 0x3c9u >= 0x3fu) {
++		if ((int)abstop - 0x3c9 < 0)
++			return f64_add(x, F64_1);                    /* tiny: 1 + x */
++		if (abstop >= 0x409) {
++			if (x == 0xfff0000000000000ull) return 0;    /* -inf */
++			if (abstop >= 0x7ff) return f64_add(x, F64_1);
++			if (x >> 63)                                 /* __math_uflow(0) */
++				return f64_mul(0x1000000000000000ull, 0x1000000000000000ull);
++			return f64_mul(0x7000000000000000ull, 0x7000000000000000ull);
++		}
++		special = 1;
++	}
++	z = f64_mul(EXP_INVLN2N, x);
++	kd = f64_rinta(z);
++	ki = f64_to_i64_rna(z);
++	r = f64_fma(EXP_NEGLN2HI, kd, x);
++	r = f64_fma(kd, EXP_NEGLN2LO, r);
++	idx = ((uint64_t)ki << 1) & 0xfe;
++	tail = exp_tab[idx];
++	sbits = exp_tab[idx + 1] + ((uint64_t)ki << 45);
++	p1 = f64_fma(EXP_C3, r, EXP_C2);
++	r2 = f64_mul(r, r);
++	t1 = f64_add(tail, r);
++	t1 = f64_fma(r2, p1, t1);
++	p2 = f64_mul(r2, r2);
++	tmp = f64_fma(r, EXP_C5, EXP_C4);
++	tmp = f64_fma(p2, tmp, t1);
++	if (!special) {
++		scale = sbits;
++		return f64_fma(tmp, scale, scale);
++	}
++	/* specialcase */
++	if (!((uint32_t)ki & 0x80000000u)) {
++		f64 y;
++		sbits -= 1009ull << 52;
++		scale = sbits;
++		y = f64_fma(tmp, scale, scale);
++		return f64_mul(y, 0x7f00000000000000ull);
++	} else {
++		f64 y, hi, lo, one = F64_1, t;
++		sbits += 1022ull << 52;
++		scale = sbits;
++		lo = f64_mul(tmp, scale);
++		y = f64_add(lo, scale);
++		if (sf_mi(f64_cmp(y, one))) {
++			t = f64_sub(scale, y);
++			lo = f64_add(lo, t);
++			hi = f64_add(y, one);
++			t = f64_sub(one, hi);
++			t = f64_add(y, t);
++			lo = f64_add(lo, t);
++			y = f64_add(hi, lo);
++			y = f64_add(y, 0xbff0000000000000ull);
++			if (sf_eq(f64_cmp(y, 0))) y = 0;
++		}
++		return f64_mul(y, 0x0010000000000000ull);
++	}
++}
++#endif
+diff --git a/bsd/dev/sweet_qg_softfloat.h b/bsd/dev/sweet_qg_softfloat.h
+new file mode 100644
+index 0000000..e28c1dc
+--- /dev/null
++++ b/bsd/dev/sweet_qg_softfloat.h
+@@ -0,0 +1,84 @@
++/* GENERATED from davinci-ios/battery/port by "make kernel-files" - edit the port, not this */
++/*
++ * qg_softfloat.h - integer-only IEEE-754 binary32/binary64 arithmetic with the
++ * exact semantics of AArch64 (FPCR = 0: round-to-nearest-even, no flush-to-zero,
++ * no default-NaN mode) plus a bit-exact port of bionic libm exp() (Android 11
++ * arm64, ARM optimized-routines, EXP_TABLE_BITS = 7, FMA-contracted).
++ *
++ * Purpose: the MIUI QG daemon (hvdcp_opti) computes its battery model in float.
++ * The XNU kernel may not use FP/SIMD (-mkernel), so qg_algo.c performs every
++ * daemon FP operation through these functions, in the daemon's own operation
++ * order, which reproduces its results bit for bit.
++ *
++ * Values are carried as raw bit patterns (uint32_t / uint64_t).
++ */
++#ifndef QG_SOFTFLOAT_H
++#define QG_SOFTFLOAT_H
++
++#include <stdint.h>
++
++typedef uint32_t f32;
++typedef uint64_t f64;
++
++/* binary64 */
++f64 f64_add(f64 a, f64 b);
++f64 f64_sub(f64 a, f64 b);
++f64 f64_mul(f64 a, f64 b);
++f64 f64_div(f64 a, f64 b);
++f64 f64_fma(f64 a, f64 b, f64 c);      /* a*b + c, single rounding (FMADD d,a,b,c) */
++f64 f64_rinta(f64 a);                  /* FRINTA: round to integral, ties away */
++int64_t f64_to_i64_rna(f64 a);         /* FCVTAS x, d */
++f64 f64_from_i32(int32_t v);           /* SCVTF d, w (exact) */
++
++/* binary32 (each is a single correctly rounded operation, like FADD s etc.) */
++f32 f32_add(f32 a, f32 b);
++f32 f32_sub(f32 a, f32 b);
++f32 f32_mul(f32 a, f32 b);
++f32 f32_div(f32 a, f32 b);
++f32 f32_min(f32 a, f32 b);             /* FMIN s */
++f32 f32_max(f32 a, f32 b);             /* FMAX s */
++f32 f32_from_i32(int32_t v);           /* SCVTF s, w */
++int32_t f32_to_i32_rz(f32 a);          /* FCVTZS w, s (saturating, NaN -> 0) */
++
++f64 f32_to_f64(f32 a);                 /* FCVT d, s (exact) */
++f32 f64_to_f32(f64 a);                 /* FCVT s, d (RNE) */
++
++/* FCMP result as AArch64 NZCV, and the condition codes the daemon uses */
++#define SF_N 8
++#define SF_Z 4
++#define SF_C 2
++#define SF_V 1
++unsigned f32_cmp(f32 a, f32 b);        /* FCMP s, s  (or s, #0.0 with b = 0) */
++unsigned f64_cmp(f64 a, f64 b);        /* FCMP d, d */
++static inline int sf_mi(unsigned f) { return (f & SF_N) != 0; }
++static inline int sf_pl(unsigned f) { return (f & SF_N) == 0; }
++static inline int sf_gt(unsigned f) { return !(f & SF_Z) && (!!(f & SF_N) == !!(f & SF_V)); }
++static inline int sf_le(unsigned f) { return (f & SF_Z) || (!!(f & SF_N) != !!(f & SF_V)); }
++static inline int sf_ge(unsigned f) { return !!(f & SF_N) == !!(f & SF_V); }
++static inline int sf_lt(unsigned f) { return !!(f & SF_N) != !!(f & SF_V); }
++static inline int sf_eq(unsigned f) { return (f & SF_Z) != 0; }
++
++/* bionic libm exp() (arm64, Android 11), bit exact */
++f64 sf_exp(f64 x);
++
++/* constants used by the daemon (bit patterns) */
++#define F32_0      0x00000000u
++#define F32_1      0x3f800000u
++#define F32_2      0x40000000u
++#define F32_M10    0xc1200000u
++#define F32_100    0x42c80000u
++#define F32_200    0x43480000u
++#define F32_1000   0x447a0000u
++#define F32_M1000  0xc47a0000u
++#define F32_3600   0x45610000u
++#define F32_10000  0x461c4000u
++#define F32_M10000 0xc61c4000u
++#define F32_20000  0x469c4000u
++#define F32_1E6    0x49742400u
++#define F32_0_35   0x3eb33333u
++#define F32_10     0x41200000u
++#define F64_1      0x3ff0000000000000ull
++#define F64_M0_005 0xbf747ae147ae147bull
++#define F64_0_005  0x3f747ae147ae147bull
++
++#endif
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index ba4ce37..ce3c513 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,6 +1,6 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
++ * PMIC READ ONLY. The only MMIO store issues a 1..8-byte read command.
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+@@ -83,14 +83,22 @@ sweet_spmi_init(void)
+ 	return 0;
+ }
+ 
++/*
++ * EXT_READL of n = 1..8 consecutive bytes of one peripheral in ONE SPMI
++ * transaction (BC = n - 1; data in RDATA0 +0x18 / RDATA1 +0x1c). n = 1 is the
++ * proven single-byte command. Multi-byte reads give atomic 16..32-bit QG/RTC/
++ * SDAM values without the QG hold bit (no writes).
++ */
+ int
+-sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++sweet_spmi_read_n(unsigned sid, unsigned addr, uint8_t *out, unsigned n)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
++	if (!sp_ready || !out || sid != 0 || addr > 0xffffu || n < 1 || n > 8 ||
++	    (addr & 0xffu) + n > 0x100u ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60)) {   /* 0x60: RTC_RW (reads) */
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60 &&   /* 0x60: RTC_RW (reads) */
++	    peripheral != 0xb6)) {                                               /* 0xB6: QG SDAM (reads) */
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -100,9 +108,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		return -1;
+ 	}
+ 	unsigned off = 0x80u * apid;
+-	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4);
++	uint32_t cmd = (1u << 27) | ((addr & 0xffu) << 4) | (n - 1u);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=0 */
++	*(volatile uint32_t *)(sp_obs + off) = cmd; /* EXT_READL, BC=n-1 */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; ++i) {
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+@@ -111,16 +119,26 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
+-			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			uint32_t d0 = sp_rd(sp_obs, off + 0x18u);
++			uint32_t d1 = n > 4 ? sp_rd(sp_obs, off + 0x1cu) : 0;
++			for (unsigned b = 0; b < n; ++b) {
++				out[b] = (uint8_t)((b < 4 ? d0 >> (8u * b) : d1 >> (8u * (b - 4u))) & 0xffu);
++			}
+ 			IOLockUnlock(sp_lock);
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
+ 	sp_poisoned[apid] = true;
+-	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+-	    sid, addr, apid);
++	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x n=%u APID=%u disabled\n",
++	    sid, addr, n, apid);
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++int
++sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
++{
++	return sweet_spmi_read_n(sid, addr, out, 1);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 45565d1..ca59d8c 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* n = 1..8 bytes of one peripheral in one transaction; same rules */
++int sweet_spmi_read_n(unsigned sid, unsigned addr, uint8_t *out, unsigned n);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index cb7ca58..2272503 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -1,7 +1,9 @@
+ /*
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+- * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+- * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * sweetbattery=1: read-only PM6150. Primary: MIUI's own battery % (bsd/dev/
++ * sweet_qg.c: bit-exact port of the QTI QG daemon + qpnp-qg, polled every
++ * 1 s / 200 ms). If the QG is unusable: the old voltage-derived estimate,
++ * polled every 30 seconds (UNCALIBRATED).
+  * See report.md for binary evidence, register provenance and integration.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -12,6 +14,7 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include "../../../bsd/dev/sweet_qg.h"
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -70,8 +73,11 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fQG;
+ 	int fLastMode;
++	uint32_t fQGDelay;
++	struct sweet_qg_status fQGStatus;
++	void publishQG(void);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -95,7 +101,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fQG = false;
++	fQGDelay = 1000;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -209,6 +216,109 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	}
+ }
+ 
++/* sweetbattery=1 with a working QG: what MIUI would show (sweet_qg.c). */
++void
++SweetBattery::publishQG(void)
++{
++	const struct sweet_qg_status *s = &fQGStatus;
++	unsigned percent = s->percent < 0 ? 0u : (s->percent > 100 ? 100u : (unsigned)s->percent);
++	int ma = -s->ua / 1000;             /* Linux: + = discharge; IOPMPowerSource: + = charging */
++	unsigned mv = s->mv > 0 ? (unsigned)s->mv : 0u;
++	unsigned learned = s->learned_mah > 0 ? (unsigned)s->learned_mah : 4000u;
++	setBatteryInstalled(true);
++	setCurrentCapacity(percent);
++	setMaxCapacity(100);
++	setExternalConnected(s->external != 0);
++	setExternalChargeCapable(s->charge_capable != 0);
++	setIsCharging(s->charging != 0);
++	setAtWarnLevel(false);
++	setAtCriticalLevel(s->critical != 0);   /* MIUI's force-shutdown condition */
++	setVoltage(mv);
++	setAmperage(ma);
++	setTimeRemaining(-1);
++	setCycleCount(0);
++	putBool("FullyCharged", s->full != 0);
++	putBool("AppleRawExternalConnected", s->external != 0);
++	putNumber("AppleRawCurrentCapacity", s->charge_counter_uah > 0 ? (UInt32)(s->charge_counter_uah / 1000) : 0);
++	putNumber("AppleRawMaxCapacity", learned);
++	putNumber("NominalChargeCapacity", learned);
++	putNumber("DesignCapacity", 4000);
++	putNumber("InstantAmperage", (UInt32)ma);
++	/* centidegrees C; NOT measured until the VADC conversion exists (TODO write) */
++	putNumber("Temperature", (UInt32)(s->temp_dc * 10));
++	putBool("SweetBatteryHardwareSampleValid", true);
++	putBool("SweetBatteryCurrentValid", true);
++	putBool("SweetBatterySOCEstimated", false);
++	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryFallback", false);
++	putNumber("SweetBatteryPercent", percent);
++	/* Linux qpnp-qg / QG daemon internals (negative values read as 2^32 - n) */
++	putNumber("SweetQGMsoc", (UInt32)s->msoc);
++	putNumber("SweetQGCatchUpSoc", (UInt32)s->catch_up_soc);
++	putNumber("SweetQGSysSoc", (UInt32)s->sys_soc);
++	putNumber("SweetQGBattSoc", (UInt32)s->batt_soc);
++	putNumber("SweetQGCcSoc", (UInt32)s->cc_soc);
++	putNumber("SweetQGFullSoc", (UInt32)s->full_soc);
++	putNumber("SweetQGMaintSoc", (UInt32)s->maint_soc);
++	putNumber("SweetQGChargeFull", (UInt32)s->charge_full);
++	putNumber("SweetQGPsStatus", (UInt32)s->ps_status);
++	putNumber("SweetQGChargeDone", (UInt32)s->charge_done);
++	putNumber("SweetQGHealth", (UInt32)s->health);
++	putNumber("SweetQGCurrentUA", (UInt32)s->ua);
++	putNumber("SweetQGTempDeciC", (UInt32)s->temp_dc);
++	putNumber("SweetQGTempSource", (UInt32)s->temp_src);
++	putNumber("SweetQGLearnedMah", (UInt32)s->learned_mah);
++	putNumber("SweetQGFifoRT", (UInt32)s->fifo_rt);
++	putNumber("SweetQGAccCount", (UInt32)s->acc_count);
++	putNumber("SweetQGFifoLen", (UInt32)s->fifo_len);
++	putNumber("SweetQGFifoCount", (UInt32)s->fifo_count);
++	putNumber("SweetQGFifoIntervalMs", (UInt32)s->fifo_interval_ms);
++	putNumber("SweetQGFifoCycles", (UInt32)s->fifo_cycles);
++	putNumber("SweetQGFifoGaps", (UInt32)s->fifo_gaps);
++	putNumber("SweetQGFifoRejects", (UInt32)s->fifo_rejects);
++	putNumber("SweetQGFifoSource", (UInt32)s->fifo_source);
++	putNumber("SweetQGDaemonCycles", (UInt32)s->daemon_cycles);
++	putNumber("SweetQGDaemonWrites", (UInt32)s->daemon_writes);
++	putNumber("SweetQGGoodOcv", (UInt32)s->good_ocv_events);
++	putNumber("SweetQGSpmiErrors", (UInt32)s->spmi_errors);
++	putNumber("SweetQGMultiByte", (UInt32)s->multibyte);
++	putNumber("SweetQGPonSoc", (UInt32)s->pon_soc);
++	putNumber("SweetQGPonCalcSoc", (UInt32)s->pon_calc_soc);
++	putNumber("SweetQGPonUsedSdam", (UInt32)s->pon_used_shutdown);
++	putNumber("SweetQGSdamSoc", (UInt32)s->sdam_soc);
++	putNumber("SweetQGSdamAgeS", (UInt32)s->sdam_age_s);
++	putNumber("SweetQGSdamMagicOk", (UInt32)s->sdam_magic_ok);
++	putNumber("SweetQGRtc", (UInt32)s->rtc_s);
++
++	OSDictionary *legacy = OSDictionary::withCapacity(7);
++	if (legacy) {
++		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
++		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
++		    kIOBatteryFlagsKey};
++		UInt32 values[] = {percent, 100, mv, (UInt32)ma, 0,
++		    (UInt32)(kIOBatteryInstalled | (s->external ? kIOBatteryChargerConnect : 0) |
++		    (s->charging ? kIOBatteryCharge : 0))};
++		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
++			OSNumber *number = OSNumber::withNumber(values[i], 32);
++			if (number) {
++				legacy->setObject(keys[i], number);
++				number->release();
++			}
++		}
++		setLegacyIOBatteryInfo(legacy);
++		legacy->release();
++	}
++	updateStatus();
++	if (mv) {
++		sweet_battery_mv = mv;
++	}
++	if (fLastMode != 2) {
++		IOLog("SWEET BATTERY: MIUI QG engine, %u%% %umV %dmA external=%d charging=%d\n",
++		    percent, mv, ma, s->external, s->charging);
++		fLastMode = 2;
++	}
++}
++
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+@@ -300,6 +410,14 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
++		if (self->fQG) {
++			self->fQGDelay = sweet_qg_poll(&self->fQGStatus);
++			if (self->fQGStatus.changed) {
++				self->publishQG();
++			}
++			sender->setTimeoutMS(self->fQGDelay);
++			return;
++		}
+ 		self->poll();
+ 		sender->setTimeoutMS(30000);
+ 	}
+@@ -317,17 +435,24 @@ SweetBattery::start(IOService *provider)
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	/* MIUI's own algorithm when the QG is readable; else the estimate below */
++	fQG = fReal && sweet_qg_start(&fQGStatus) == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+-	poll();
++	if (fQG) {
++		publishQG();
++	} else {
++		poll();
++	}
+ 	if (fReal) {
+ 		fLoop = IOWorkLoop::workLoop();
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fQG ? fQGDelay : 30000);
+ 		} else {
+ 			fReal = false;
++			fQG = false;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}

@@ -1,0 +1,252 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index a4fbb9c..e8bd3ac 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -691,8 +691,10 @@ rail(unsigned r, bool on)
+ 		rail_on[r] = false;
+ 		return true;
+ 	}
+-	if (sweet_rpmh_vreg_vote(rail_res[r].res, rail_res[r].mv, on) != 0) {
+-		say("RPMh did not take %s %s\n", rail_res[r].res, on ? "on" : "off");
++	int error = sweet_rpmh_vreg_vote(rail_res[r].res, rail_res[r].mv, on);
++	if (error != 0) {
++		say("RPMh did not take %s %s (errno %d; sysctl kern.sweet_rpmhlog says why)\n", rail_res[r].res,
++		    on ? "on" : "off", error);
+ 		if (on) {
+ 			give_up("a rail that RPMh did not take");
+ 			return false;
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 7f034d6..90f6d0c 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,6 +9,8 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+@@ -53,6 +55,44 @@ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
+ 
++/*
++ * Every line below, also kept here (the newest 8 KB): the kernel's message buffer holds only seconds of
++ * a boot, so the reason a vote was refused is gone before USB comes up. sysctl kern.sweet_rpmhlog.
++ */
++static char rh_log_buf[8192];
++static unsigned rh_log_len;
++
++static int
++rh_log_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, rh_log_buf, rh_log_len);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_rpmhlog, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    rh_log_sysctl, "A", "the RPMh vote helper's messages");
++
++static void rh_log(const char *format, ...) __printflike(1, 2);
++
++static void
++rh_log(const char *format, ...)
++{
++	char line[200];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	printf("SWEET RPMH: %s", line);
++	size_t n = strlen(line);
++	if (rh_log_len + n > sizeof(rh_log_buf)) {
++		unsigned drop = sizeof(rh_log_buf) / 2;
++		memmove(rh_log_buf, rh_log_buf + drop, rh_log_len - drop);
++		rh_log_len -= drop;
++	}
++	memcpy(rh_log_buf + rh_log_len, line, n);
++	rh_log_len += (unsigned)n;
++}
++
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+ {
+@@ -79,7 +119,7 @@ rh_sync(uint32_t off, uint32_t value)
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: readback timeout off=%#x want=%#x got=%#x\n",
++	rh_log("readback timeout off=%#x want=%#x got=%#x\n",
+ 	    off, value, rh_read(rh_tcs, off));
+ 	return false;
+ }
+@@ -111,7 +151,7 @@ rh_map(void)
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
+ 	if (!rh_rsc || !rh_tcs || !rh_dict) {
+-		printf("SWEET RPMH: RSC/locator mapping failed\n");
++		rh_log("RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+ 	uint32_t id = rh_read(rh_rsc, 0);
+@@ -120,24 +160,24 @@ rh_map(void)
+ 	unsigned major = (id >> 16) & 0xffu;
+ 	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+ 	rh_ncpt = (config >> 27) & 0x1fu;
+-	printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
++	rh_log("rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+ 	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
+ 	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+ 	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+ 	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+ 	    count > RH_TCS_SIZE / RH_TCS_STRIDE || rh_ncpt < 3 || rh_ncpt > 16) {
+-		printf("SWEET RPMH: unsupported RSC geometry/revision\n");
++		rh_log("unsupported RSC geometry/revision\n");
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+ 		uint32_t pa = rh_read(rh_dict, 0);
+ 		uint32_t size = rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		rh_log("cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+ 		    (uint64_t)pa + size > 0x100000000ULL) {
+-			printf("SWEET RPMH: invalid cmd-db locator\n");
++			rh_log("invalid cmd-db locator\n");
+ 			return EINVAL;
+ 		}
+ 		rh_db = ml_io_map(pa, size);
+@@ -149,11 +189,11 @@ rh_map(void)
+ 	uint32_t db_version = rh_read(rh_db, 0);
+ 	uint32_t magic = rh_read(rh_db, 4);
+ 	uint32_t flags = rh_read(rh_db, 140);
+-	printf("SWEET RPMH: cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
++	rh_log("cmd-db version=%#x magic=%#x checksum=%#x flags=%#x\n",
+ 	    db_version, magic, rh_read(rh_db, 136), flags);
+ 	/* Linux only checks magic; version 1 is an intentionally stricter policy. */
+ 	if (magic != RH_DB_MAGIC || db_version != 1 || (flags & 1u)) {
+-		printf("SWEET RPMH: unsupported/standalone cmd-db\n");
++		rh_log("unsupported/standalone cmd-db\n");
+ 		return EINVAL;
+ 	}
+ 	return 0;
+@@ -178,7 +218,7 @@ rh_lookup(const char *res, uint32_t *address)
+ 		unsigned count = rh_db16(h + 6);
+ 		if (slave < 3 || slave > 5 || (entries & 3u) ||
+ 		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
+-			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
++			rh_log("malformed cmd-db slave header %u\n", i);
+ 			return EINVAL;
+ 		}
+ 		for (unsigned j = 0; j < count; ++j) {
+@@ -189,18 +229,18 @@ rh_lookup(const char *res, uint32_t *address)
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+ 			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				rh_log("invalid VRM entry for %s\n", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+ 			++matches;
+-			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
++			rh_log("%s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+ 			    res, addr, slave, rh_db16(h + 8),
+ 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+ 		}
+ 	}
+ 	if (matches != 1) {
+-		printf("SWEET RPMH: %s lookup matches=%u; refusing\n", res, matches);
++		rh_log("%s lookup matches=%u; refusing\n", res, matches);
+ 		return ENODEV;
+ 	}
+ 	return 0;
+@@ -226,7 +266,7 @@ rh_send(uint32_t address, unsigned mv, uint32_t mode, bool on)
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+-		printf("SWEET RPMH: ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
++		rh_log("ACTIVE TCS%u idle=%#x control=%#x enable=%#x wait=%#x\n",
+ 		    t, rh_read(rh_tcs, b + RH_STATUS), rh_read(rh_tcs, b + RH_CONTROL),
+ 		    enabled, rh_read(rh_tcs, b + RH_WAIT));
+ 		if (enabled & ~((1u << rh_ncpt) - 1u)) {
+@@ -235,7 +275,7 @@ rh_send(uint32_t address, unsigned mv, uint32_t mode, bool on)
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				rh_log("conflicting inherited L11C request in TCS%u\n", t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -244,7 +284,7 @@ rh_send(uint32_t address, unsigned mv, uint32_t mode, bool on)
+ 		}
+ 	}
+ 	if (chosen < 0) {
+-		printf("SWEET RPMH: no empty idle ACTIVE TCS; leaving inherited state intact\n");
++		rh_log("no empty idle ACTIVE TCS; leaving inherited state intact\n");
+ 		return EBUSY;
+ 	}
+ 	unsigned t = (unsigned)chosen;
+@@ -270,7 +310,7 @@ rh_send(uint32_t address, unsigned mv, uint32_t mode, bool on)
+ 	/* The allow-list's mode (PMIC5 raw: LDO HPM 7, SMPS/BOB AUTO 6); enable comes last. */
+ 	const uint32_t offsets[3] = {0, 8, 4};
+ 	const uint32_t values[3] = {mv, mode, on ? 1u : 0u};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=%u enable=%d irq-enable=%#x\n", t, mv, mode, on, irq_en);
++	rh_log("TCS%u ACTIVE %u mV mode=%u enable=%d irq-enable=%#x\n", t, mv, mode, on, irq_en);
+ 	for (unsigned c = 0; c < 3; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+@@ -304,10 +344,10 @@ rh_send(uint32_t address, unsigned mv, uint32_t mode, bool on)
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
++	rh_log("TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+ 	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
+ 	if (!done) {
+-		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
++		rh_log("timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+ 	}
+ 	/* Proven completion: clear trigger before mode, then free only our commands. */
+@@ -321,7 +361,7 @@ rh_send(uint32_t address, unsigned mv, uint32_t mode, bool on)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: %#x ACTIVE vote (enable %d) complete (rail voltage requires hardware verification)\n",
++	rh_log("%#x ACTIVE vote (enable %d) complete (rail voltage requires hardware verification)\n",
+ 	    address, on);
+ 	return 0;
+ }
+@@ -355,7 +395,7 @@ sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on)
+ 		++k;
+ 	}
+ 	if (!res || k == sizeof(rh_allowed) / sizeof(rh_allowed[0])) {
+-		printf("SWEET RPMH: %s at %u mV is not in the allow-list\n", res ? res : "(null)", mv);
++		rh_log("%s at %u mV is not in the allow-list\n", res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+@@ -364,7 +404,7 @@ sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on)
+ 	int error = EIO;
+ 	uint32_t address = 0;
+ 	if (rh_poisoned) {
+-		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		rh_log("previous uncertain transaction; refusing further access\n");
+ 		goto out;
+ 	}
+ 	error = rh_map();
+@@ -376,7 +416,7 @@ sweet_rpmh_vreg_vote(const char *res, unsigned mv, bool on)
+ 	}
+ out:
+ 	if (error) {
+-		printf("SWEET RPMH: enable failed errno=%d\n", error);
++		rh_log("enable failed errno=%d\n", error);
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;

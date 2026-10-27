@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index d77673d..2a451e7 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -698,6 +698,7 @@ pgpio_restore(unsigned gpio)
+ #define LPG_PREDIV_FAST         0x01            /* prediv 1, exponent 1: 53.33 us */
+ 
+ static bool popup_enabled, popup_test, popup_probe_wanted, popup_is_up, popup_pins_set;
++static uint8_t popup_lpg_on = 0x84;     /* ENABLE_CONTROL "on": out + PWM-value source (an LPG); a plain PWM (0x0b) has bit 7 only */
+ static uint32_t popup_stop = 99;        /* sweetpopup_stop=N: stop after step N (bisecting a hang) */
+ 
+ /* One byte of one of the two peripherals the motor needs (PM6150L GPIO 10, LPG 2), by our own channel. */
+@@ -806,7 +807,8 @@ popup_pins(void)
+ 	/* LPG 2: 9-bit PWM of the 19.2 MHz clock (the size bit moves with the subtype), 50 % duty, glitch removal */
+ 	uint8_t size_clk = (uint8_t)(((subtype == 0x0b) ? (1u << 2) : (1u << 4)) | 3u);
+ 	if (popup_stop < 3) { say("pop-up: stopping after step 2\n"); return false; }
+-	say("pop-up step 3: LPG2 configuration (size/clock %#x)\n", size_clk);
++	popup_lpg_on = subtype == 0x0b ? 0x80 : 0x84;
++	say("pop-up step 3: PWM configuration (subtype %#x, size/clock %#x, on %#x)\n", subtype, size_clk, popup_lpg_on);
+ 	if (!popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), 0) ||
+ 	    !popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_TYPE_CONFIG), 0x20) ||
+ 	    !popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SIZE_CLK), size_clk) ||
+@@ -938,7 +940,7 @@ popup_move(bool up)
+ 	say("pop-up step 7: LPG2 on (slow)\n");
+ 	bool ok = popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_PREDIV_CLK), LPG_PREDIV_SLOW) &&
+ 	    popup_spmi_put(SID_PM6150L_B, LPG(LPG_PWM_SYNC), 1) &&
+-	    popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), 0x84);        /* out on, source PWM value */
++	    popup_spmi_put(SID_PM6150L_B, LPG(LPG_ENABLE_CONTROL), popup_lpg_on);        /* out on (an LPG: + PWM-value source) */
+ 	if (ok) {
+ 		popup_wait_ms(51);
+ 		say("pop-up step 8: fast\n");

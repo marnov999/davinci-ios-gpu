@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 54b6e34..5d2c0f3 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -4784,8 +4784,16 @@ drm_do_ios_import(uint32_t surf_id, uint32_t *out_handle)
+ 	struct kgsl_bo_ent *b;
+ 	void *surf;
+ 	if (surf_id == 0u) { return EINVAL; }
+-	for (i = 0; i < KGSL_MAX_BO; i++) {   /* a surface that is a buffer already is that buffer */
+-		if (g_bo[i].used == 1 && g_bo[i].surf_id == surf_id) { *out_handle = g_bo[i].id; return 0; }
++	/* a surface that is a buffer of this process already is that buffer. Of THIS process: a handle
++	 * has no count of its own, so a buffer shared with another importer (the window server
++	 * compositing an application's IOSurface) was taken out of the GPU's address space when that
++	 * process closed it -- under the application still drawing into it (SMMU write fault, core
++	 * stalled). Each process has its own mapping of the same pages. */
++	for (i = 0; i < KGSL_MAX_BO; i++) {
++		if (g_bo[i].used == 1 && g_bo[i].surf_id == surf_id && g_bo[i].pid == proc_selfpid()) {
++			*out_handle = g_bo[i].id;
++			return 0;
++		}
+ 	}
+ 	for (i = 0; i < KGSL_MAX_BO; i++) {   /* one given back and kept: again, as it was */
+ 		if (g_bo[i].used == 3 && g_bo[i].surf_id == surf_id && g_bo[i].pid == proc_selfpid()) {

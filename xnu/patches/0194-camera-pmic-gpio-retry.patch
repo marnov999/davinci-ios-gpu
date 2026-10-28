@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 2a451e7..7bdb6c2 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -579,9 +579,38 @@ spmi_read(unsigned sid, uint16_t address, uint8_t *value)
+ 	return ok;
+ }
+ 
+-/* A PM6150L GPIO register written through our own channel (chnls + 0x10000 * apid) and read back. */
++/*
++ * A PM6150L GPIO register written through our own channel (chnls + 0x10000 * apid) and read back. The
++ * observer's reads now and then return a wrong byte (the keys' and the RTC's reads have needed the same
++ * care): a read-back that differs is read again and the write made again, three times, before the camera
++ * is given up for the boot (a wide -> tele switch died of one such read: "reg 0x41 <- 0 reads 0x1").
++ */
++static bool pgpio_put_once(unsigned gpio, uint8_t reg, uint8_t value, uint8_t *back);
++
+ static bool
+ pgpio_put(unsigned gpio, uint8_t reg, uint8_t value)
++{
++	uint8_t back = 0;
++
++	for (int attempt = 0; attempt < 3; attempt++) {
++		if (pgpio_put_once(gpio, reg, value, &back)) {
++			if (attempt) {
++				say("PM6150L GPIO%u reg %#x <- %#x: took at the %d. try\n", gpio, reg, value, attempt + 1);
++			}
++			return true;
++		}
++		if (broken) {
++			return false;
++		}
++		spin_us(100);
++	}
++	say("PM6150L GPIO%u reg %#x <- %#x reads %#x\n", gpio, reg, value, back);
++	give_up("a PMIC GPIO write that did not take");
++	return false;
++}
++
++static bool
++pgpio_put_once(unsigned gpio, uint8_t reg, uint8_t value, uint8_t *back_out)
+ {
+ 	unsigned owner = 7, apid;
+ 	bool ok = false;
+@@ -620,12 +649,13 @@ pgpio_put(unsigned gpio, uint8_t reg, uint8_t value)
+ 		give_up("a PMIC GPIO owned by another EE");
+ 		return false;
+ 	}
+-	if (!ok || !spmi_read(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(gpio) << 8 | reg), &back) || back != value) {
+-		say("PM6150L GPIO%u reg %#x <- %#x reads %#x\n", gpio, reg, value, back);
+-		give_up("a PMIC GPIO write that did not take");
+-		return false;
++	for (int k = 0; ok && k < 3; k++) {
++		if (spmi_read(SID_PM6150L, (uint16_t)(PGPIO_PERIPH(gpio) << 8 | reg), &back) && back == value) {
++			return true;
++		}
+ 	}
+-	return true;
++	*back_out = back;
++	return false;
+ }
+ 
+ static uint8_t pgpio_found[5];

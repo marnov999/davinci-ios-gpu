@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index a76cc92..272b04e 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -3633,13 +3633,16 @@ gpu_report(const char *why)
+ 	}
+ 	g_reports++;
+ 	printf("SWEET DRM: GPU %s: submission %u is the last, the core has done %u; ring read up to %u, "
+-	    "written up to %u; rbbm %#x; ib1 %#x_%08x rem %#x; ib2 rem %#x; protect %#x; smmu fsr %#x far %#x\n",
++	    "written up to %u; rbbm %#x; ib1 %#x_%08x rem %#x; ib2 rem %#x; protect %#x; smmu fsr %#x far %#x_%08x "
++	    "fsynr0 %#x\n",
+ 	    why, g_fence, *(volatile uint32_t *)(g_res_nc + GPU_FENCE_OFF),
+ 	    gpu_rd(g_core, 0x806u << 2), g_wptr, gpu_rd(g_core, 0x210u << 2),
+ 	    gpu_rd(g_core, 0x929u << 2), gpu_rd(g_core, 0x928u << 2),
+ 	    gpu_rd(g_core, 0x92Au << 2), gpu_rd(g_core, 0x92Du << 2), gpu_rd(g_core, 0x8CAu << 2),
+ 	    g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x058u) : 0,
+-	    g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x060u) : 0);
++	    g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x064u) : 0,   /* FAR high: the GPU's VAs are past 4 GiB */
++	    g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x060u) : 0,
++	    g_smmu_base ? gpu_rd(g_smmu_base, 0x8000u + 0x068u) : 0);  /* FSYNR0: read/write, which stream */
+ }
+ 
+ /* RedwoodGPU gpuWait: wait for the core to be done with `fence`; with the lock held, which is

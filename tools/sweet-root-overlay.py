@@ -40,7 +40,7 @@ import argparse, hashlib, os, plistlib, shutil, struct, sys
 # Claude session transcripts (push_file.py / push.sh, last push per path).
 FILES = [
     ('launchd', 'usr/local/gltest/sweettime', 'davinci-ios/gpu/userland/metal/sweettime', 0o755, '12ffbb8fc9df4a7a'),  # 2026-10-26: time of day = RTC (kern.sweet_rtc, 0162) + kept offset (job com.sweet.time)
-    ('launchd', 'usr/local/lib/libsweet-media.dylib', 'davinci-ios/camera/userland/libsweet-media.dylib', 0o755, 'f894ada410b61c33'),  # 2026-10-26: mediaserverd camera (sweetcam=5), camera/userland/build.sh
+    ('launchd', 'usr/local/lib/libsweet-media.dylib', 'davinci-ios/camera/userland/libsweet-media.dylib', 0o755, 'da63efefb143ea7a'),  # 2026-10-28: mediaserverd camera (sweetcam=5; frames only on the graph's Start, no boot-probe pop-up), camera/userland/build.sh
     ('launchd', 'usr/local/lib/sweet_media_shim', 'davinci-ios/camera/userland/sweet_media_shim', 0o755, '9c48829ed46d8fb5'),  # 2026-10-26: mediaserverd ProgramArguments[0]; inserts libsweet-media (execs without it if missing)
     ('launchd', 'usr/local/gltest/scset', 'davinci-ios/gpu/userland/metal/scset', 0o755, 'a838fc11ea8053b7'),  # 2026-10-25: publishes Plugin:InterfaceNamer *QUIET* at boot (job com.sweet.scquiet)
     ('assets', 'usr/local/gltest/inplace_copy_lpf.fragment.spv', 'backup/ios-root-sources-20261025/phone-only/inplace_copy_lpf.fragment.spv', 0o644, '05f9adab013b54c8'),  # only on the phone; pulled 2026-10-25

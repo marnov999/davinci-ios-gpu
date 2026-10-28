@@ -1,0 +1,126 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 1c36a11..bed0efd 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -15,6 +15,12 @@
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
+  *
++ * Use counts: the library counts uses per process and calls trap 0 when its
++ * count for a category goes 0 -> 1, trap 1 when it goes back to 0;
++ * IOSurfaceIsInUse reads the system-wide counts (u32 per category at +0x18
++ * of the state page), which surface pools (CMPhoto's, CoreVideo's) go by
++ * before they hand a surface out again.
++ *
+  * The lock result tells the library where the surface lives in the
+  * caller's address space: +0 pixels, +8 shared state page (registry id,
+  * seed at +0xc), +0x10 timestamps, then id, sizes and geometry (layout in
+@@ -73,6 +79,7 @@ enum {
+ #define SWEET_SURFACE_ROW_ALIGN         64
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
++#define SWEET_SURFACE_STATE_USES        0x18    /* u32 per use count category (2) in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+ static IOLock       *sweet_surface_lock;
+@@ -802,17 +809,31 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	uint32_t      uses[2];          /* this client's share of the surface's use counts (traps 0/1) */
+ 	bool          detached;         /* client let go (trap 4) but has not released yet (trap 5) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { detached = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { detached = false; uses[0] = uses[1] = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetSurfaceRef, OSObject);
+ 
++static volatile SInt32 *
++sweet_surface_uses(SweetSurface *s, uint32_t category)
++{
++	return (volatile SInt32 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USES + 4 * category);
++}
++
+ void
+ SweetSurfaceRef::free()
+ {
++	/* uses this client still held (released the surface or exited while using it) end with it */
++	for (uint32_t c = 0; c < 2 && surface != NULL; c++) {
++		if (uses[c] != 0) {
++			OSAddAtomic(-(SInt32)uses[c], sweet_surface_uses(surface, c));
++			uses[c] = 0;
++		}
++	}
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
+@@ -866,7 +887,9 @@ public:
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
++	IOReturn useCount(uintptr_t id, uintptr_t category, int delta);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
+@@ -1428,12 +1451,43 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ }
+ 
+ IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
++IOSurfaceRootUserClient::useCount(uintptr_t id, uintptr_t category, int delta)
+ {
++	if (category >= 2) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)id, false, NULL);
++	if (ref == NULL) {
++		ref = findRef((uint32_t)id, true, NULL);
++	}
++	if (ref == NULL) {
++		IOLockUnlock(fLock);
++		return kIOReturnNotFound;
++	}
++	if (delta > 0) {
++		ref->uses[category]++;
++		OSIncrementAtomic(sweet_surface_uses(ref->surface, (uint32_t)category));
++	} else if (ref->uses[category] != 0) {
++		ref->uses[category]--;
++		OSDecrementAtomic(sweet_surface_uses(ref->surface, (uint32_t)category));
++	}
++	IOLockUnlock(fLock);
+ 	return kIOReturnSuccess;
+ }
+ 
++IOReturn
++IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount((uintptr_t)id, (uintptr_t)category, 1);
++}
++
++IOReturn
++IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++	return useCount((uintptr_t)id, (uintptr_t)category, -1);
++}
++
+ static IOReturn
+ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ {
+@@ -1525,8 +1579,8 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapDetach]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },

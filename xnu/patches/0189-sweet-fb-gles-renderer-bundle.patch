@@ -1,0 +1,21 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 726f2b9..5b0e15d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -393,6 +393,16 @@ sweet_publish_accelerator(IOService *provider)
+ 		accelerator->setName("sgx");
+ 		accelerator->setProperty("MetalPluginName", "RedwoodMetal");
+ 		accelerator->setProperty("MetalPluginClassName", "RedwoodMetalDevice");
++		/*
++		 * OpenGL ES: libGFXShared (gfxInitializeLibrary) reads these off this same service and
++		 * opens /System/Library/Extensions/<name>.bundle/<name> -- the Metal one when
++		 * IOGLESDefaultUseMetal is true. AppleMetalGLRenderer is Apple's GLES on Metal, so an
++		 * application's own EAGLContext runs on RedwoodMetal (the processes metal_allow names).
++		 * Without them EAGLContext found no renderer at all and gave applications no context.
++		 */
++		accelerator->setProperty("IOGLESBundleName", "AppleMetalGLRenderer");
++		accelerator->setProperty("IOGLESMetalBundleName", "AppleMetalGLRenderer");
++		accelerator->setProperty("IOGLESDefaultUseMetal", kOSBooleanTrue);
+ 		accelerator->registerService();
+ 		IOLog("SWEET FB: IOAcceleratorES published (sweetmetal=%u): MetalPluginName RedwoodMetal\n", metal);
+ 	}

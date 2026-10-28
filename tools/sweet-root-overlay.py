@@ -66,9 +66,9 @@ FILES = [
     ('gl', 'usr/local/gltest/hello_gl', 'davinci-ios/gpu/userland/mesa/gltest/hello_gl', 0o755, '57d864c7ecb5f3e3'),  # inject_gltest.sh; job com.sweet.gltest (disabled)
     ('gl', 'usr/local/lib/libvulkan_freedreno.dylib', 'davinci-ios/gpu/userland/mesa/build-tu/src/freedreno/vulkan/libvulkan_freedreno.dylib', 0o755, 'a47aa312aa44dcf6'),  # push 10-21 (turnip, Vulkan era); == device copy
     # (usr/local/lib/logshim: pushed 10-24, no longer on the phone 2026-10-25 -- left out)
-    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, '2b1b52e2bb095405'),  # 10-28: backboardd switch file, GLES IR -> AIR via libGLVMPlugin, setProvokingVertexMode:, views = the texture, unanswered-selector net, allowlist names with spaces
+    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, 'f5e3013ac60d2bb1'),  # 10-28 19:20: + one clear per pass (not per draw), CPU blit encoder, -iosurface, lenient GLES draws, sysmem switch, diagnostics
     ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/Info.plist', 'davinci-ios/gpu/userland/metal/redwood/metal_plugin.plist', 0o644, '96f6896e6e1137cb'),  # push 10-25 06:32Z
-    ('metal', 'usr/local/lib/libredwoodair.dylib', 'davinci-ios/gpu/userland/metal/redwood/libredwoodair.dylib', 0o755, 'c17463da45713130'),  # 10-28: buffer address space from the pointer type when the metadata has none (GLES IR modules)
+    ('metal', 'usr/local/lib/libredwoodair.dylib', 'davinci-ios/gpu/userland/metal/redwood/libredwoodair.dylib', 0o755, '84a043087f99f301'),  # 10-28 19:20: + half varyings linked as 32-bit, GL line loop / triangle fan, linear sampled RTs
     ('apps', 'Applications/MetalDemo.app/MetalDemo', 'davinci-ios/gpu/userland/metal/demoapp/MetalDemo', 0o755, 'f34277acc0078ae5'),  # push 10-25 07:53Z (signed with demoapp/ents.plist)
     ('apps', 'Applications/MetalDemo.app/Info.plist', 'davinci-ios/gpu/userland/metal/demoapp/Info.plist', 0o644, '1dc8e501ab0ac4b1'),  # push 10-25 07:53Z
     ('apps', 'Applications/MetalDemo.app/AppIcon60x60@2x.png', 'davinci-ios/gpu/userland/metal/demoapp/AppIcon60x60@2x.png', 0o644, '2aa4673331efbbb0'),  # push 10-25 07:53Z

@@ -347,6 +347,12 @@ DYLD_PATCHES = [
     ('dyld_shared_cache_arm64.01', 0x181a37760, 0x19db760,
      'f0962db0100244f9500000b400021fd6000080d2c0035fd6',
      'ff0302d1f44f06a9fd7b07a9fdc30191881a30f008c544f9', 'restore'),
+    # CMPhoto: __canDecodeTilesOrLayersIntoCanvas -> return false (mov w0,#0; ret). Decoding a HEIC grid
+    # straight into one canvas goes through VideoToolbox's tile decoder; the software HEVC decoder (no
+    # AppleAVD here) fails the clipped edge tiles of a 4:0:0 alpha grid with kVTParameterErr, so every HEIC
+    # with alpha (the iOS 16 wallpaper's pictures) decoded to nothing. Tiles decoded one by one and copied
+    # in are right (needs kernel 0193's IOSurface use counts). metal/cpatch 2026-10-28 22:25Z
+    ('dyld_shared_cache_arm64.11', 0x1a5dcdc9c, 0x37e9c9c, 'ff8302d1e923036d', '00008052c0035fd6', 'patch'),
 ]
 
 STAGED, APPS = 'private/var/staged_system_apps', 'Applications'

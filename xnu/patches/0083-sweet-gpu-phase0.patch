@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5978 @@
+@@ -0,0 +1,5999 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5559,6 +5559,8 @@
 +#define WMODEM_SCM_IS_SUPPORTED 0x42000207ull
 +#define WMODEM_SCM_INIT_IMAGE   0x42000201ull
 +#define WMODEM_SCM_MEM_SETUP    0x42000202ull
++#define WMODEM_SCM_SHUTDOWN     0x42000206ull
++#define WGPU_PAS_ID             13u             /* known-good: the GPU zap PAS works for pas-id 13 */
 +
 +static void
 +wifi_modem_pas_validate(void)
@@ -5587,10 +5589,29 @@
 +	    (unsigned long long)mdt_pa, mdtsz, ((volatile unsigned char *)mdt_io)[0], ((volatile unsigned char *)mdt_io)[1],
 +	    ((volatile unsigned char *)mdt_io)[2], ((volatile unsigned char *)mdt_io)[3]);
 +
++	/* is_supported sweep: compare the modem (4) against the KNOWN-GOOD GPU (13). If TZ answers x1=1
++	 * for 13 but x1=0 for 4, TZ gates modem PAS from us specifically; if it answers 0 for both, the
++	 * call's convention just differs and the answer is not a reliable "supported" flag. (read-only) */
++	x1 = 0;
++	x0 = gpu_scm_pas(WMODEM_SCM_IS_SUPPORTED, 0x01u, (uint64_t)WGPU_PAS_ID, 0, 0, &x1);
++	printf("SWEET WIFI: [5] PAS is_supported(%u=GPU, known-good) -> x0=%#llx x1=%#llx\n",
++	    WGPU_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
++	x1 = 0;
 +	x0 = gpu_scm_pas(WMODEM_SCM_IS_SUPPORTED, 0x01u, (uint64_t)WMODEM_PAS_ID, 0, 0, &x1);
-+	printf("SWEET WIFI: [5] PAS is_supported(%u) -> x0=%#llx x1=%#llx (x0=0 & x1=1 => TZ can PAS this peripheral)\n",
++	printf("SWEET WIFI: [5] PAS is_supported(%u=modem) -> x0=%#llx x1=%#llx (x0=0 & x1=1 => TZ can PAS this peripheral)\n",
 +	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
 +
++	/* Reset any wedged PIL state for pas-id 4 before init_image: the boot chain may have already
++	 * PAS-inited the modem (double-init -> TZ rejects with 0xffcffff6), and the GPU zap does exactly
++	 * this shutdown-first. Safe here: the survey showed the modem NEVER RAN (SMP2P 0 items), so this
++	 * resets bookkeeping only -- it does NOT stop a running modem and does NOT release anything. */
++	x1 = 0;
++	x0 = gpu_scm_pas(WMODEM_SCM_SHUTDOWN, 0x01u, (uint64_t)WMODEM_PAS_ID, 0, 0, &x1);
++	printf("SWEET WIFI: [5] PAS shutdown(%u) to reset PIL state -> x0=%#llx x1=%#llx (result ignored; modem never ran)\n",
++	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
++	gmub_flush();
++
++	x1 = 0;
 +	x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, mdt_pa, 0, &x1);
 +	printf("SWEET WIFI: [5] PAS init_image(%u, mdt) -> x0=%#llx x1=%#llx (0/0 => signature ACCEPTED)\n",
 +	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);

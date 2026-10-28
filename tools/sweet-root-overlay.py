@@ -66,7 +66,7 @@ FILES = [
     ('gl', 'usr/local/gltest/hello_gl', 'davinci-ios/gpu/userland/mesa/gltest/hello_gl', 0o755, '57d864c7ecb5f3e3'),  # inject_gltest.sh; job com.sweet.gltest (disabled)
     ('gl', 'usr/local/lib/libvulkan_freedreno.dylib', 'davinci-ios/gpu/userland/mesa/build-tu/src/freedreno/vulkan/libvulkan_freedreno.dylib', 0o755, 'a47aa312aa44dcf6'),  # push 10-21 (turnip, Vulkan era); == device copy
     # (usr/local/lib/logshim: pushed 10-24, no longer on the phone 2026-10-25 -- left out)
-    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, '7b5d17c7be36d95c'),  # push 10-26 06:27Z (64-byte texture/linear alignment answers)
+    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, '1c33b33f1c1166b7'),  # 10-28: + backboardd only with /usr/local/gltest/metal_backboardd (CA-on-Metal test), swizzle log
     ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/Info.plist', 'davinci-ios/gpu/userland/metal/redwood/metal_plugin.plist', 0o644, '96f6896e6e1137cb'),  # push 10-25 06:32Z
     ('metal', 'usr/local/lib/libredwoodair.dylib', 'davinci-ios/gpu/userland/metal/redwood/libredwoodair.dylib', 0o755, '2e748088bbdc20b4'),  # push 10-26 06:31Z (fewer attachments, SSBO offset bounce, min/max factors)
     ('apps', 'Applications/MetalDemo.app/MetalDemo', 'davinci-ios/gpu/userland/metal/demoapp/MetalDemo', 0o755, 'f34277acc0078ae5'),  # push 10-25 07:53Z (signed with demoapp/ents.plist)
@@ -268,7 +268,7 @@ FILES = [
 FLAGS = {
     # metalshim.m: in backboardd, dlopen libredwood-gl (CA -> freedreno GLES). ESSENTIAL.
     'ca_gles': b'1',
-    # RedwoodMetal allowlist (backboardd never gets Metal)
+    # RedwoodMetal allowlist (backboardd only via the metal_backboardd switch file, not installed here)
     'metal_allow': b'metal_test\nmtltry\nmtlcompute\nmtlrender\nmtldrawable\nMetalDemo\nMobileNotes\nPreferences\n',  # 10-26: Notes (PencilKit), Settings (CoreImage icons; with metal_profile=1)
     # kernel 0115 (sweetcpufreq=1): CPU/L3/GPU clock rows (devtools/clocks.sh); all max
     'clocks': b'l3=10 little=9 big=12 gpu=0\n',

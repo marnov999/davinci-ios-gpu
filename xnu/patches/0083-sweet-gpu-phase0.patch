@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6051 @@
+@@ -0,0 +1,6130 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5559,6 +5559,81 @@
 +#define WMODEM_SCM_IS_SUPPORTED 0x42000207ull
 +#define WMODEM_SCM_INIT_IMAGE   0x42000201ull
 +#define WMODEM_SCM_MEM_SETUP    0x42000202ull
++
++/*
++ * Send ONE immediate RPMh ARC vote on the apps RSC (dt mailbox@18220000, "qcom,tcs-drv", drv-id 2),
++ * to power a rail the way the stock pil-tz driver's regulator_enable(vdd_cx)/regulator_enable(vdd_mss)
++ * does before pas_init_image. The AOP load_state message is only a notification; the real rail power
++ * is this RSC vote, which we were missing. Mirrors the downstream qcom-rpmh-mailbox.c (RSC v2.7):
++ *   reg_base = reg[1] = 0x18220d00; ACTIVE TCS (from qcom,tcs-config <2 2 ...>) is m=0; slot n=0.
++ * CMD_DATA is the ARC hardware-level INDEX into the resource's cmd-db VLVL list (NOT the vlvl value);
++ * we vote the top corner (nvals-1 = TURBO), matching the stock proxy vote. Reuses cmddb_find().
++ * Only touches the AP's own apps RSC active TCS, which nothing else on the AP drives here.
++ */
++#define WRSC_PAGE_PA     0x18220000u     /* page holding reg_base 0x18220d00 */
++#define WRSC_RB          0x00000d00u     /* reg_base offset within the page (reg[1]) */
++#define WRSC_IRQ_STATUS  0x04u
++#define WRSC_IRQ_CLEAR   0x08u
++#define WRSC_CMD_WAIT    0x10u
++#define WRSC_CONTROL     0x14u
++#define WRSC_STATUS      0x18u
++#define WRSC_CMD_ENABLE  0x1cu
++#define WRSC_CMD_MSGID   0x30u
++#define WRSC_CMD_ADDR    0x34u
++#define WRSC_CMD_DATA    0x38u
++#define WRSC_CMD_STATUS  0x3cu
++#define WRSC_MSGID_WR    0x10108u         /* LEN8 | RESP_REQ | WRITE (completing active write) */
++#define WRSC_AMC_ENABLE  0x10000u
++#define WRSC_AMC_TRIGGER 0x1000000u
++
++static vm_offset_t wrsc_page;             /* mapped 0x18220000; reg_base at +0xd00 */
++
++static int
++wifi_rpmh_vote(const char *res)
++{
++	uint16_t vals[16];
++	uint32_t addr = 0, nvals = 0, idx, s;
++	unsigned i;
++	vm_offset_t rb;
++
++	if (!wrsc_page && !(wrsc_page = ml_io_map(WRSC_PAGE_PA, 0x2000u))) {
++		printf("SWEET WIFI: [5] cannot map the apps RSC\n");
++		return -1;
++	}
++	rb = wrsc_page + WRSC_RB;              /* ACTIVE TCS m=0, slot n=0 */
++	if (cmddb_find(res, &addr, vals, &nvals) != 0 || nvals == 0u) {
++		printf("SWEET WIFI: [5] cmd-db lacks %s -- not voting\n", res);
++		return -1;
++	}
++	idx = nvals - 1u;                      /* top corner (TURBO), as the stock proxy vote */
++	printf("SWEET WIFI: [5] RPMh vote %s: cmd-db addr %#x, %u levels, hlvl idx %u (vlvl %u) [TURBO]\n",
++	    res, addr, nvals, idx, vals[idx]);
++	for (i = 0; i < 2000u && !(wmmio_rd32(rb, WRSC_STATUS) & 1u); i++) {
++		delay_for_interval(1, NSEC_PER_USEC);   /* wait TCS idle */
++	}
++	wmmio_wr32(rb, WRSC_CMD_ENABLE, 0);    /* clear any residue */
++	wmmio_wr32(rb, WRSC_CMD_WAIT, 0);
++	wmmio_wr32(rb, WRSC_CMD_MSGID, WRSC_MSGID_WR);
++	wmmio_wr32(rb, WRSC_CMD_ADDR, addr);
++	wmmio_wr32(rb, WRSC_CMD_DATA, idx);
++	wmmio_wr32(rb, WRSC_CMD_WAIT, 1u);     /* want completion on slot 0 */
++	wmmio_wr32(rb, WRSC_CMD_ENABLE, 1u);
++	wmmio_wr32(rb, WRSC_CONTROL, 0);                       /* trigger: 0 -> ENABLE -> ENABLE|TRIGGER */
++	for (i = 0; i < 1000u && wmmio_rd32(rb, WRSC_CONTROL) != 0u; i++) { }
++	wmmio_wr32(rb, WRSC_CONTROL, WRSC_AMC_ENABLE);
++	for (i = 0; i < 1000u && wmmio_rd32(rb, WRSC_CONTROL) != WRSC_AMC_ENABLE; i++) { }
++	wmmio_wr32(rb, WRSC_CONTROL, WRSC_AMC_ENABLE | WRSC_AMC_TRIGGER);
++	for (i = 0; i < 20000u && !(wmmio_rd32(rb, WRSC_IRQ_STATUS) & 1u); i++) {
++		delay_for_interval(1, NSEC_PER_USEC);
++	}
++	s = wmmio_rd32(rb, WRSC_CMD_STATUS);
++	wmmio_wr32(rb, WRSC_IRQ_CLEAR, 1u);
++	wmmio_wr32(rb, WRSC_CMD_ENABLE, 0);
++	wmmio_wr32(rb, WRSC_CMD_WAIT, 0);
++	printf("SWEET WIFI: [5] RPMh vote %s: cmd_status %#x (issued=%u compl=%u)%s\n", res, s, (s >> 8) & 1u,
++	    (s >> 16) & 1u, ((s & 0x100u) && (s & 0x10000u)) ? " OK" : " -- NOT confirmed");
++	return ((s & 0x100u) && (s & 0x10000u)) ? 0 : -1;
++}
 +#define WMODEM_SCM_SHUTDOWN     0x42000206ull
 +#define WGPU_PAS_ID             13u             /* known-good: the GPU zap PAS works for pas-id 13 */
 +#define QMP_MSG_LEN             64u             /* Linux qmp_send always writes 64 bytes, text + zero pad */
@@ -5657,7 +5732,11 @@
 +	 * BEFORE init_image -- mainline q6v5 enables cx+mss proxy power before pas_init_image, and no
 +	 * qcom_scm_assign_mem is needed for this modem class (only sm8550+). */
 +	(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: on}");
-+	delay_for_interval(20, NSEC_PER_MSEC);          /* let the AOP settle the rails */
++	/* The real rail power: vote vdd_cx + vdd_mss ON via the apps RSC, as the stock pil-tz driver does
++	 * (regulator_enable) before pas_init_image. This is the step MIUI does and we were missing. */
++	(void)wifi_rpmh_vote("cx.lvl");
++	(void)wifi_rpmh_vote("mss.lvl");
++	delay_for_interval(20, NSEC_PER_MSEC);          /* let the rails settle */
 +
 +	x1 = 0;
 +	x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, mdt_pa, 0, &x1);

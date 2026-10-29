@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6130 @@
+@@ -0,0 +1,6144 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5716,38 +5716,52 @@
 +	printf("SWEET WIFI: [5] PAS is_supported(%u=modem) -> x0=%#llx x1=%#llx (x0=0 & x1=1 => TZ can PAS this peripheral)\n",
 +	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
 +
-+	/* Reset any wedged PIL state for pas-id 4 before init_image: the boot chain may have already
-+	 * PAS-inited the modem (double-init -> TZ rejects with 0xffcffff6), and the GPU zap does exactly
-+	 * this shutdown-first. Safe here: the survey showed the modem NEVER RAN (SMP2P 0 items), so this
-+	 * resets bookkeeping only -- it does NOT stop a running modem and does NOT release anything. */
-+	x1 = 0;
-+	x0 = gpu_scm_pas(WMODEM_SCM_SHUTDOWN, 0x01u, (uint64_t)WMODEM_PAS_ID, 0, 0, &x1);
-+	printf("SWEET WIFI: [5] PAS shutdown(%u) to reset PIL state -> x0=%#llx x1=%#llx (result ignored; modem never ran)\n",
-+	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
-+	gmub_flush();
-+
-+	/* davinci's modem is qcom,signal-aop: its proxy power (cx, mss rails) is brought up by the AOP
-+	 * when told the modem image is loading, NOT by an AP rail vote. Step 5 failed (0xffcffff6) with
-+	 * that power off. So, over the channel step 3 opened, tell the AOP to power the modem for load
-+	 * BEFORE init_image -- mainline q6v5 enables cx+mss proxy power before pas_init_image, and no
-+	 * qcom_scm_assign_mem is needed for this modem class (only sm8550+). */
++	/* AUTHORITATIVE (MiCode davinci-p-oss subsys-pil-tz.c pil_boot, RE'd 2026-10-29): the modem and the
++	 * GPU zap (pas-id 13, which authenticates fine here) run byte-identical pil_init_image_trusted code.
++	 * The metadata buffer is ordinary coherent DMA (NOT in the modem region), the bus vote is the same
++	 * global scm_pas client both use, and there is NO hyp/scm_assign before init_image on this SoC. So
++	 * the mdt buffer / bus / region are all ruled out -- 0xffcffff6 is TZ's PAS AUTH of the modem
++	 * metadata failing. And our modem.mdt is byte-identical (md5) to the one THIS TZ accepts under MIUI,
++	 * so TZ *can* authenticate it: the reject is a TZ-STATE difference between the MIUI boot and ours.
++	 *
++	 * The one concrete deviation we had from stock pil_boot was an unconditional shutdown(4) BEFORE
++	 * init_image -- stock does init_image first, no shutdown. Two cases to tell apart in one boot:
++	 *   (A) our boot chain (ABL) left pas-id 4 already-inited -> re-init rejected; shutdown clears it.
++	 *   (B) our pre-shutdown itself wedged an otherwise-clean PAS state.
++	 * So: power on (cheap, proven-harmless insurance), then init_image FIRST with no shutdown (exactly
++	 * like stock). Only if rejected, shutdown(4) to clear stale PAS bookkeeping and retry. The pair of
++	 * return codes says which case we are in -- or, if both reject identically, that it is a genuine
++	 * TZ auth/secure-state reject beyond this code path. */
 +	(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: on}");
-+	/* The real rail power: vote vdd_cx + vdd_mss ON via the apps RSC, as the stock pil-tz driver does
-+	 * (regulator_enable) before pas_init_image. This is the step MIUI does and we were missing. */
 +	(void)wifi_rpmh_vote("cx.lvl");
 +	(void)wifi_rpmh_vote("mss.lvl");
 +	delay_for_interval(20, NSEC_PER_MSEC);          /* let the rails settle */
 +
 +	x1 = 0;
 +	x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, mdt_pa, 0, &x1);
-+	printf("SWEET WIFI: [5] PAS init_image(%u, mdt) -> x0=%#llx x1=%#llx (0/0 => signature ACCEPTED)\n",
++	printf("SWEET WIFI: [5] PAS init_image(%u, mdt) [attempt A, NO prior shutdown -- matches stock pil_boot] -> x0=%#llx x1=%#llx\n",
 +	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
 +	if (x0 != 0u) {
-+		printf("SWEET WIFI: [5] TZ REJECTED the modem image header (x0=%#llx) -- stop; modem untouched, in reset\n",
-+		    (unsigned long long)x0);
++		uint64_t sx1 = 0, sx0;
++		printf("SWEET WIFI: [5] attempt A rejected (x0=%#llx); clearing PAS state with shutdown(%u) and retrying\n",
++		    (unsigned long long)x0, WMODEM_PAS_ID);
++		sx0 = gpu_scm_pas(WMODEM_SCM_SHUTDOWN, 0x01u, (uint64_t)WMODEM_PAS_ID, 0, 0, &sx1);
++		printf("SWEET WIFI: [5] PAS shutdown(%u) -> x0=%#llx x1=%#llx\n",
++		    WMODEM_PAS_ID, (unsigned long long)sx0, (unsigned long long)sx1);
++		gmub_flush();
++		x1 = 0;
++		x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, mdt_pa, 0, &x1);
++		printf("SWEET WIFI: [5] PAS init_image(%u, mdt) [attempt B, AFTER shutdown] -> x0=%#llx x1=%#llx\n",
++		    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
++	}
++	if (x0 != 0u) {
++		printf("SWEET WIFI: [5] TZ REJECTED the modem image on BOTH attempts (x0=%#llx). The mdt is byte-identical to "
++		    "MIUI's, power/bus/buffer/region are ruled out -- this is a TZ-side PAS authentication/secure-state reject, "
++		    "not something this code path sets up wrong. Stop; modem untouched, in reset.\n", (unsigned long long)x0);
 +		(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: off}");
 +		return;
 +	}
++	printf("SWEET WIFI: [5] init_image ACCEPTED (x0=0) -- TZ authenticated the modem metadata.\n");
 +
 +	x0 = gpu_scm_pas(WMODEM_SCM_MEM_SETUP, 0x03u, (uint64_t)WMODEM_PAS_ID, (uint64_t)WMODEM_REGION_PA,
 +	    (uint64_t)WMODEM_REGION_SIZE, &x1);

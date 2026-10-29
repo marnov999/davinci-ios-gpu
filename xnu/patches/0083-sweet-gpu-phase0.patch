@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6780 @@
+@@ -0,0 +1,6806 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5452,6 +5452,26 @@
 +	return 0;
 +}
 +
++/* Read len bytes at file offset off into buf (cacheable). 0 on success; *got = bytes read. */
++static int
++wifi_read_file_at(const char *path, uint8_t *buf, uint32_t len, off_t off, uint64_t *got)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int e, resid = (int)len;
++	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
++		return -1;
++	}
++	e = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)len, off, UIO_SYSSPACE, IO_NODELOCKED,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++	vnode_put(vp);
++	if (e != 0) {
++		return -1;
++	}
++	*got = (uint64_t)len - (uint64_t)resid;
++	return 0;
++}
++
 +/* Stat a file's size without reading it. 0 on success. */
 +static int
 +wifi_file_size(const char *path, uint64_t *size)
@@ -5835,24 +5855,30 @@
 +	printf("SWEET WIFI: [8] copying loadable segments into %#x..\n", WMODEM_REGION_PA);
 +	for (uint32_t s = 0; s < phnum; s++) {
 +		struct wmdt_phdr ph;
-+		uint64_t got = 0, j, fcopy;
++		uint64_t got = 0, j, done;
 +		vm_offset_t dst;
 +		memcpy(&ph, wifi_mdt + phoff + 32u * s, sizeof(ph));
 +		if (ph.type != 1u || WMDT_HASH(ph.flags) || ph.memsz == 0u) { continue; }
 +		dst = region + ((vm_offset_t)ph.paddr - (vm_offset_t)WMODEM_REGION_PA);   /* paddr is page-aligned */
-+		if (ph.filesz != 0u) {
-+			if (ph.filesz > 0x400000u) { printf("SWEET WIFI: [8] seg %u filesz %#x > 4 MiB -- stop\n", s, ph.filesz); return; }
-+			snprintf(path, sizeof(path), "%smodem.b%02u", WMDT_DIR, s);
-+			if (wifi_read_file(path, (uint8_t *)stage_cva, ph.filesz, &got) != 0 || got != (uint64_t)ph.filesz) {
-+				printf("SWEET WIFI: [8] seg %u: read %s failed (%llu/%u) -- stop\n", s, path, (unsigned long long)got, ph.filesz); return;
++		/* Stream the segment file in 4 MiB chunks (seg 23 is 27 MiB -- too big for one buffer) into the
++		 * cacheable stage, then copy each chunk to the NC region in aligned 8-byte writes (device memory
++		 * forbids unaligned). dst+done stays 8-aligned (chunks are 4 MiB); only the final chunk's tail is
++		 * padded to 8 and lands in the bss. Then zero from filesz(rounded) to memsz. */
++		snprintf(path, sizeof(path), "%smodem.b%02u", WMDT_DIR, s);
++		done = 0;
++		while (done < ph.filesz) {
++			uint32_t chunk = (ph.filesz - done) > 0x400000u ? 0x400000u : (uint32_t)(ph.filesz - done);
++			uint32_t c8 = (chunk + 7u) & ~7u;
++			if (wifi_read_file_at(path, (uint8_t *)stage_cva, chunk, (off_t)done, &got) != 0 || got != (uint64_t)chunk) {
++				printf("SWEET WIFI: [8] seg %u: read %s @%llu failed (%llu/%u) -- stop\n",
++				    s, path, (unsigned long long)done, (unsigned long long)got, chunk); return;
 +			}
++			for (j = chunk; j < c8; j++) { ((unsigned char *)stage_cva)[j] = 0; }
++			for (j = 0; j < c8; j += 8u) { *(volatile uint64_t *)(dst + done + j) = *(uint64_t *)(stage_cva + j); }
++			done += chunk;
 +		}
-+		/* copy file bytes to the NC region in aligned 8-byte writes (device memory forbids unaligned);
-+		 * pad the stage tail to 8 so the rounded copy lands clean inside the bss, then zero to memsz. */
-+		fcopy = (ph.filesz + 7ull) & ~7ull;
-+		if (fcopy > ph.memsz) { fcopy = ph.memsz; }
-+		for (j = ph.filesz; j < fcopy; j++) { ((unsigned char *)stage_cva)[j] = 0; }
-+		for (j = 0; j + 8u <= fcopy; j += 8u) { *(volatile uint64_t *)(dst + j) = *(uint64_t *)(stage_cva + j); }
++		j = (ph.filesz + 7ull) & ~7ull;
++		if (j > ph.memsz) { j = ph.memsz; }
 +		for (; j + 8u <= ph.memsz; j += 8u) { *(volatile uint64_t *)(dst + j) = 0ull; }
 +		for (; j < ph.memsz; j++) { ((volatile unsigned char *)dst)[j] = 0; }
 +		__asm__ volatile("dsb sy" ::: "memory");

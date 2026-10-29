@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6623 @@
+@@ -0,0 +1,6679 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -6254,6 +6254,58 @@
 +	printf("SWEET WIFI: [6] ipa_fws shutdown issued (PAS cleanup; nothing was loaded) -- cross-probe done\n");
 +}
 +
++/* sweetwifi=7 DDR-LOCATION SWEEP. TZ RE (static disasm of tz.bin) proved 0xffcffff6 = negated internal
++ * 0x30000A, raised by reader B's per-page map op (0x1c085234) logging AC_ERR_NOT_DDR_MEMORY: the modem
++ * (and every non-GPU) PAS init_image MAPS the NS metadata buffer into TZ to read it and checks the
++ * buffer PA is inside a DDR bank XBL registered with TZ at boot (table populated once at TZ boot; no
++ * runtime SMC adds to it). Our gmub_alloc_phys buffer sits in XNU's high RAM (~0xb7xxxxxx), which is
++ * real DDR (GPU zap reader A reads it fine) but is NOT in TZ's registered bank table -> reject. GPU zap
++ * uses reader A which has no DDR check. So the fix is purely WHERE the mdt lives. This probes the same
++ * modem.mdt at several candidate PAs to find which class TZ accepts as registered DDR. All non-gmub
++ * targets are unused low-DDR carveouts/removed/System-RAM scratch (modem in reset; init_image only
++ * reads; we shutdown(4) after each so each try is independent). Nothing is loaded or released. */
++static void
++wifi_ddr_try(const char *label, uint64_t pa, int use_gmub)
++{
++	vm_offset_t cva = 0, io = 0;
++	uint64_t gpa = pa, x0, x1 = 0, i, n = wifi_mdt_size;
++	if (use_gmub) {
++		if (gmub_alloc_phys(&cva, &gpa, 0x4000) != 0) {
++			printf("SWEET WIFI: [7] %s: gmub_alloc failed\n", label); return;
++		}
++	}
++	if (!(io = ml_io_map(gpa, 0x4000))) {
++		printf("SWEET WIFI: [7] %s: cannot map pa %#llx\n", label, (unsigned long long)gpa); return;
++	}
++	for (i = 0; i < n; i++) { ((volatile unsigned char *)io)[i] = wifi_mdt[i]; }
++	__asm__ volatile("dsb sy" ::: "memory");
++	gmub_flush();
++	x1 = 0;
++	x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, gpa, 0, &x1);
++	printf("SWEET WIFI: [7] init_image(4, mdt@%#llx  %s) -> x0=%#llx x1=%#llx  %s\n",
++	    (unsigned long long)gpa, label, (unsigned long long)x0, (unsigned long long)x1,
++	    x0 == 0u ? "<<<<< ACCEPTED -- THIS PA IS REGISTERED DDR; allocate the mdt (and modem image) here" :
++	    (x0 == 0xffcffff6ull ? "(0xffcffff6 = AC_ERR_NOT_DDR_MEMORY: PA not in TZ's boot-registered DDR table)" :
++	    "(other error)"));
++	x1 = 0;
++	(void)gpu_scm_pas(WMODEM_SCM_SHUTDOWN, 0x01u, (uint64_t)WMODEM_PAS_ID, 0, 0, &x1);
++}
++static void
++wifi_ddr_sweep(void)
++{
++	printf("SWEET WIFI: [7] DDR-LOCATION SWEEP for modem.mdt (reader-B AC_ERR_NOT_DDR_MEMORY probe); modem STAYS IN RESET\n");
++	if (wifi_mdt_size == 0u || wifi_mdt_size > sizeof(wifi_mdt)) {
++		printf("SWEET WIFI: [7] no validated modem.mdt from step 4 -- cannot sweep\n"); return;
++	}
++	wifi_ddr_try("XNU high RAM via gmub (CONTROL, expect reject)", 0, 1);
++	wifi_ddr_try("modem carveout spare @0x93400000", 0x93400000ull, 0);
++	wifi_ddr_try("modem carveout base  @0x8b000000", 0x8b000000ull, 0);
++	wifi_ddr_try("removed_region       @0x86300000", 0x86300000ull, 0);
++	wifi_ddr_try("System-RAM bank2     @0x98000000", 0x98000000ull, 0);
++	wifi_ddr_try("System-RAM bank1     @0x82000000", 0x82000000ull, 0);
++	printf("SWEET WIFI: [7] sweep done -- any ACCEPTED line gives the PA class to allocate the mdt from (next: move the real buffer there)\n");
++}
++
 +extern vnode_t rootvnode;       /* also declared near sweet_push_exec_bit; a second extern is harmless */
 +static void
 +wifi_fw_thread(void *arg, wait_result_t wr)
@@ -6263,9 +6315,13 @@
 +	for (tries = 0; tries < 600u; tries++) {        /* up to ~60 s for the iOS root volume */
 +		if (rootvnode != NULLVP) {
 +			if (wifi_firmware_read_validate() && wifi_level >= 4) {
-+				wifi_modem_pas_validate();      /* sweetwifi=4: TZ signature check, modem NOT released */
++				if (wifi_level == 7) {
++					wifi_ddr_sweep();       /* sweetwifi=7: DDR-location sweep -- find a PA TZ accepts (AC_ERR_NOT_DDR_MEMORY) */
++				} else {
++					wifi_modem_pas_validate();      /* sweetwifi=4: TZ signature check, modem NOT released */
++				}
 +			}
-+			if (wifi_level >= 6) {
++			if (wifi_level == 6) {
 +				wifi_pas_crossprobe();          /* sweetwifi=6: embedded ipa_fws (pas-id 15) PAS cross-probe */
 +			}
 +			break;

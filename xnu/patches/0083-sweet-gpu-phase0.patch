@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,7144 @@
+@@ -0,0 +1,7425 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5816,6 +5816,7 @@
 +static void wifi_modem_liveness(void);   /* defined after the wsmem helpers */
 +static void wifi_smp2p_up(void);         /* M2a: SMP2P bring-up, defined after the wsmem helpers */
 +static void wifi_glink_attach(void);     /* M2b: GLINK FIFO attach */
++static void wifi_glink_link(void);       /* M2c: GLINK version + open IPCRTR */
 +static void
 +wifi_modem_release(void)
 +{
@@ -6456,6 +6457,9 @@
 +					if (wifi_level >= 10) {
 +						wifi_glink_attach();    /* sweetwifi=10: M2b -- attach GLINK FIFOs, peek modem VERSION */
 +					}
++					if (wifi_level >= 11) {
++						wifi_glink_link();      /* sweetwifi=11: M2c -- send VERSION, pump, open IPCRTR */
++					}
 +				} else if (wifi_level == 7) {
 +					wifi_ddr_sweep();       /* sweetwifi=7: DDR-location sweep -- find a PA TZ accepts (AC_ERR_NOT_DDR_MEMORY) */
 +				} else {
@@ -6949,6 +6953,283 @@
 +		delay_for_interval(100, NSEC_PER_MSEC);
 +	}
 +	printf("SWEET WIFI: [10] M2b GLINK attach done\n");
++}
++
++/* ---- M2c: GLINK link -- version + open the IPCRTR channel (sweetwifi=11) --------------------------
++ * Port of hakios.mpss.c glink_room/put/say/offer/advance/pump + step_link. GLINK is host-initiated: we
++ * send our VERSION (ring APCS bit 12), then pump the modem's RX ring and answer VERSION/OPEN/OPEN_ACK/
++ * INTENT. The channel opens when the modem has opened its side (theirs!=0) AND acked ours; then we push
++ * our receive intents. A completed inbound datagram is handed to wifi_qrtr_input (a stub for M2c; M2d
++ * parses QRTR). GLINK cmds enum per the spec. Intent buffers come from a static pool (no kalloc_data). */
++enum { WGL_VERSION = 0, WGL_VERSION_ACK = 1, WGL_OPEN = 2, WGL_CLOSE = 3, WGL_OPEN_ACK = 4, WGL_INTENT = 5,
++	WGL_DONE = 6, WGL_INTENT_REQUEST = 7, WGL_INTENT_REQUEST_ACK = 8, WGL_DATA = 9, WGL_CLOSE_ACK = 11,
++	WGL_DATA_MORE = 12, WGL_READ_NOTIFY = 13, WGL_DONE_REUSE = 14, WGL_SIGNALS = 15 };
++#define WGL_VERSION_1    1u
++#define WGL_INTENT_REUSE 1u
++#define WGL_RESERVE      16u
++
++struct wglink_channel {
++	const char *name;
++	uint32_t ours, theirs;
++	bool asked, acknowledged, open;
++	struct { uint32_t size, count; } intents[3];
++	struct { uint32_t id, size; bool there, in_use; } their_intents[64];
++	struct { uint32_t size, fill; uint8_t *data; } our_intents[24];
++	uint32_t our_intent_count;
++};
++static struct {
++	bool up, broken, agreed;
++	uint32_t features, said, heard;
++	struct wglink_channel ch;
++} wgl = { .ch = { .name = "IPCRTR", .ours = 1u, .intents = { { 0x800u, 5u }, { 0x2000u, 3u }, { 0x4400u, 2u } } } };
++static uint8_t  wglink_pool[0x12000];
++static uint32_t wglink_pool_used;
++
++static void wifi_qrtr_input(const uint8_t *data, uint32_t len);   /* M2d; a stub for now */
++
++static uint32_t
++wglink_room(void)
++{
++	uint32_t head = wsmem_word(wglink_desc + WGLINK_OUR_HEAD), tail = wsmem_word(wglink_desc + WGLINK_OUR_TAIL), room;
++	if (head >= wglink_ours_size || tail >= wglink_ours_size) { return 0; }
++	room = tail <= head ? wglink_ours_size - head + tail : tail - head;
++	return room < WGL_RESERVE ? 0 : room - WGL_RESERVE;
++}
++
++static void
++wglink_advance(uint32_t count)
++{
++	wsmem_poke(wglink_desc + WGLINK_THEIR_TAIL, (wsmem_word(wglink_desc + WGLINK_THEIR_TAIL) + count) % wglink_theirs_size);
++}
++
++static bool
++wglink_put(const void *a, uint32_t alen, const void *b, uint32_t blen)
++{
++	volatile uint8_t *q = wsmem + wglink_ours;
++	uint32_t head = wsmem_word(wglink_desc + WGLINK_OUR_HEAD), length = alen + blen, padded = (length + 7u) & ~7u, i;
++	if (!wgl.up || wglink_room() < padded) { return false; }
++	for (i = 0; i < padded; i++) {
++		q[(head + i) % wglink_ours_size] = i < alen ? ((const uint8_t *)a)[i] : i < length ? ((const uint8_t *)b)[i - alen] : 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	wsmem_poke(wglink_desc + WGLINK_OUR_HEAD, (head + padded) % wglink_ours_size);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wifi_ring_modem(12);
++	wgl.said++;
++	return true;
++}
++
++static void
++wglink_say(uint32_t cmd, uint32_t p1, uint32_t p2, const void *more, uint32_t more_len)
++{
++	struct { uint16_t cmd, p1; uint32_t p2; } m = { (uint16_t)cmd, (uint16_t)p1, p2 };
++	(void)wglink_put(&m, (uint32_t)sizeof(m), more, more_len);
++}
++
++static bool
++wglink_offer(uint32_t size)
++{
++	uint32_t words[2], i = wgl.ch.our_intent_count;
++	if (i >= 24u || size == 0u || size > 0x10000u || wglink_pool_used + size > sizeof(wglink_pool)) { return false; }
++	wgl.ch.our_intents[i].data = wglink_pool + wglink_pool_used;
++	wglink_pool_used += size;
++	wgl.ch.our_intents[i].size = size;
++	wgl.ch.our_intents[i].fill = 0;
++	wgl.ch.our_intent_count++;
++	words[0] = size; words[1] = i + 1u;
++	wglink_say(WGL_INTENT, wgl.ch.ours, 1u, words, (uint32_t)sizeof(words));
++	return true;
++}
++
++/* Everything the modem put in its ring, taken out and acted on (Linux qcom_glink_native_rx). */
++static void
++wglink_pump(void)
++{
++	struct { uint16_t command, param1; uint32_t param2; } message;
++	struct wglink_channel *channel = &wgl.ch;
++	uint32_t words[4];
++	char name[33];
++
++	while (wgl.up && !wgl.broken) {
++		uint32_t waiting = wglink_waiting(), length = (uint32_t)sizeof(message);
++		if (waiting < sizeof(message)) { return; }
++		wglink_peek(&message, 0, (uint32_t)sizeof(message));
++		if (message.command == WGL_OPEN) {
++			length += message.param2;
++		} else if (message.command == WGL_INTENT) {
++			length += 8u * message.param2;
++		} else if (message.command == WGL_DATA || message.command == WGL_DATA_MORE) {
++			if (waiting < 16u) { return; }
++			wglink_peek(words, 8, 8);
++			length = 16u + words[0];
++		}
++		length = (length + 7u) & ~7u;
++		if (length > wglink_theirs_size - 8u) {
++			printf("SWEET WIFI: [11] glink: message of %u bytes (cmd %u) not believed -- broken\n", length, message.command);
++			wgl.broken = true; return;
++		}
++		if (waiting < length) { return; }
++		wgl.heard++;
++		switch (message.command) {
++		case WGL_VERSION:
++			if (message.param1 == WGL_VERSION_1) { wgl.features &= message.param2; }
++			wglink_advance(length);
++			wglink_say(WGL_VERSION_ACK, WGL_VERSION_1, wgl.features, NULL, 0);
++			break;
++		case WGL_VERSION_ACK:
++			wglink_advance(length);
++			if (message.param1 == WGL_VERSION_1 && message.param2 == wgl.features) {
++				wgl.agreed = true;
++			} else if (message.param1 != 0) {
++				wgl.features &= message.param2;
++				wglink_say(WGL_VERSION, WGL_VERSION_1, wgl.features, NULL, 0);
++			}
++			break;
++		case WGL_OPEN:
++			bzero(name, sizeof(name));
++			wglink_peek(name, (uint32_t)sizeof(message), message.param2 < sizeof(name) - 1 ? message.param2 : (uint32_t)sizeof(name) - 1);
++			wglink_advance(length);
++			if (strcmp(name, channel->name) != 0) {
++				printf("SWEET WIFI: [11] glink: modem opens \"%s\" (its ch %u): unanswered, we don't speak it\n", name, message.param1);
++				break;
++			}
++			printf("SWEET WIFI: [11] glink: modem opens \"%s\" (its ch %u): acked, opening ours (ch %u)\n", name, message.param1, channel->ours);
++			channel->theirs = message.param1;
++			wglink_say(WGL_OPEN_ACK, channel->theirs, 0, NULL, 0);
++			if (!channel->asked) {
++				uint32_t sz = (uint32_t)strlen(channel->name) + 1u;
++				bzero(name, sizeof(name));
++				strlcpy(name, channel->name, sizeof(name));
++				wglink_say(WGL_OPEN, channel->ours, sz, name, (sz + 7u) & ~7u);
++				channel->asked = true;
++			}
++			break;
++		case WGL_OPEN_ACK:
++			wglink_advance(length);
++			if (message.param1 == channel->ours) { channel->acknowledged = true; }
++			break;
++		case WGL_INTENT:
++			for (uint32_t i = 0; (message.param1 == channel->theirs || message.param1 == channel->ours) && i < message.param2; i++) {
++				wglink_peek(words, 8u + 8u * i, 8);
++				for (unsigned n = 0; n < 64u; n++) {
++					if (!channel->their_intents[n].there || channel->their_intents[n].id == words[1]) {
++						channel->their_intents[n].there = true;
++						channel->their_intents[n].in_use = false;
++						channel->their_intents[n].size = words[0];
++						channel->their_intents[n].id = words[1];
++						break;
++					}
++				}
++			}
++			wglink_advance(length);
++			break;
++		case WGL_DONE:
++		case WGL_DONE_REUSE:
++			for (unsigned n = 0; (message.param1 == channel->theirs || message.param1 == channel->ours) && n < 64u; n++) {
++				if (channel->their_intents[n].there && channel->their_intents[n].id == message.param2) {
++					channel->their_intents[n].in_use = false;
++					channel->their_intents[n].there = message.command == WGL_DONE_REUSE;
++				}
++			}
++			wglink_advance(length);
++			break;
++		case WGL_INTENT_REQUEST:
++			wglink_advance(length);
++			{
++				bool granted = wglink_offer(message.param2);
++				wglink_say(WGL_INTENT_REQUEST_ACK, channel->ours, granted, NULL, 0);
++			}
++			break;
++		case WGL_INTENT_REQUEST_ACK:
++			wglink_advance(length);
++			break;
++		case WGL_DATA:
++		case WGL_DATA_MORE: {
++			uint32_t intent = message.param2 - 1u;
++			if (intent >= channel->our_intent_count ||
++			    words[0] > channel->our_intents[intent].size - channel->our_intents[intent].fill) {
++				printf("SWEET WIFI: [11] glink: data %u bytes on ch %u intent %u NOT OURS/too much -- dropped\n",
++				    words[0], message.param1, message.param2);
++				wglink_advance(length);
++				break;
++			}
++			wglink_peek(channel->our_intents[intent].data + channel->our_intents[intent].fill, 16, words[0]);
++			channel->our_intents[intent].fill += words[0];
++			wglink_advance(length);
++			if (words[1] == 0u) {
++				wifi_qrtr_input(channel->our_intents[intent].data, channel->our_intents[intent].fill);
++				channel->our_intents[intent].fill = 0;
++				wglink_say(WGL_DONE_REUSE, channel->ours, message.param2, NULL, 0);
++			}
++			break;
++		}
++		case WGL_READ_NOTIFY:
++			wglink_advance(length);
++			wifi_ring_modem(12);
++			break;
++		case WGL_CLOSE:
++			wglink_advance(length);
++			wglink_say(WGL_CLOSE_ACK, message.param1, 0, NULL, 0);
++			if (message.param1 == channel->theirs) { channel->open = false; channel->theirs = 0; }
++			break;
++		case WGL_CLOSE_ACK:
++		case WGL_SIGNALS:
++			wglink_advance(length);
++			break;
++		default:
++			printf("SWEET WIFI: [11] glink: unknown message (%u %u %#x) -- broken\n", message.command, message.param1, message.param2);
++			wgl.broken = true;
++			return;
++		}
++		if (channel->theirs != 0u && channel->acknowledged && !channel->open) {
++			channel->open = true;
++			printf("SWEET WIFI: [11]   >>>>> THE CHANNEL \"IPCRTR\" IS OPEN both ways (ours %u, modem %u) -- telling the modem our intents <<<<<\n",
++			    channel->ours, channel->theirs);
++			for (unsigned i = 0; i < 3u; i++) {
++				for (unsigned n = 0; n < channel->intents[i].count; n++) { (void)wglink_offer(channel->intents[i].size); }
++			}
++		}
++	}
++}
++
++/* M2c stub -- M2d replaces this with the QRTR parser (hello + service list). */
++static void
++wifi_qrtr_input(const uint8_t *data, uint32_t len)
++{
++	uint32_t w0 = len >= 4u ? *(const uint32_t *)data : 0, w1 = len >= 8u ? *(const uint32_t *)(data + 4) : 0;
++	printf("SWEET WIFI: [11] (QRTR datagram: %u bytes, first words %#x %#x -- parsing is M2d)\n", len, w0, w1);
++}
++
++static void
++wifi_glink_link(void)
++{
++	int t;
++	printf("SWEET WIFI: [11] M2c GLINK link: send VERSION (ring bit 12), pump, open IPCRTR\n");
++	if (!wglink_find()) { printf("SWEET WIFI: [11] GLINK not attached (run after M2b)\n"); return; }
++	wsmem_poke(wglink_desc + WGLINK_OUR_HEAD, 0);
++	wsmem_poke(wglink_desc + WGLINK_THEIR_TAIL, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wgl.up = true; wgl.broken = false; wgl.agreed = false; wgl.features = WGL_INTENT_REUSE;
++	wgl.said = wgl.heard = 0; wglink_pool_used = 0;
++	wgl.ch.theirs = 0; wgl.ch.asked = wgl.ch.acknowledged = wgl.ch.open = false; wgl.ch.our_intent_count = 0;
++	bzero(wgl.ch.their_intents, sizeof(wgl.ch.their_intents));
++	wglink_say(WGL_VERSION, WGL_VERSION_1, wgl.features, NULL, 0);
++	for (t = 0; t < 500 && !wgl.broken && !wgl.ch.open; t++) {
++		wglink_pump();
++		if ((t % 50) == 0) {
++			printf("SWEET WIFI: [11]   +%dms: agreed=%d theirs=%u ack=%d open=%d said=%u heard=%u\n",
++			    t * 10, wgl.agreed, wgl.ch.theirs, wgl.ch.acknowledged, wgl.ch.open, wgl.said, wgl.heard);
++		}
++		delay_for_interval(10, NSEC_PER_MSEC);
++	}
++	wglink_pump();
++	if (wgl.ch.open) {
++		printf("SWEET WIFI: [11] M2c DONE: IPCRTR OPEN (ours %u, modem %u, said %u, heard %u) -- QRTR next (M2d)\n",
++		    wgl.ch.ours, wgl.ch.theirs, wgl.said, wgl.heard);
++	} else {
++		printf("SWEET WIFI: [11] M2c: IPCRTR NOT open (agreed=%d theirs=%u ack=%d broken=%d said=%u heard=%u)\n",
++		    wgl.agreed, wgl.ch.theirs, wgl.ch.acknowledged, wgl.broken, wgl.said, wgl.heard);
++	}
 +}
 +
 +/*

@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6679 @@
+@@ -0,0 +1,6686 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5690,9 +5690,16 @@
 +		printf("SWEET WIFI: [5] no validated modem.mdt from step 4 -- not asking TZ\n");
 +		return;
 +	}
-+	/* The metadata must sit in plain, physically-contiguous DRAM below 4 GiB that TZ can read. */
-+	if (gmub_alloc_phys(&mdt_cva, &mdt_pa, 0x4000) != 0 || !(mdt_io = ml_io_map(mdt_pa, 0x4000))) {
-+		printf("SWEET WIFI: [5] cannot get a contiguous <4GB buffer for the mdt\n");
++	/* The metadata buffer MUST sit in a DDR bank XBL registered with TZ at boot. TZ RE (tz.bin) + the
++	 * sweetwifi=7 sweep (2026-10-29) proved the modem path (reader B) MAPS this buffer into TZ and rejects
++	 * with 0xffcffff6 = AC_ERR_NOT_DDR_MEMORY when its PA is not in that table. XNU's high RAM (gmub,
++	 * ~0xb7xxxxxx) is real DDR but NOT registered; the modem carveout IS (init_image accepted at both
++	 * 0x8b000000 and 0x93400000, rejected from gmub). Stage at the top of the carveout (0x93400000, in the
++	 * ~7 MiB spare above the image's 0x8b000000..0x92e00000) so it never collides with the loaded image. */
++	mdt_pa = 0x93400000ull;
++	(void)mdt_cva;
++	if (!(mdt_io = ml_io_map(mdt_pa, 0x4000))) {
++		printf("SWEET WIFI: [5] cannot map the modem-carveout mdt staging buffer at %#llx\n", (unsigned long long)mdt_pa);
 +		return;
 +	}
 +	for (i = 0; i < mdtsz; i++) {

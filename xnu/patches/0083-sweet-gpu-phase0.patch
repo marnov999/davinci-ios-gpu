@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,7546 @@
+@@ -0,0 +1,7898 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5817,6 +5817,10 @@
 +static void wifi_smp2p_up(void);         /* M2a: SMP2P bring-up, defined after the wsmem helpers */
 +static void wifi_glink_attach(void);     /* M2b: GLINK FIFO attach */
 +static void wifi_glink_link(void);       /* M2c: GLINK version + open IPCRTR */
++static void wrmtfs_load(void);           /* M3a: rmtfs (defined after wifi_glink_link) */
++static bool wrmtfs_buffer_make(void);
++static bool wrmtfs_share(bool in);
++static void wrmtfs_start(void);
 +static void
 +wifi_modem_release(void)
 +{
@@ -5844,6 +5848,11 @@
 +	x1 = 0; x0 = gpu_scm_pas(WMODEM_SCM_MEM_SETUP, 0x03u, (uint64_t)WMODEM_PAS_ID, (uint64_t)WMODEM_REGION_PA, (uint64_t)WMODEM_REGION_SIZE, &x1);
 +	printf("SWEET WIFI: [8] mem_setup(4) -> x0=%#llx\n", (unsigned long long)x0);
 +	if (x0 != 0u) { printf("SWEET WIFI: [8] mem_setup refused -- stop; modem in reset\n"); goto fail_off; }
++
++	if (wifi_level >= 13) {   /* M3a: read EFS partitions, map the rmtfs buffer, TZ-assign it to the modem (before auth) */
++		wrmtfs_load();
++		if (wrmtfs_buffer_make()) { (void)wrmtfs_share(true); }
++	}
 +
 +	if (!(region = ml_io_map((vm_offset_t)WMODEM_REGION_PA, (vm_size_t)WMODEM_REGION_SIZE))) {
 +		printf("SWEET WIFI: [8] cannot map the modem region -- stop (authenticated, in reset)\n"); goto fail_off;
@@ -7238,6 +7247,57 @@
 +	return wglink_send(buf, (uint32_t)sizeof(*h) + padded);
 +}
 +
++
++/* ---- M3: QRTR server side -- local ports + announced servers (port of hakios qrtr_open/announce) --- */
++typedef void (*wqrtr_recv_t)(void *ctx, uint32_t node, uint32_t from_port, const void *data, uint32_t len);
++struct wqrtr_port { uint32_t number; wqrtr_recv_t receive; void *context; };
++static struct wqrtr_port wqrtr_ports[16];
++static struct { uint32_t service, instance, port; } wour_servers[4];
++static uint32_t wqrtr_next_port = 0x4000u;
++
++static struct wqrtr_port *
++wqrtr_open(wqrtr_recv_t receive, void *context)
++{
++	unsigned p;
++	for (p = 0; p < 16u; p++) {
++		if (wqrtr_ports[p].number == 0u) {
++			wqrtr_ports[p].number = wqrtr_next_port++;
++			wqrtr_ports[p].receive = receive;
++			wqrtr_ports[p].context = context;
++			return &wqrtr_ports[p];
++		}
++	}
++	return NULL;
++}
++
++static int
++wqrtr_send(uint32_t from_port, uint32_t node, uint32_t to, const void *data, uint32_t length)
++{
++	return wqrtr_out_packet(QRTR_DATA, from_port, node, to, data, length);
++}
++
++static void
++wqrtr_announce(uint32_t node, unsigned server, bool end)
++{
++	struct wqrtr_control p = { QRTR_NEW_SERVER, { 0, 0, 0, 0 } };
++	if (!end) {
++		p.words[0] = wour_servers[server].service;
++		p.words[1] = wour_servers[server].instance;
++		p.words[2] = QRTR_US_NODE;
++		p.words[3] = wour_servers[server].port;
++	}
++	(void)wqrtr_out_packet(QRTR_NEW_SERVER, QRTR_CONTROL, node, QRTR_CONTROL, &p, (uint32_t)sizeof(p));
++}
++
++static void
++wqrtr_announce_all(uint32_t node)
++{
++	unsigned i;
++	for (i = 0; i < 4u; i++) {
++		if (wour_servers[i].port != 0u) { wqrtr_announce(node, i, false); }
++	}
++}
++
 +static void
 +wifi_qrtr_input(const uint8_t *data, uint32_t length)
 +{
@@ -7277,18 +7337,25 @@
 +	}
 +	if (!(h.to_port == QRTR_CONTROL || h.type == QRTR_HELLO || h.type == QRTR_NEW_SERVER || h.type == QRTR_DEL_SERVER ||
 +	    h.type == QRTR_BYE || h.type == QRTR_NEW_LOOKUP)) {
-+		return;   /* data to a normal port: nothing here wants it yet (M3/M4) */
++		unsigned p;
++		for (p = 0; p < 16u; p++) {   /* data to one of our ports (rmtfs/servreg/tftp) -> its callback */
++			if (wqrtr_ports[p].number == h.to_port && h.type == QRTR_DATA && wqrtr_ports[p].receive != NULL) {
++				wqrtr_ports[p].receive(wqrtr_ports[p].context, h.from_node, h.from_port, data + at, h.size);
++				return;
++			}
++		}
++		return;
 +	}
 +	bzero(&c, sizeof(c));
 +	memcpy(&c, data + at, h.size < sizeof(c) ? h.size : sizeof(c));
 +	switch (c.command) {
 +	case QRTR_HELLO: {
 +		struct wqrtr_control hello = { QRTR_HELLO, { 0, 0, 0, 0 } };
-+		int e = 0;
 +		if (wqrtr_hellos++ == 0u) {
-+			e = wqrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, h.from_node, QRTR_CONTROL, &hello, (uint32_t)sizeof(hello));
++			int e = wqrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, h.from_node, QRTR_CONTROL, &hello, (uint32_t)sizeof(hello));
++			printf("SWEET WIFI: [11] qrtr: HELLO from node %u; our reply %s\n", h.from_node, e == 0 ? "SENT" : "NOT sent");
++			wqrtr_announce_all(h.from_node);      /* M3: tell the modem our servers (rmtfs etc.) */
 +		}
-+		printf("SWEET WIFI: [11] qrtr: HELLO from node %u; our reply %s\n", h.from_node, e == 0 ? "SENT" : "NOT sent");
 +		break;
 +	}
 +	case QRTR_NEW_SERVER: {
@@ -7304,6 +7371,17 @@
 +		printf("SWEET WIFI: [11] qrtr: >>> SERVICE %u (%#x) version %u instance %u at node %u port %u%s\n",
 +		    c.words[0], c.words[0], c.words[1] & 0xffu, c.words[1] >> 8, c.words[2], c.words[3],
 +		    c.words[0] == 0x27u || c.words[0] == 39u ? "   <<< WLFW = Wi-Fi!" : "");
++		break;
++	}
++	case QRTR_NEW_LOOKUP: {
++		unsigned i, matches = 0;
++		for (i = 0; i < 4u; i++) {
++			if (wour_servers[i].port != 0u && (c.words[0] == 0u || wour_servers[i].service == c.words[0])) {
++				wqrtr_announce(h.from_node, i, false); matches++;
++			}
++		}
++		wqrtr_announce(h.from_node, 0, true);   /* the empty NEW_SERVER that ends the answer */
++		printf("SWEET WIFI: [11] qrtr: modem looks for service %u (%#x) inst %u: %u of ours\n", c.words[0], c.words[0], c.words[1], matches);
 +		break;
 +	}
 +	case QRTR_DEL_SERVER:
@@ -7328,6 +7406,7 @@
 +	wgl.said = wgl.heard = 0; wglink_pool_used = 0;
 +	wgl.ch.theirs = 0; wgl.ch.asked = wgl.ch.acknowledged = wgl.ch.open = false; wgl.ch.our_intent_count = 0;
 +	bzero(wgl.ch.their_intents, sizeof(wgl.ch.their_intents));
++	if (wifi_level >= 13) { wrmtfs_start(); }   /* M3a: register the rmtfs server before HELLO/announce */
 +	wglink_say(WGL_VERSION, WGL_VERSION_1, wgl.features, NULL, 0);
 +	for (t = 0; t < 500 && !wgl.broken && !wgl.ch.open; t++) {
 +		wglink_pump();
@@ -7346,12 +7425,285 @@
 +		    wgl.agreed, wgl.ch.theirs, wgl.ch.acknowledged, wgl.broken, wgl.said, wgl.heard);
 +	}
 +	if (wgl.ch.open && wifi_level >= 12) {
-+		printf("SWEET WIFI: [11] M2d: listening ~8 s for the QRTR hello + the modem's service list...\n");
-+		for (t = 0; t < 800 && !wgl.broken; t++) { wglink_pump(); delay_for_interval(10, NSEC_PER_MSEC); }
++		int listen_iters = wifi_level >= 13 ? 3000 : 800;   /* rmtfs needs longer (modem OPEN/ALLOC/RW) */
++		printf("SWEET WIFI: [11] M2d/M3: listening %d ms for QRTR services + rmtfs activity...\n", listen_iters * 10);
++		for (t = 0; t < listen_iters && !wgl.broken; t++) { wglink_pump(); delay_for_interval(10, NSEC_PER_MSEC); }
 +		printf("SWEET WIFI: [11] M2d DONE: qrtr hellos=%u, datagrams in=%u, modem node=%u (said=%u heard=%u)\n",
 +		    wqrtr_hellos, wqrtr_in, wqrtr_peer, wgl.said, wgl.heard);
 +	}
 +}
++
++/* ---- M3a: rmtfs (QMI service 14) -- serve the modem's EFS so it progresses past SSCTL/servreg ------
++ * Port of hakios.mpss.c rmtfs. A <4GB no-map buffer is TZ-assigned to the modem (SCM 0x42000C16), the
++ * modem opens /boot/modem_fs{1,2,g,c}, asks for the buffer PA, then reads/writes sectors via iovec; we
++ * serve from the partition images (pushed to /usr/local/gltest/). Writes are kept in RAM for the run. */
++#define WRMTFS_SECTOR        512u
++#define WRMTFS_BUFFER_SIZE   0x200000u          /* davinci dt qcom,rmtfs_sharedmem@0 = 2 MiB */
++#define WRMTFS_BUFFER_PA_DEF 0x95700000ull      /* pil_adsp_region (no-map, ADSP not started here); modem_buffer= overrides */
++#define WQMI_REQUEST         0u
++#define WQMI_RESPONSE        2u
++#define WQMI_RESULT_FAILURE  1u
++#define WQMI_ERR_INTERNAL    1u
++#define WQMI_ERR_MALFORMED   2u
++#define WVMID_HLOS           3u
++#define WVMID_MSS_MSA        15u
++#define WVMID_NAV            0x2bu
++#define WVM_PERM_RW          6u
++
++static struct { const char *path, *partition, *file; uint8_t *data; uint64_t size; bool open; } wrmtfs_files[4] = {
++	{ "/boot/modem_fs1", "modemst1", "/usr/local/gltest/modemst1.img", NULL, 0, false },
++	{ "/boot/modem_fs2", "modemst2", "/usr/local/gltest/modemst2.img", NULL, 0, false },
++	{ "/boot/modem_fsc", "fsc",      "/usr/local/gltest/fsc.img",      NULL, 0, false },
++	{ "/boot/modem_fsg", "fsg",      "/usr/local/gltest/fsg.img",      NULL, 0, false },
++};
++static vm_offset_t      wrmtfs_buffer;
++static volatile uint8_t *wrmtfs_window;
++static uint64_t         wrmtfs_buffer_pa;
++static bool             wrmtfs_shared;
++static struct wqrtr_port *wrmtfs_port;
++static uint32_t wrmtfs_requests, wrmtfs_reads, wrmtfs_writes, wrmtfs_refused;
++
++/* SMC with four register args (x2..x5); our gpu_scm_pas only drives x2..x4. SCM_INTERRUPTED=1. */
++static int32_t
++wifi_scm4(uint64_t fn, uint64_t args, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t *answer)
++{
++	uint64_t session = 0;
++	int i;
++	fn |= (1ull << 30) | (2ull << 24);   /* SCM_64 | SCM_SIP */
++	for (i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? fn : 1ull;
++		register uint64_t x1 __asm__("x1") = args;
++		register uint64_t x2 __asm__("x2") = a2;
++		register uint64_t x3 __asm__("x3") = a3;
++		register uint64_t x4 __asm__("x4") = a4;
++		register uint64_t x5 __asm__("x5") = a5;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++		__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++		    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != 1ull) { *answer = x1; return (int32_t)x0; }
++	}
++	return -1;
++}
++
++static const uint8_t *
++wqmi_tlv(const uint8_t *m, uint32_t length, uint8_t type, uint16_t *size)
++{
++	uint32_t at;
++	for (at = 7; at + 3u <= length;) {
++		uint16_t n = (uint16_t)(m[at + 1] | m[at + 2] << 8);
++		if (at + 3u + n > length) { return NULL; }
++		if (m[at] == type) { *size = n; return m + at + 3u; }
++		at += 3u + n;
++	}
++	return NULL;
++}
++
++static uint32_t
++wle32(const uint8_t *p)
++{
++	return (uint32_t)(p[0] | p[1] << 8 | p[2] << 16 | p[3] << 24);
++}
++
++static bool
++wrmtfs_buffer_make(void)
++{
++	uint32_t i;
++	uint64_t bp = 0;
++	if (wrmtfs_window != NULL) { return true; }
++	wrmtfs_buffer_pa = WRMTFS_BUFFER_PA_DEF;
++	if (PE_parse_boot_argn("modem_buffer", &bp, sizeof(bp)) && bp != 0) { wrmtfs_buffer_pa = bp; }
++	wrmtfs_window = (volatile uint8_t *)ml_io_map_wcomb(wrmtfs_buffer_pa, WRMTFS_BUFFER_SIZE);
++	if (wrmtfs_window == NULL) { printf("SWEET WIFI: [13] rmtfs: cannot map buffer at %#llx\n", wrmtfs_buffer_pa); return false; }
++	wrmtfs_buffer = (vm_offset_t)wrmtfs_window;
++	for (i = 0; i < WRMTFS_BUFFER_SIZE; i += 8u) { *(volatile uint64_t *)(wrmtfs_window + i) = 0; }
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET WIFI: [13] rmtfs: buffer %u bytes at %#llx\n", WRMTFS_BUFFER_SIZE, wrmtfs_buffer_pa);
++	return true;
++}
++
++/* TZ mem-assign (Linux qcom_scm_assign_mem). in=true: HLOS -> {HLOS,MSS,NAV} rw. */
++static bool
++wrmtfs_share(bool in)
++{
++	vm_offset_t cva = 0;
++	uint64_t pa = 0, answer = ~0ull;
++	uint8_t *page;
++	unsigned sources, destinations, i;
++	int32_t result;
++	if (wrmtfs_buffer == 0 || wrmtfs_shared == in) { return wrmtfs_buffer != 0; }
++	if (gmub_alloc_phys(&cva, &pa, PAGE_SIZE) != 0) { printf("SWEET WIFI: [13] rmtfs: no page for assign descriptor\n"); return false; }
++	page = (uint8_t *)cva;
++	for (i = 0; i < PAGE_SIZE; i += 8u) { *(volatile uint64_t *)(page + i) = 0; }
++	*(volatile uint64_t *)(page + 0) = wrmtfs_buffer_pa;
++	*(volatile uint64_t *)(page + 8) = WRMTFS_BUFFER_SIZE;
++	if (in) {
++		*(volatile uint32_t *)(page + 64) = WVMID_HLOS;
++		sources = 1;
++		*(volatile uint32_t *)(page + 128 + 0) = WVMID_HLOS;    *(volatile uint32_t *)(page + 128 + 4) = WVM_PERM_RW;
++		*(volatile uint32_t *)(page + 128 + 24 + 0) = WVMID_MSS_MSA; *(volatile uint32_t *)(page + 128 + 24 + 4) = WVM_PERM_RW;
++		*(volatile uint32_t *)(page + 128 + 48 + 0) = WVMID_NAV; *(volatile uint32_t *)(page + 128 + 48 + 4) = WVM_PERM_RW;
++		destinations = 3;
++	} else {
++		*(volatile uint32_t *)(page + 64 + 0) = WVMID_HLOS;
++		*(volatile uint32_t *)(page + 64 + 4) = WVMID_MSS_MSA;
++		*(volatile uint32_t *)(page + 64 + 8) = WVMID_NAV;
++		sources = 3;
++		*(volatile uint32_t *)(page + 128 + 0) = WVMID_HLOS; *(volatile uint32_t *)(page + 128 + 4) = WVM_PERM_RW;
++		destinations = 1;
++	}
++	*(volatile uint64_t *)(page + 240 + 0) = (uint64_t)sources * 4u;
++	*(volatile uint64_t *)(page + 240 + 8) = pa + 128u;
++	*(volatile uint64_t *)(page + 240 + 16) = (uint64_t)destinations * 24u;
++	*(volatile uint64_t *)(page + 240 + 24) = 0;
++	gpu_dcache_clean(cva, PAGE_SIZE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	result = wifi_scm4(0xc16ull, 0x1117ull, pa, 16, pa + 64u, pa + 240u, &answer);
++	printf("SWEET WIFI: [13] rmtfs: SCM mem-assign(%s) -> ret=%d answer=%#llx\n", in ? "share" : "reclaim", result, (unsigned long long)answer);
++	if (result != 0 || answer != 0) { printf("SWEET WIFI: [13] rmtfs: TZ did NOT %s the buffer\n", in ? "share" : "reclaim"); return false; }
++	wrmtfs_shared = in;
++	printf("SWEET WIFI: [13] rmtfs: %s\n", in ? ">>> THE MODEM MAY USE THE BUFFER <<<" : "buffer reclaimed by HLOS");
++	return true;
++}
++
++static void
++wrmtfs_load(void)
++{
++	unsigned f;
++	for (f = 0; f < 4u; f++) {
++		uint64_t size = 0, got = 0;
++		vm_offset_t buf = 0;
++		if (wrmtfs_files[f].data != NULL) { continue; }
++		if (wifi_file_size(wrmtfs_files[f].file, &size) != 0 || size == 0 || size > (64u << 20)) {
++			printf("SWEET WIFI: [13] rmtfs: %s NOT on device (push it to %s)\n", wrmtfs_files[f].partition, wrmtfs_files[f].file);
++			continue;
++		}
++		if (kmem_alloc(kernel_map, &buf, (vm_size_t)size, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET WIFI: [13] rmtfs: no memory for %s (%llu bytes)\n", wrmtfs_files[f].partition, size);
++			continue;
++		}
++		if (wifi_read_file(wrmtfs_files[f].file, (uint8_t *)buf, (uint32_t)size, &got) != 0 || got != size) {
++			printf("SWEET WIFI: [13] rmtfs: read %s failed (%llu/%llu)\n", wrmtfs_files[f].file, got, size);
++			kmem_free(kernel_map, buf, (vm_size_t)size);
++			continue;
++		}
++		wrmtfs_files[f].data = (uint8_t *)buf;
++		wrmtfs_files[f].size = size;
++		printf("SWEET WIFI: [13] rmtfs: loaded %s (%s): %llu bytes\n", wrmtfs_files[f].partition, wrmtfs_files[f].file, size);
++	}
++}
++
++static void
++wrmtfs_receive(void *context, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data, *value;
++	uint8_t answer[64], *tlv;
++	uint16_t message, size = 0, result = 0, error = 0, extra = 0;
++	unsigned file = 4;
++	(void)context;
++	if (length < 7u || m[0] != WQMI_REQUEST) { return; }
++	message = (uint16_t)(m[3] | m[4] << 8);
++	wrmtfs_requests++;
++	bzero(answer, sizeof(answer));
++	answer[0] = WQMI_RESPONSE;
++	answer[1] = m[1]; answer[2] = m[2]; answer[3] = m[3]; answer[4] = m[4];
++	tlv = answer + 14;
++	switch (message) {
++	case 1:   /* OPEN */
++		value = wqmi_tlv(m, length, 1, &size);
++		for (unsigned fi = 0; value != NULL && fi < 4u; fi++) {
++			if (size == strlen(wrmtfs_files[fi].path) && memcmp(value, wrmtfs_files[fi].path, size) == 0) { file = fi; }
++		}
++		if (file == 4u || wrmtfs_files[file].data == NULL) {
++			printf("SWEET WIFI: [13] rmtfs: modem opens \"%.*s\": NOT HERE\n", value ? (int)(size < 48u ? size : 48u) : 0, value ? (const char *)value : "");
++			result = WQMI_RESULT_FAILURE; error = WQMI_ERR_INTERNAL; wrmtfs_refused++; break;
++		}
++		wrmtfs_files[file].open = true;
++		printf("SWEET WIFI: [13] rmtfs: modem opens %s (%llu bytes): caller %u\n", wrmtfs_files[file].path, wrmtfs_files[file].size, file + 1);
++		tlv[0] = 0x10; tlv[1] = 4; tlv[2] = 0; tlv[3] = (uint8_t)(file + 1); extra = 7;
++		break;
++	case 2:   /* CLOSE */
++		value = wqmi_tlv(m, length, 1, &size);
++		file = value != NULL && size == 4u && wle32(value) >= 1u && wle32(value) <= 4u ? wle32(value) - 1u : 4u;
++		if (file < 4u) { wrmtfs_files[file].open = false; }
++		break;
++	case 4:   /* ALLOC_BUFF */
++		value = wqmi_tlv(m, length, 2, &size);
++		if (value == NULL || size != 4u || wle32(value) > WRMTFS_BUFFER_SIZE || wrmtfs_buffer == 0 || !wrmtfs_shared) {
++			printf("SWEET WIFI: [13] rmtfs: modem asks buffer %u: NOT GIVEN (%s)\n", value && size == 4u ? wle32(value) : 0, wrmtfs_shared ? "shared" : "NOT shared");
++			result = WQMI_RESULT_FAILURE; error = WQMI_ERR_INTERNAL; wrmtfs_refused++; break;
++		}
++		printf("SWEET WIFI: [13] rmtfs: modem asks buffer %u: given ours at %#llx\n", wle32(value), wrmtfs_buffer_pa);
++		tlv[0] = 0x10; tlv[1] = 8; tlv[2] = 0;
++		for (unsigned b = 0; b < 8u; b++) { tlv[3 + b] = (uint8_t)(wrmtfs_buffer_pa >> (8 * b)); }
++		extra = 11;
++		break;
++	case 3: {   /* RW_IOVEC */
++		const uint8_t *direction = wqmi_tlv(m, length, 2, &size), *entries;
++		uint16_t direction_size = size, entries_size = 0;
++		bool write;
++		unsigned count, e;
++		value = wqmi_tlv(m, length, 1, &size);
++		entries = wqmi_tlv(m, length, 3, &entries_size);
++		file = value != NULL && size == 4u && wle32(value) >= 1u && wle32(value) <= 4u ? wle32(value) - 1u : 4u;
++		if (file == 4u || !wrmtfs_files[file].open || direction == NULL || direction_size != 1u || entries == NULL ||
++		    entries_size < 1u || entries_size != 1u + 12u * entries[0] || wrmtfs_window == NULL) {
++			result = WQMI_RESULT_FAILURE; error = WQMI_ERR_MALFORMED; wrmtfs_refused++; break;
++		}
++		write = direction[0] != 0;
++		count = entries[0];
++		for (e = 0; e < count && result == 0; e++) {
++			uint64_t sector = wle32(entries + 1 + 12 * e), physical = wle32(entries + 5 + 12 * e), sectors = wle32(entries + 9 + 12 * e);
++			uint64_t bytes = sectors * WRMTFS_SECTOR, i;
++			if (physical < wrmtfs_buffer_pa || physical - wrmtfs_buffer_pa + bytes > WRMTFS_BUFFER_SIZE ||
++			    sector * WRMTFS_SECTOR + bytes > wrmtfs_files[file].size) {
++				printf("SWEET WIFI: [13] rmtfs: %s %llu sectors from %llu of %s: OUT OF RANGE\n", write ? "write" : "read", sectors, sector, wrmtfs_files[file].partition);
++				result = WQMI_RESULT_FAILURE; error = WQMI_ERR_MALFORMED; wrmtfs_refused++; break;
++			}
++			if (write) {
++				for (i = 0; i < bytes; i++) { wrmtfs_files[file].data[sector * WRMTFS_SECTOR + i] = wrmtfs_window[physical - wrmtfs_buffer_pa + i]; }
++				wrmtfs_writes++;
++			} else {
++				for (i = 0; i < bytes; i++) { wrmtfs_window[physical - wrmtfs_buffer_pa + i] = wrmtfs_files[file].data[sector * WRMTFS_SECTOR + i]; }
++				wrmtfs_reads++;
++			}
++		}
++		__asm__ volatile("dsb sy" ::: "memory");
++		if (result == 0 && (wrmtfs_reads + wrmtfs_writes) <= 16u) {
++			printf("SWEET WIFI: [13] rmtfs: modem %s %u pieces of %s: served\n", write ? "writes" : "reads", count, wrmtfs_files[file].partition);
++		}
++		break;
++	}
++	case 5:   /* GET_DEV_ERROR */
++		tlv[0] = 0x10; tlv[1] = 1; tlv[2] = 0; tlv[3] = 0; extra = 4;
++		break;
++	default:
++		printf("SWEET WIFI: [13] rmtfs: unknown request %#x (%u bytes)\n", message, length);
++		result = WQMI_RESULT_FAILURE; error = WQMI_ERR_MALFORMED;
++		break;
++	}
++	answer[5] = (uint8_t)(7 + extra);
++	answer[6] = (uint8_t)((7 + extra) >> 8);
++	answer[7] = 2; answer[8] = 4; answer[9] = 0;
++	answer[10] = (uint8_t)result; answer[11] = (uint8_t)(result >> 8);
++	answer[12] = (uint8_t)error; answer[13] = (uint8_t)(error >> 8);
++	if (wrmtfs_port != NULL) {
++		(void)wqrtr_send(wrmtfs_port->number, node, port, answer, 14u + extra);
++	}
++}
++
++static void
++wrmtfs_start(void)
++{
++	if (wrmtfs_port == NULL) { wrmtfs_port = wqrtr_open(wrmtfs_receive, NULL); }
++	if (wrmtfs_port == NULL) { printf("SWEET WIFI: [13] rmtfs: no free QRTR port\n"); return; }
++	wour_servers[0].service = 14u;
++	wour_servers[0].instance = 1u;   /* RMTFS_VERSION(1) | RMTFS_INSTANCE(0)<<8 */
++	wour_servers[0].port = wrmtfs_port->number;
++	printf("SWEET WIFI: [13] rmtfs: server registered (service 14, instance 1, port %u)\n", wrmtfs_port->number);
++}
++
 +
 +/*
 + * The CPU's clock (boot-arg sweetcpufreq=1), as HackiOS's redwood_cpufreq.c does it on its EPSS: the

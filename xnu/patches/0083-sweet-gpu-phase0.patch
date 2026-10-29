@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,7922 @@
+@@ -0,0 +1,8328 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5820,6 +5820,7 @@
 +static void wrmtfs_load(void);           /* M3a: rmtfs (defined after wifi_glink_link) */
 +static bool wrmtfs_setup(void);
 +static void wrmtfs_start(void);
++static void wservreg_load(void);         /* M3b: service-registry locator (pd-mapper) */
 +static void
 +wifi_modem_release(void)
 +{
@@ -5851,6 +5852,9 @@
 +	if (wifi_level >= 13) {   /* M3a: read EFS partitions, map the rmtfs buffer, TZ-assign it to the modem (before auth) */
 +		wrmtfs_load();
 +		(void)wrmtfs_setup();
++	}
++	if (wifi_level >= 14) {   /* M3b/M3c: load the pd-mapper .jsn table (servreg + tftp registered at glink_link) */
++		wservreg_load();
 +	}
 +
 +	if (!(region = ml_io_map((vm_offset_t)WMODEM_REGION_PA, (vm_size_t)WMODEM_REGION_SIZE))) {
@@ -7717,6 +7721,396 @@
 +	}
 +}
 +
++/* ---- M3b/M3c: pd-mapper (service-registry locator, QMI 64) + tqftpserv (TFTP over QRTR, QMI 4096) ----
++ * Port of hakios.mpss.c's servreg + tftp. The modem, once it has its EFS (rmtfs), asks the locator where
++ * services live (reading the .jsn table beside the firmware) and fetches firmware files (wlanmdsp.mbn,
++ * bdwlan.*) over TFTP -- both needed before the modem spawns its wlan process-domain (-> WLFW service 39).
++ * Firmware + .jsn are pushed to /usr/local/gltest/fw/. Reuses wqrtr_*, wqmi_tlv, wifi_file_size. */
++#define WFW_DIR              "/usr/local/gltest/"   /* flat: modem.* + modemst*.img + wifi fw + .jsn all here */
++#define WTFTP_SERVICE        4096u
++#define WTFTP_RRQ            1u
++#define WTFTP_WRQ            2u
++#define WTFTP_DATA           3u
++#define WTFTP_ACK            4u
++#define WTFTP_ERROR          5u
++#define WTFTP_OACK           6u
++#define WTFTP_ENOENT         1u
++#define WTFTP_EBADOP         4u
++#define WTFTP_END_OF_XFER    9u
++#define WTFTP_MAX_BLOCK      8000u
++#define WTFTP_MAX_WINDOW     4u
++#define WTFTP_WRITE_MAX      (1u << 20)
++#define WSERVREG_SERVICE     64u
++#define WSERVREG_INSTANCE    257u
++#define WSERVREG_GET_DOMAIN_LIST 0x21u
++#define WSERVREG_PFR         0x24u
++
++static struct wqrtr_port *wtftp_port, *wservreg_port;
++
++/* A whole firmware file from WFW_DIR into a fresh buffer the caller frees with wkfree(buf,*size). */
++static uint8_t *
++wfw_read(const char *name, uint64_t *size)
++{
++	char path[192];
++	uint64_t sz = 0, got = 0;
++	vm_offset_t buf = 0;
++	snprintf(path, sizeof(path), "%s%s", WFW_DIR, name);
++	if (wifi_file_size(path, &sz) != 0 || sz == 0 || sz > (16u << 20)) { return NULL; }
++	if (kmem_alloc(kernel_map, &buf, (vm_size_t)sz, KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) { return NULL; }
++	if (wifi_read_file(path, (uint8_t *)buf, (uint32_t)sz, &got) != 0 || got != sz) { kmem_free(kernel_map, buf, (vm_size_t)sz); return NULL; }
++	*size = sz;
++	return (uint8_t *)buf;
++}
++
++static uint8_t *
++wkalloc(uint64_t n)
++{
++	vm_offset_t v = 0;
++	if (kmem_alloc(kernel_map, &v, (vm_size_t)(n ? n : 1u), KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) { return NULL; }
++	return (uint8_t *)v;
++}
++
++static void
++wkfree(uint8_t *p, uint64_t n)
++{
++	if (p != NULL) { kmem_free(kernel_map, (vm_offset_t)p, (vm_size_t)(n ? n : 1u)); }
++}
++
++static void
++wqrtr_close(struct wqrtr_port *p)
++{
++	if (p != NULL) { p->number = 0u; p->receive = NULL; p->context = NULL; }
++}
++
++/* ---- tqftpserv: the firmware files the modem asks for, over TFTP in QRTR datagrams ---- */
++struct wtftp_transfer {
++	struct wqrtr_port *port;
++	uint32_t node, peer;
++	const uint8_t *data;            /* a read: the file, whole (wfw_read, or a wtftp_files entry) */
++	uint64_t size;
++	uint32_t blksize, wsize, rsize, seek, sent, expected;
++	uint8_t *written;               /* a write: what has come */
++	uint32_t written_size;
++	char name[160];
++	bool done, writing, borrowed;
++};
++static struct wtftp_transfer wtftp_transfers[4];
++static struct { char name[160]; uint8_t *data; uint64_t size; } wtftp_files[8];
++static uint32_t wtftp_requests, wtftp_served, wtftp_refused, wservreg_requests;
++
++static void wtftp_transfer_receive(void *ctx, uint32_t node, uint32_t port, const void *data, uint32_t length);
++
++static void
++wtftp_error(struct wqrtr_port *from, uint32_t node, uint32_t port, uint16_t code, const char *text)
++{
++	uint8_t packet[64];
++	size_t n = strlen(text) + 1;
++	if (n > sizeof(packet) - 4) { n = sizeof(packet) - 4; }
++	packet[0] = 0; packet[1] = (uint8_t)WTFTP_ERROR;
++	packet[2] = (uint8_t)(code >> 8); packet[3] = (uint8_t)code;
++	memcpy(packet + 4, text, n); packet[4 + n - 1] = 0;
++	(void)wqrtr_send(from->number, node, port, packet, (uint32_t)(4 + n));
++}
++
++static void
++wtftp_transfer_end(struct wtftp_transfer *t)
++{
++	if (t->data != NULL && !t->borrowed) { wkfree((uint8_t *)(uintptr_t)t->data, t->size); }
++	t->data = NULL;
++	if (t->written != NULL) { wkfree(t->written, WTFTP_WRITE_MAX); t->written = NULL; }
++	if (t->port != NULL) { wqrtr_close(t->port); t->port = NULL; }
++	t->done = true;
++}
++
++/* Blocks `from`+1 onward, a window of them (TFTP blocks are numbered from 1). */
++static void
++wtftp_send_window(struct wtftp_transfer *t, uint32_t from)
++{
++	uint8_t *packet = wkalloc(t->blksize + 4u);
++	uint32_t w;
++	if (packet == NULL) { return; }
++	for (w = 0; w < t->wsize; w++) {
++		uint32_t block = from + 1u + w;
++		uint64_t offset = (uint64_t)t->seek + (uint64_t)(block - 1u) * t->blksize;
++		uint32_t n = offset >= t->size ? 0u : (uint32_t)(t->size - offset < t->blksize ? t->size - offset : t->blksize);
++		if (t->rsize != 0u && (uint64_t)(block - 1u) * t->blksize >= t->rsize) { break; }
++		if (t->rsize != 0u && (uint64_t)block * t->blksize > t->rsize) {
++			uint32_t left = (uint32_t)(t->rsize - (uint64_t)(block - 1u) * t->blksize);
++			n = left < n ? left : n;
++		}
++		packet[0] = 0; packet[1] = (uint8_t)WTFTP_DATA;
++		packet[2] = (uint8_t)(block >> 8); packet[3] = (uint8_t)block;
++		if (n != 0u) { memcpy(packet + 4, t->data + offset, n); }
++		if (wqrtr_send(t->port->number, t->node, t->peer, packet, 4u + n) != 0) { break; }
++		t->sent = block;
++		if (n < t->blksize) { break; }
++	}
++	wkfree(packet, t->blksize + 4u);
++}
++
++static void
++wtftp_transfer_receive(void *ctx, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	struct wtftp_transfer *t = ctx;
++	const uint8_t *m = data;
++	uint16_t opcode, block;
++	if (t->done || node != t->node || port != t->peer || length < 4u) { return; }
++	opcode = (uint16_t)(m[0] << 8 | m[1]);
++	block = (uint16_t)(m[2] << 8 | m[3]);
++	if (t->writing && opcode == WTFTP_DATA) {
++		uint32_t n = length - 4u;
++		uint8_t ack[4] = { 0, (uint8_t)WTFTP_ACK, (uint8_t)(block >> 8), (uint8_t)block };
++		if (block != t->expected) { wtftp_error(t->port, node, port, (uint16_t)WTFTP_EBADOP, "out of sequence"); wtftp_transfer_end(t); return; }
++		if (t->written_size + n > WTFTP_WRITE_MAX) { wtftp_error(t->port, node, port, 3, "too much"); wtftp_transfer_end(t); return; }
++		memcpy(t->written + t->written_size, m + 4, n);
++		t->written_size += n; t->expected++;
++		if (block % t->wsize == 0u || n < t->blksize) { (void)wqrtr_send(t->port->number, node, port, ack, sizeof(ack)); }
++		if (n < t->blksize) {
++			unsigned f, free_slot = 8u;
++			for (f = 0; f < 8u; f++) {
++				if (wtftp_files[f].data != NULL && strcmp(wtftp_files[f].name, t->name) == 0) { break; }
++				if (wtftp_files[f].data == NULL && free_slot == 8u) { free_slot = f; }
++			}
++			if (f == 8u) { f = free_slot; }
++			if (f < 8u) {
++				if (wtftp_files[f].data != NULL) { wkfree(wtftp_files[f].data, wtftp_files[f].size); }
++				wtftp_files[f].data = wkalloc(t->written_size ? t->written_size : 1u);
++				if (wtftp_files[f].data != NULL) {
++					memcpy(wtftp_files[f].data, t->written, t->written_size);
++					wtftp_files[f].size = t->written_size;
++					strlcpy(wtftp_files[f].name, t->name, sizeof(wtftp_files[f].name));
++				}
++			}
++			printf("SWEET WIFI: [14] tftp: modem wrote \"%s\": %u bytes, kept%s\n", t->name, t->written_size, f < 8u ? "" : " NOWHERE");
++			wtftp_served++; wtftp_transfer_end(t);
++		}
++		return;
++	}
++	if (opcode == WTFTP_ERROR) {
++		if (block != WTFTP_END_OF_XFER) { printf("SWEET WIFI: [14] tftp: %s: modem ends with error %u\n", t->name, block); }
++		wtftp_transfer_end(t); return;
++	}
++	if (opcode != WTFTP_ACK) { wtftp_error(t->port, node, port, (uint16_t)WTFTP_EBADOP, "expected ACK"); wtftp_transfer_end(t); return; }
++	if ((uint64_t)t->seek + (uint64_t)block * t->blksize >= t->size || (t->rsize != 0u && (uint64_t)block * t->blksize >= t->rsize)) {
++		wtftp_served++; wtftp_transfer_end(t); return;
++	}
++	wtftp_send_window(t, block);
++}
++
++static const char *
++wtftp_file_of(const char *path)
++{
++	static const char *const prefixes[] = { "/readonly/firmware/image/", "/readonly/vendor/firmware_mnt/image/",
++		"/readonly/vendor/firmware/", "/readonly/firmware/" };
++	unsigned i;
++	for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
++		size_t n = strlen(prefixes[i]);
++		if (strncmp(path, prefixes[i], n) == 0 && strnstr(path + n, "..", strlen(path + n)) == NULL) { return path + n; }
++	}
++	return NULL;
++}
++
++static void
++wtftp_receive(void *ctx, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data, *endp = m + length;
++	const char *name, *mode, *p;
++	struct wtftp_transfer *t = NULL;
++	uint32_t blksize = 512u, wsize = 1u, rsize = 0u, seek = 0u;
++	bool tsize = false, options = false, writing;
++	char fwname[192];
++	uint64_t size = 0;
++	const uint8_t *file;
++	uint8_t oack[192];
++	unsigned at, i;
++	(void)ctx;
++	if (length < 4u) { return; }
++	wtftp_requests++;
++	writing = (uint32_t)(m[0] << 8 | m[1]) == WTFTP_WRQ;
++	if ((uint32_t)(m[0] << 8 | m[1]) != WTFTP_RRQ && !writing) {
++		wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_EBADOP, "not read/write"); wtftp_refused++; return;
++	}
++	name = (const char *)m + 2; p = name;
++	while (p < (const char *)endp && *p != 0) { p++; }
++	if (p >= (const char *)endp) { return; }
++	mode = p + 1; p = mode;
++	while (p < (const char *)endp && *p != 0) { p++; }
++	if (p >= (const char *)endp) { return; }
++	p++;
++	while (p < (const char *)endp) {
++		const char *option = p, *value;
++		while (p < (const char *)endp && *p != 0) { p++; }
++		if (p >= (const char *)endp) { break; }
++		value = ++p;
++		while (p < (const char *)endp && *p != 0) { p++; }
++		if (p >= (const char *)endp) { break; }
++		p++; options = true;
++		if (strcmp(option, "blksize") == 0) { blksize = (uint32_t)strtoul(value, NULL, 10); }
++		else if (strcmp(option, "wsize") == 0) { wsize = (uint32_t)strtoul(value, NULL, 10); }
++		else if (strcmp(option, "rsize") == 0) { rsize = (uint32_t)strtoul(value, NULL, 10); }
++		else if (strcmp(option, "seek") == 0) { seek = (uint32_t)strtoul(value, NULL, 10); }
++		else if (strcmp(option, "tsize") == 0) { tsize = true; }
++	}
++	if (blksize < 8u) { blksize = 8u; }
++	if (blksize > WTFTP_MAX_BLOCK) { blksize = WTFTP_MAX_BLOCK; }
++	if (wsize < 1u) { wsize = 1u; }
++	if (wsize > WTFTP_MAX_WINDOW) { wsize = WTFTP_MAX_WINDOW; }
++	for (i = 0; i < 4u && t == NULL; i++) { if (wtftp_transfers[i].port == NULL) { t = &wtftp_transfers[i]; } }
++	if (t == NULL) { wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_ENOENT, "busy"); wtftp_refused++; return; }
++	if (writing) {
++		bzero(t, sizeof(*t));
++		t->written = wkalloc(WTFTP_WRITE_MAX);
++		t->port = t->written == NULL ? NULL : wqrtr_open(wtftp_transfer_receive, t);
++		if (t->port == NULL) { wtftp_transfer_end(t); wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_ENOENT, "no port"); return; }
++		t->node = node; t->peer = port; t->writing = true; t->expected = 1u; t->blksize = blksize; t->wsize = wsize;
++		strlcpy(t->name, name, sizeof(t->name));
++		printf("SWEET WIFI: [14] tftp: modem writes \"%s\" (blk %u win %u)\n", name, blksize, wsize);
++		if (!options) { uint8_t ack[4] = { 0, (uint8_t)WTFTP_ACK, 0, 0 }; (void)wqrtr_send(t->port->number, node, port, ack, sizeof(ack)); return; }
++		size = 0; goto oack;
++	}
++	file = NULL;
++	for (i = 0; i < 8u && file == NULL; i++) {
++		if (wtftp_files[i].data != NULL && strcmp(wtftp_files[i].name, name) == 0) { file = wtftp_files[i].data; size = wtftp_files[i].size; t->borrowed = true; }
++	}
++	if (file == NULL && wtftp_file_of(name) == NULL) {
++		printf("SWEET WIFI: [14] tftp: modem reads \"%s\": NOT A PATH SERVED HERE\n", name);
++		wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_ENOENT, "not found"); wtftp_refused++; return;
++	}
++	if (file == NULL) { file = wfw_read(wtftp_file_of(name), &size); }
++	if (file == NULL) {
++		printf("SWEET WIFI: [14] tftp: modem reads \"%s\" (fw/%s): NOT HERE -- push it to %s\n", name, wtftp_file_of(name) ? wtftp_file_of(name) : "?", WFW_DIR);
++		wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_ENOENT, "not found"); wtftp_refused++; return;
++	}
++	{ bool borrowed = t->borrowed; bzero(t, sizeof(*t)); t->borrowed = borrowed; }
++	t->port = wqrtr_open(wtftp_transfer_receive, t);
++	if (t->port == NULL) { if (!t->borrowed) { wkfree((uint8_t *)(uintptr_t)file, size); } wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_ENOENT, "no port"); return; }
++	t->node = node; t->peer = port; t->data = file; t->size = size; t->blksize = blksize; t->wsize = wsize; t->rsize = rsize; t->seek = seek;
++	strlcpy(t->name, name, sizeof(t->name));
++	printf("SWEET WIFI: [14] tftp: modem reads \"%s\": %llu bytes (blk %u win %u)\n", name, size, blksize, wsize);
++	if (!options) { wtftp_send_window(t, 0); return; }
++oack:
++	oack[0] = 0; oack[1] = (uint8_t)WTFTP_OACK; at = 2;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "blksize") + 1u;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%u", blksize) + 1u;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "timeoutms") + 1u;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "1000") + 1u;
++	if (tsize && !t->writing) {
++		at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "tsize") + 1u;
++		at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%llu", size) + 1u;
++	}
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "wsize") + 1u;
++	at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%u", wsize) + 1u;
++	if (rsize != 0u) { at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "rsize") + 1u; at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%u", rsize) + 1u; }
++	if (seek != 0u) { at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "seek") + 1u; at += (unsigned)snprintf((char *)oack + at, sizeof(oack) - at, "%u", seek) + 1u; }
++	(void)wqrtr_send(t->port->number, node, port, oack, at);
++}
++
++/* ---- servreg locator (pd-mapper, QMI service 64): which domain provides a named service ---- */
++static struct { char service[48]; char domain[48]; uint32_t instance; } wservreg_map[32];
++static unsigned wservreg_maps;
++
++static const char *
++wjsn_string(const char *from, const char *end, const char *key, char *out, size_t out_size)
++{
++	char quoted[48];
++	const char *at;
++	snprintf(quoted, sizeof(quoted), "\"%s\"", key);
++	at = strnstr(from, quoted, (size_t)(end - from));
++	if (at == NULL) { return NULL; }
++	at += strlen(quoted);
++	while (at < end && (*at == ':' || *at == ' ' || *at == '\t' || *at == '\n' || *at == '\r')) { at++; }
++	if (at >= end) { return NULL; }
++	if (*at == '"') {
++		const char *close = at + 1;
++		while (close < end && *close != '"') { close++; }
++		if (close >= end) { return NULL; }
++		snprintf(out, out_size, "%.*s", (int)(close - at - 1), at + 1);
++		return close + 1;
++	}
++	{ const char *close = at; while (close < end && ((*close >= '0' && *close <= '9') || *close == '-')) { close++; } snprintf(out, out_size, "%.*s", (int)(close - at), at); return close; }
++}
++
++static void
++wservreg_load(void)
++{
++	static const char *const files[] = { "modemr.jsn", "modemuw.jsn", "wlan.jsn", "modem_wlan.jsn", "adspr.jsn", "adsps.jsn", "cdspr.jsn", "slpi_v2.jsn" };
++	unsigned f;
++	wservreg_maps = 0;
++	for (f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
++		char soc[24], domain[24], subdomain[24], instance[16], provider[24], service[24], full[48];
++		uint64_t size = 0;
++		const uint8_t *data = wfw_read(files[f], &size);
++		const char *text, *end, *at;
++		if (data == NULL) { continue; }
++		text = (const char *)data; end = text + size;
++		if (wjsn_string(text, end, "soc", soc, sizeof(soc)) == NULL || wjsn_string(text, end, "domain", domain, sizeof(domain)) == NULL ||
++		    wjsn_string(text, end, "subdomain", subdomain, sizeof(subdomain)) == NULL ||
++		    wjsn_string(text, end, "qmi_instance_id", instance, sizeof(instance)) == NULL) {
++			printf("SWEET WIFI: [14] servreg: %s: not of the shape this reads\n", files[f]); wkfree((uint8_t *)(uintptr_t)data, size); continue;
++		}
++		snprintf(full, sizeof(full), "%s/%s/%s", soc, domain, subdomain);
++		at = text;
++		while (wservreg_maps < sizeof(wservreg_map) / sizeof(wservreg_map[0]) &&
++		    (at = wjsn_string(at, end, "provider", provider, sizeof(provider))) != NULL &&
++		    wjsn_string(at, end, "service", service, sizeof(service)) != NULL) {
++			snprintf(wservreg_map[wservreg_maps].service, sizeof(wservreg_map[0].service), "%s/%s", provider, service);
++			strlcpy(wservreg_map[wservreg_maps].domain, full, sizeof(wservreg_map[0].domain));
++			wservreg_map[wservreg_maps].instance = (uint32_t)strtoul(instance, NULL, 10);
++			wservreg_maps++;
++		}
++		wkfree((uint8_t *)(uintptr_t)data, size);
++	}
++	printf("SWEET WIFI: [14] servreg: %u services from .jsn\n", wservreg_maps);
++	for (f = 0; f < wservreg_maps; f++) { printf("SWEET WIFI: [14] servreg:   %s at %s, instance %u\n", wservreg_map[f].service, wservreg_map[f].domain, wservreg_map[f].instance); }
++}
++
++static void
++wservreg_receive(void *ctx, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data, *value;
++	uint8_t answer[512];
++	uint16_t message, size = 0;
++	unsigned at = 7 + 7, found = 0, i;
++	char wanted[64] = "";
++	(void)ctx;
++	if (length < 7u || m[0] != WQMI_REQUEST) { return; }
++	message = (uint16_t)(m[3] | m[4] << 8);
++	wservreg_requests++;
++	bzero(answer, sizeof(answer));
++	answer[0] = WQMI_RESPONSE; answer[1] = m[1]; answer[2] = m[2]; answer[3] = m[3]; answer[4] = m[4];
++	answer[7] = 2; answer[8] = 4;    /* result: success */
++	if (message == WSERVREG_GET_DOMAIN_LIST) {
++		value = wqmi_tlv(m, length, 1, &size);
++		if (value != NULL) { snprintf(wanted, sizeof(wanted), "%.*s", (int)(size < 63u ? size : 63u), (const char *)value); }
++		for (i = 0; i < wservreg_maps; i++) { found += strcmp(wservreg_map[i].service, wanted) == 0; }
++		answer[at++] = 0x10; answer[at++] = 2; answer[at++] = 0; answer[at++] = (uint8_t)found; answer[at++] = (uint8_t)(found >> 8);
++		answer[at++] = 0x11; answer[at++] = 2; answer[at++] = 0; answer[at++] = 1; answer[at++] = 0;
++		if (found != 0u) {
++			unsigned list = at;
++			answer[at++] = 0x12; at += 2; answer[at++] = (uint8_t)found;
++			for (i = 0; i < wservreg_maps && at + 64u < sizeof(answer); i++) {
++				if (strcmp(wservreg_map[i].service, wanted) != 0) { continue; }
++				answer[at++] = (uint8_t)strlen(wservreg_map[i].domain);
++				memcpy(answer + at, wservreg_map[i].domain, strlen(wservreg_map[i].domain));
++				at += (unsigned)strlen(wservreg_map[i].domain);
++				{ unsigned b; for (b = 0; b < 4u; b++) { answer[at++] = (uint8_t)(wservreg_map[i].instance >> (8 * b)); } }
++				answer[at++] = 0; at += 4;
++			}
++			answer[list + 1] = (uint8_t)(at - list - 3);
++			answer[list + 2] = (uint8_t)((at - list - 3) >> 8);
++		}
++		printf("SWEET WIFI: [14] servreg: modem asks where \"%s\" is: %u domain%s\n", wanted, found, found == 1u ? "" : "s");
++	} else if (message == WSERVREG_PFR) {
++		value = wqmi_tlv(m, length, 1, &size);
++		printf("SWEET WIFI: [14] servreg: modem reports a failure of \"%.*s\"\n", value ? (int)(size < 63u ? size : 63u) : 0, value ? (const char *)value : "");
++	} else {
++		printf("SWEET WIFI: [14] servreg: request %#x not known\n", message);
++		answer[10] = WQMI_RESULT_FAILURE; answer[12] = WQMI_ERR_MALFORMED;
++	}
++	answer[5] = (uint8_t)(at - 7); answer[6] = (uint8_t)((at - 7) >> 8);
++	(void)wqrtr_send(wservreg_port->number, node, port, answer, at);
++}
++
 +static void
 +wrmtfs_start(void)
 +{
@@ -7726,6 +8120,18 @@
 +	wour_servers[0].instance = 1u;   /* RMTFS_VERSION(1) | RMTFS_INSTANCE(0)<<8 */
 +	wour_servers[0].port = wrmtfs_port->number;
 +	printf("SWEET WIFI: [13] rmtfs: server registered (service 14, instance 1, port %u)\n", wrmtfs_port->number);
++	if (wifi_level >= 14) {   /* M3b/M3c: the modem needs tftp + the locator to spawn wlan_pd */
++		if (wtftp_port == NULL) { wtftp_port = wqrtr_open(wtftp_receive, NULL); }
++		if (wtftp_port != NULL) {
++			wour_servers[1].service = WTFTP_SERVICE; wour_servers[1].instance = 1u; wour_servers[1].port = wtftp_port->number;
++			printf("SWEET WIFI: [14] tqftpserv: server registered (service 4096, instance 1, port %u)\n", wtftp_port->number);
++		}
++		if (wservreg_port == NULL) { wservreg_port = wqrtr_open(wservreg_receive, NULL); }
++		if (wservreg_port != NULL) {
++			wour_servers[2].service = WSERVREG_SERVICE; wour_servers[2].instance = WSERVREG_INSTANCE; wour_servers[2].port = wservreg_port->number;
++			printf("SWEET WIFI: [14] servreg: locator registered (service 64, instance 257, port %u)\n", wservreg_port->number);
++		}
++	}
 +}
 +
 +

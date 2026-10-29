@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6806 @@
+@@ -0,0 +1,6843 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5813,6 +5813,7 @@
 + * signs of life. Still no HLOS services yet (QRTR/rmtfs = M2/M3), so the modem may idle or crash after a
 + * few seconds -- that is expected; the milestone here is auth_and_reset(4)=0 = out of reset. */
 +#define WMODEM_SCM_AUTH_RESET 0x42000205ull
++static void wifi_modem_liveness(void);   /* defined after the wsmem helpers */
 +static void
 +wifi_modem_release(void)
 +{
@@ -5831,23 +5832,23 @@
 +	(void)wifi_rpmh_vote("mss.lvl");
 +	delay_for_interval(20, NSEC_PER_MSEC);
 +
-+	if (!(mio = ml_io_map(0x93400000ull, 0x4000))) { printf("SWEET WIFI: [8] cannot map mdt stage\n"); return; }
++	if (!(mio = ml_io_map(0x93400000ull, 0x4000))) { printf("SWEET WIFI: [8] cannot map mdt stage\n"); goto fail_off; }
 +	for (i = 0; i < mdtsz; i++) { ((volatile unsigned char *)mio)[i] = wifi_mdt[i]; }
 +	__asm__ volatile("dsb sy" ::: "memory"); gmub_flush();
 +	x1 = 0; x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, 0x93400000ull, 0, &x1);
 +	printf("SWEET WIFI: [8] init_image(4) -> x0=%#llx\n", (unsigned long long)x0);
-+	if (x0 != 0u) { printf("SWEET WIFI: [8] init_image rejected -- stop; modem in reset\n"); return; }
++	if (x0 != 0u) { printf("SWEET WIFI: [8] init_image rejected -- stop; modem in reset\n"); goto fail_off; }
 +	x1 = 0; x0 = gpu_scm_pas(WMODEM_SCM_MEM_SETUP, 0x03u, (uint64_t)WMODEM_PAS_ID, (uint64_t)WMODEM_REGION_PA, (uint64_t)WMODEM_REGION_SIZE, &x1);
 +	printf("SWEET WIFI: [8] mem_setup(4) -> x0=%#llx\n", (unsigned long long)x0);
-+	if (x0 != 0u) { printf("SWEET WIFI: [8] mem_setup refused -- stop; modem in reset\n"); return; }
++	if (x0 != 0u) { printf("SWEET WIFI: [8] mem_setup refused -- stop; modem in reset\n"); goto fail_off; }
 +
 +	if (!(region = ml_io_map((vm_offset_t)WMODEM_REGION_PA, (vm_size_t)WMODEM_REGION_SIZE))) {
-+		printf("SWEET WIFI: [8] cannot map the modem region -- stop (authenticated, in reset)\n"); return;
++		printf("SWEET WIFI: [8] cannot map the modem region -- stop (authenticated, in reset)\n"); goto fail_off;
 +	}
 +	/* CACHEABLE staging buffer: vn_rdwr does word/vector copies that fault on device (ml_io_map) memory
 +	 * (ESR 0x96000061 unaligned abort -- that panicked wifi13). gmub_alloc_phys gives a cacheable VA. */
 +	if (gmub_alloc_phys(&stage_cva, &stage_pa, 0x400000) != 0) {
-+		printf("SWEET WIFI: [8] cannot get 4 MiB segment staging buffer -- stop\n"); return;
++		printf("SWEET WIFI: [8] cannot get 4 MiB segment staging buffer -- stop\n"); goto fail_off;
 +	}
 +	(void)stage_pa;
 +	phnum = (uint32_t)(wifi_mdt[44] | wifi_mdt[45] << 8);
@@ -5871,7 +5872,7 @@
 +			uint32_t c8 = (chunk + 7u) & ~7u;
 +			if (wifi_read_file_at(path, (uint8_t *)stage_cva, chunk, (off_t)done, &got) != 0 || got != (uint64_t)chunk) {
 +				printf("SWEET WIFI: [8] seg %u: read %s @%llu failed (%llu/%u) -- stop\n",
-+				    s, path, (unsigned long long)done, (unsigned long long)got, chunk); return;
++				    s, path, (unsigned long long)done, (unsigned long long)got, chunk); goto fail_off;
 +			}
 +			for (j = chunk; j < c8; j++) { ((unsigned char *)stage_cva)[j] = 0; }
 +			for (j = 0; j < c8; j += 8u) { *(volatile uint64_t *)(dst + done + j) = *(uint64_t *)(stage_cva + j); }
@@ -5890,7 +5891,7 @@
 +	x1 = 0; x0 = gpu_scm_pas(WMODEM_SCM_AUTH_RESET, 0x01u, (uint64_t)WMODEM_PAS_ID, 0, 0, &x1);
 +	printf("SWEET WIFI: [8] PAS auth_and_reset(4) -> x0=%#llx x1=%#llx  %s\n", (unsigned long long)x0, (unsigned long long)x1,
 +	    x0 == 0u ? "<<<<< MODEM RELEASED (out of reset)!" : "(FAILED -- modem did not start)");
-+	if (x0 != 0u) { printf("SWEET WIFI: [8] auth_and_reset failed; power left on; modem not running\n"); return; }
++	if (x0 != 0u) { printf("SWEET WIFI: [8] auth_and_reset failed; modem not running\n"); goto fail_off; }
 +
 +	(void)wifi_map_blocks();
 +	printf("SWEET WIFI: [8] modem out of reset -- watching APCS doorbell ~5 s (bit0=AOP, 14=modem SMP2P, 12=GLINK)\n");
@@ -5900,7 +5901,12 @@
 +			printf("SWEET WIFI: [8]   +%dms APCS doorbell=%#x\n", (t + 1) * 500, wmmio_rd32(wapcs_base, WAPCS_IPC_PHYS & 0xfffu));
 +		}
 +	}
++	wifi_modem_liveness();          /* did the modem actually run? (did it write its SMP2P item into SMEM?) */
 +	printf("SWEET WIFI: [8] release attempt done; modem left powered. If up, GLINK/QRTR (M2) is next.\n");
++	return;
++fail_off:
++	/* stopped before the modem is running -- drop the AOP load_state so nothing is left half-armed */
++	(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: off}");
 +}
 +
 +/* ipa_fws.mdt (pas-id 15), extracted byte-exact from davinci vendor /firmware/ipa_fws.mdt,
@@ -6611,6 +6617,37 @@
 +	}
 +
 +	wifi_mailbox_survey();
++}
++
++/* Did the modem actually run after auth_and_reset? A modem that boots writes its SMP2P item (428) and,
++ * if it crashes, its last words (421) into the (0,1) SMEM partition -- which the step-1 survey saw EMPTY
++ * (0 items) before release. Re-read it so we know "released and ran briefly" vs "released and dead". */
++static void
++wifi_modem_liveness(void)
++{
++	uint32_t cl = 0, size = 0, part, found[64][3];
++	unsigned n, k;
++	delay_for_interval(200, NSEC_PER_MSEC);
++	part = wsmem_partition(WSMEM_US, WSMEM_MODEM, &cl, &size);
++	n = wsmem_items(part, cl, found, 64);
++	printf("SWEET WIFI: [8] post-release SMEM re-survey: (0,1) modem/APSS partition %s, %u items (was 0 before release)\n",
++	    part ? "there" : "NOT THERE", n);
++	for (k = 0; k < n; k++) {
++		if (found[k][0] == 428u) {
++			uint32_t w[5] = { 0, 0, 0, 0, 0 };
++			(void)wsmem_peek(found[k][1], w, sizeof(w));
++			printf("SWEET WIFI: [8]   >>> MODEM RAN: SMP2P item 428 present (magic %#x version %#x) <<<\n", w[0], w[1]);
++		} else if (found[k][0] == 421u) {
++			char text[84];
++			uint32_t len = found[k][2] < 80u ? found[k][2] : 80u;
++			(void)wsmem_peek(found[k][1], text, len);
++			text[len] = 0;
++			printf("SWEET WIFI: [8]   modem last words (421): \"%s\"\n", text);
++		}
++	}
++	if (n == 0u) {
++		printf("SWEET WIFI: [8] modem wrote nothing to SMEM -- did not reach SMP2P (needs GLINK/QRTR + rmtfs, M2/M3)\n");
++	}
 +}
 +
 +/*

@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,7898 @@
+@@ -0,0 +1,7922 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5818,8 +5818,7 @@
 +static void wifi_glink_attach(void);     /* M2b: GLINK FIFO attach */
 +static void wifi_glink_link(void);       /* M2c: GLINK version + open IPCRTR */
 +static void wrmtfs_load(void);           /* M3a: rmtfs (defined after wifi_glink_link) */
-+static bool wrmtfs_buffer_make(void);
-+static bool wrmtfs_share(bool in);
++static bool wrmtfs_setup(void);
 +static void wrmtfs_start(void);
 +static void
 +wifi_modem_release(void)
@@ -5851,7 +5850,7 @@
 +
 +	if (wifi_level >= 13) {   /* M3a: read EFS partitions, map the rmtfs buffer, TZ-assign it to the modem (before auth) */
 +		wrmtfs_load();
-+		if (wrmtfs_buffer_make()) { (void)wrmtfs_share(true); }
++		(void)wrmtfs_setup();
 +	}
 +
 +	if (!(region = ml_io_map((vm_offset_t)WMODEM_REGION_PA, (vm_size_t)WMODEM_REGION_SIZE))) {
@@ -7506,65 +7505,90 @@
 +	return (uint32_t)(p[0] | p[1] << 8 | p[2] << 16 | p[3] << 24);
 +}
 +
++/* Candidate rmtfs buffers: no-map carveouts for subsystems NOT started under iOS (so still HLOS-owned and
++ * assignable). hakios assigns the CDSP region on redwood; we sweep because wifi20's EINVAL(-2) can mean
++ * either a non-HLOS region OR the NAV(0x2b) destination vmid being unsupported on davinci. First wins. */
++static const struct { uint64_t pa; const char *name; } wrmtfs_candidates[] = {
++	{ 0x93900000ull, "cdsp_region" },       /* compute DSP not started here -- hakios's choice on redwood */
++	{ 0x9f800000ull, "cdsp_sec_region" },
++	{ 0x95700000ull, "pil_adsp_region" },   /* what wifi20 tried (with NAV) -> EINVAL */
++	{ 0x93400000ull, "pil_video_region" },
++};
++
++/* Map a 2 MiB window at pa as the rmtfs buffer and zero it (HLOS keeps RW after the assign, so this is
++ * fine before or after sharing). */
 +static bool
-+wrmtfs_buffer_make(void)
++wrmtfs_map(uint64_t pa)
 +{
 +	uint32_t i;
-+	uint64_t bp = 0;
-+	if (wrmtfs_window != NULL) { return true; }
-+	wrmtfs_buffer_pa = WRMTFS_BUFFER_PA_DEF;
-+	if (PE_parse_boot_argn("modem_buffer", &bp, sizeof(bp)) && bp != 0) { wrmtfs_buffer_pa = bp; }
-+	wrmtfs_window = (volatile uint8_t *)ml_io_map_wcomb(wrmtfs_buffer_pa, WRMTFS_BUFFER_SIZE);
-+	if (wrmtfs_window == NULL) { printf("SWEET WIFI: [13] rmtfs: cannot map buffer at %#llx\n", wrmtfs_buffer_pa); return false; }
++	wrmtfs_window = (volatile uint8_t *)ml_io_map_wcomb(pa, WRMTFS_BUFFER_SIZE);
++	if (wrmtfs_window == NULL) { return false; }
 +	wrmtfs_buffer = (vm_offset_t)wrmtfs_window;
++	wrmtfs_buffer_pa = pa;
 +	for (i = 0; i < WRMTFS_BUFFER_SIZE; i += 8u) { *(volatile uint64_t *)(wrmtfs_window + i) = 0; }
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	printf("SWEET WIFI: [13] rmtfs: buffer %u bytes at %#llx\n", WRMTFS_BUFFER_SIZE, wrmtfs_buffer_pa);
 +	return true;
 +}
 +
-+/* TZ mem-assign (Linux qcom_scm_assign_mem). in=true: HLOS -> {HLOS,MSS,NAV} rw. */
-+static bool
-+wrmtfs_share(bool in)
++/* One TZ mem-assign (Linux qcom_scm_assign_mem) of [buf_pa, 2 MiB): HLOS -> {HLOS,MSS[,NAV]} rw. Returns
++ * the SCM result (0 = ok) and fills *answer. Builds a fresh descriptor; keeps no state on failure. */
++static int32_t
++wrmtfs_assign(uint64_t buf_pa, bool with_nav, uint64_t *answer)
 +{
 +	vm_offset_t cva = 0;
-+	uint64_t pa = 0, answer = ~0ull;
++	uint64_t pa = 0;
 +	uint8_t *page;
-+	unsigned sources, destinations, i;
-+	int32_t result;
-+	if (wrmtfs_buffer == 0 || wrmtfs_shared == in) { return wrmtfs_buffer != 0; }
-+	if (gmub_alloc_phys(&cva, &pa, PAGE_SIZE) != 0) { printf("SWEET WIFI: [13] rmtfs: no page for assign descriptor\n"); return false; }
++	unsigned destinations, i;
++	*answer = ~0ull;
++	if (gmub_alloc_phys(&cva, &pa, PAGE_SIZE) != 0) { return -1; }
 +	page = (uint8_t *)cva;
 +	for (i = 0; i < PAGE_SIZE; i += 8u) { *(volatile uint64_t *)(page + i) = 0; }
-+	*(volatile uint64_t *)(page + 0) = wrmtfs_buffer_pa;
++	*(volatile uint64_t *)(page + 0) = buf_pa;                      /* the memory */
 +	*(volatile uint64_t *)(page + 8) = WRMTFS_BUFFER_SIZE;
-+	if (in) {
-+		*(volatile uint32_t *)(page + 64) = WVMID_HLOS;
-+		sources = 1;
-+		*(volatile uint32_t *)(page + 128 + 0) = WVMID_HLOS;    *(volatile uint32_t *)(page + 128 + 4) = WVM_PERM_RW;
-+		*(volatile uint32_t *)(page + 128 + 24 + 0) = WVMID_MSS_MSA; *(volatile uint32_t *)(page + 128 + 24 + 4) = WVM_PERM_RW;
-+		*(volatile uint32_t *)(page + 128 + 48 + 0) = WVMID_NAV; *(volatile uint32_t *)(page + 128 + 48 + 4) = WVM_PERM_RW;
++	*(volatile uint32_t *)(page + 64) = WVMID_HLOS;                 /* sources: HLOS alone */
++	*(volatile uint32_t *)(page + 128 + 0)  = WVMID_HLOS;    *(volatile uint32_t *)(page + 128 + 4)  = WVM_PERM_RW;
++	*(volatile uint32_t *)(page + 128 + 24) = WVMID_MSS_MSA; *(volatile uint32_t *)(page + 128 + 28) = WVM_PERM_RW;
++	destinations = 2;
++	if (with_nav) {
++		*(volatile uint32_t *)(page + 128 + 48) = WVMID_NAV; *(volatile uint32_t *)(page + 128 + 52) = WVM_PERM_RW;
 +		destinations = 3;
-+	} else {
-+		*(volatile uint32_t *)(page + 64 + 0) = WVMID_HLOS;
-+		*(volatile uint32_t *)(page + 64 + 4) = WVMID_MSS_MSA;
-+		*(volatile uint32_t *)(page + 64 + 8) = WVMID_NAV;
-+		sources = 3;
-+		*(volatile uint32_t *)(page + 128 + 0) = WVMID_HLOS; *(volatile uint32_t *)(page + 128 + 4) = WVM_PERM_RW;
-+		destinations = 1;
 +	}
-+	*(volatile uint64_t *)(page + 240 + 0) = (uint64_t)sources * 4u;
-+	*(volatile uint64_t *)(page + 240 + 8) = pa + 128u;
-+	*(volatile uint64_t *)(page + 240 + 16) = (uint64_t)destinations * 24u;
++	*(volatile uint64_t *)(page + 240 + 0)  = 1u * 4u;                        /* arg3: sources size */
++	*(volatile uint64_t *)(page + 240 + 8)  = pa + 128u;                      /* arg4: destinations */
++	*(volatile uint64_t *)(page + 240 + 16) = (uint64_t)destinations * 24u;   /* arg5: their size */
 +	*(volatile uint64_t *)(page + 240 + 24) = 0;
 +	gpu_dcache_clean(cva, PAGE_SIZE);
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	result = wifi_scm4(0xc16ull, 0x1117ull, pa, 16, pa + 64u, pa + 240u, &answer);
-+	printf("SWEET WIFI: [13] rmtfs: SCM mem-assign(%s) -> ret=%d answer=%#llx\n", in ? "share" : "reclaim", result, (unsigned long long)answer);
-+	if (result != 0 || answer != 0) { printf("SWEET WIFI: [13] rmtfs: TZ did NOT %s the buffer\n", in ? "share" : "reclaim"); return false; }
-+	wrmtfs_shared = in;
-+	printf("SWEET WIFI: [13] rmtfs: %s\n", in ? ">>> THE MODEM MAY USE THE BUFFER <<<" : "buffer reclaimed by HLOS");
-+	return true;
++	return wifi_scm4(0xc16ull, 0x1117ull, pa, 16, pa + 64u, pa + 240u, answer);
++}
++
++/* Find a carveout TZ will assign to the modem, map it, keep it. Sets wrmtfs_shared on success. NAV-off is
++ * tried first (NAV is the likelier cause of EINVAL). modem_buffer=PA pins one region. */
++static bool
++wrmtfs_setup(void)
++{
++	uint64_t bp = 0, answer;
++	int32_t result;
++	unsigned c, pass, n = sizeof(wrmtfs_candidates) / sizeof(wrmtfs_candidates[0]);
++	bool pinned = PE_parse_boot_argn("modem_buffer", &bp, sizeof(bp)) && bp != 0;
++	for (c = 0; c < (pinned ? 1u : n); c++) {
++		uint64_t pa = pinned ? bp : wrmtfs_candidates[c].pa;
++		const char *nm = pinned ? "modem_buffer" : wrmtfs_candidates[c].name;
++		for (pass = 0; pass < 2u; pass++) {
++			bool nav = pass == 1;
++			result = wrmtfs_assign(pa, nav, &answer);
++			printf("SWEET WIFI: [13] rmtfs: assign %s %#llx %s -> ret=%d answer=%#llx\n",
++			    nm, (unsigned long long)pa, nav ? "+NAV" : "no-NAV", result, (unsigned long long)answer);
++			if (result == 0 && answer == 0 && wrmtfs_map(pa)) {
++				wrmtfs_shared = true;
++				printf("SWEET WIFI: [13] rmtfs: >>> THE MODEM MAY USE THE BUFFER at %s %#llx (%s) <<<\n",
++				    nm, (unsigned long long)pa, nav ? "with NAV" : "no NAV");
++				return true;
++			}
++		}
++	}
++	printf("SWEET WIFI: [13] rmtfs: no region accepted by TZ -- buffer NOT shared\n");
++	return false;
 +}
 +
 +static void

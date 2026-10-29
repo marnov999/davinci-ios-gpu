@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6771 @@
+@@ -0,0 +1,6780 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5799,7 +5799,7 @@
 +	char path[64];
 +	uint64_t x0, x1 = 0, i, mdtsz = wifi_mdt_size;
 +	uint32_t phnum, phoff, copied = 0;
-+	vm_offset_t mio, region = 0, stage_cva = 0, stage_io = 0;
++	vm_offset_t mio, region = 0, stage_cva = 0;
 +	uint64_t stage_pa = 0;
 +
 +	printf("SWEET WIFI: [8] RELEASE THE MODEM (reset-risk): init_image + mem_setup + segment copy + auth_and_reset\n");
@@ -5824,28 +5824,37 @@
 +	if (!(region = ml_io_map((vm_offset_t)WMODEM_REGION_PA, (vm_size_t)WMODEM_REGION_SIZE))) {
 +		printf("SWEET WIFI: [8] cannot map the modem region -- stop (authenticated, in reset)\n"); return;
 +	}
-+	if (gmub_alloc_phys(&stage_cva, &stage_pa, 0x400000) != 0 || !(stage_io = ml_io_map(stage_pa, 0x400000))) {
++	/* CACHEABLE staging buffer: vn_rdwr does word/vector copies that fault on device (ml_io_map) memory
++	 * (ESR 0x96000061 unaligned abort -- that panicked wifi13). gmub_alloc_phys gives a cacheable VA. */
++	if (gmub_alloc_phys(&stage_cva, &stage_pa, 0x400000) != 0) {
 +		printf("SWEET WIFI: [8] cannot get 4 MiB segment staging buffer -- stop\n"); return;
 +	}
++	(void)stage_pa;
 +	phnum = (uint32_t)(wifi_mdt[44] | wifi_mdt[45] << 8);
 +	phoff = (uint32_t)(wifi_mdt[28] | wifi_mdt[29] << 8 | wifi_mdt[30] << 16 | wifi_mdt[31] << 24);
 +	printf("SWEET WIFI: [8] copying loadable segments into %#x..\n", WMODEM_REGION_PA);
 +	for (uint32_t s = 0; s < phnum; s++) {
 +		struct wmdt_phdr ph;
-+		uint64_t got = 0, j;
++		uint64_t got = 0, j, fcopy;
 +		vm_offset_t dst;
 +		memcpy(&ph, wifi_mdt + phoff + 32u * s, sizeof(ph));
 +		if (ph.type != 1u || WMDT_HASH(ph.flags) || ph.memsz == 0u) { continue; }
-+		dst = region + ((vm_offset_t)ph.paddr - (vm_offset_t)WMODEM_REGION_PA);
++		dst = region + ((vm_offset_t)ph.paddr - (vm_offset_t)WMODEM_REGION_PA);   /* paddr is page-aligned */
 +		if (ph.filesz != 0u) {
 +			if (ph.filesz > 0x400000u) { printf("SWEET WIFI: [8] seg %u filesz %#x > 4 MiB -- stop\n", s, ph.filesz); return; }
 +			snprintf(path, sizeof(path), "%smodem.b%02u", WMDT_DIR, s);
-+			if (wifi_read_file(path, (uint8_t *)stage_io, ph.filesz, &got) != 0 || got != (uint64_t)ph.filesz) {
++			if (wifi_read_file(path, (uint8_t *)stage_cva, ph.filesz, &got) != 0 || got != (uint64_t)ph.filesz) {
 +				printf("SWEET WIFI: [8] seg %u: read %s failed (%llu/%u) -- stop\n", s, path, (unsigned long long)got, ph.filesz); return;
 +			}
-+			for (j = 0; j < ph.filesz; j++) { ((volatile unsigned char *)dst)[j] = ((volatile unsigned char *)stage_io)[j]; }
 +		}
-+		for (j = ph.filesz; j < ph.memsz; j++) { ((volatile unsigned char *)dst)[j] = 0; }
++		/* copy file bytes to the NC region in aligned 8-byte writes (device memory forbids unaligned);
++		 * pad the stage tail to 8 so the rounded copy lands clean inside the bss, then zero to memsz. */
++		fcopy = (ph.filesz + 7ull) & ~7ull;
++		if (fcopy > ph.memsz) { fcopy = ph.memsz; }
++		for (j = ph.filesz; j < fcopy; j++) { ((unsigned char *)stage_cva)[j] = 0; }
++		for (j = 0; j + 8u <= fcopy; j += 8u) { *(volatile uint64_t *)(dst + j) = *(uint64_t *)(stage_cva + j); }
++		for (; j + 8u <= ph.memsz; j += 8u) { *(volatile uint64_t *)(dst + j) = 0ull; }
++		for (; j < ph.memsz; j++) { ((volatile unsigned char *)dst)[j] = 0; }
 +		__asm__ volatile("dsb sy" ::: "memory");
 +		copied++;
 +	}

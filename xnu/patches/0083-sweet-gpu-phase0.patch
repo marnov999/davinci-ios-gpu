@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6845 @@
+@@ -0,0 +1,7032 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5814,6 +5814,7 @@
 + * few seconds -- that is expected; the milestone here is auth_and_reset(4)=0 = out of reset. */
 +#define WMODEM_SCM_AUTH_RESET 0x42000205ull
 +static void wifi_modem_liveness(void);   /* defined after the wsmem helpers */
++static void wifi_smp2p_up(void);         /* M2a: SMP2P bring-up, defined after the wsmem helpers */
 +static void
 +wifi_modem_release(void)
 +{
@@ -6448,6 +6449,9 @@
 +			if (wifi_firmware_read_validate() && wifi_level >= 4) {
 +				if (wifi_level >= 8) {
 +					wifi_modem_release();   /* sweetwifi=8: segment copy + auth_and_reset -- RELEASE the modem (reset-risk) */
++					if (wifi_level >= 9) {
++						wifi_smp2p_up();        /* sweetwifi=9: M2a -- SMP2P handshake to DSP_READY */
++					}
 +				} else if (wifi_level == 7) {
 +					wifi_ddr_sweep();       /* sweetwifi=7: DDR-location sweep -- find a PA TZ accepts (AC_ERR_NOT_DDR_MEMORY) */
 +				} else {
@@ -6650,6 +6654,189 @@
 +	if (n == 0u) {
 +		printf("SWEET WIFI: [8] modem wrote nothing to SMEM -- did not reach SMP2P (needs GLINK/QRTR + rmtfs, M2/M3)\n");
 +	}
++}
++
++/* ---- M2a: SMP2P bring-up (sweetwifi=9) ------------------------------------------------------------
++ * Port of HackiOS hakios.mpss.c our_item_make/step_our_item/dsp_listen for davinci. The modem, out of
++ * reset, creates item 435 (its SMP2P, magic $SMP) + the GLINK descriptor/ring. We allocate OUR item 428
++ * under the SMEM hardware mutex, fill the smp2p struct (entry "master-kernel"), ring the modem (APCS
++ * 0x17c0000c bit 14), then poll 435 and run the Linux handshake until its "slave-kernel" entry reads
++ * DSP_READY (0x2). davinci TCSR mutex (dt: hwlock syscon@1f40000, SMEM hwlock index 3) = 0x1f43000. */
++#define WSMEM_LOCK_PHYS       0x01f43000u
++#define WSMEM_LOCK_US         1u
++#define WSMP2P_MAGIC          0x504d5324u
++#define WSMP2P_VERSION        1u
++#define WSMP2P_RESTART_ACKS   1u
++#define WSMP2P_RESTART_DONE   (1u << 0)
++#define WSMP2P_RESTART_ACK    (1u << 1)
++#define WSMP2P_AT_VERSION     4u
++#define WSMP2P_AT_PROCESSORS  8u
++#define WSMP2P_AT_COUNTS      12u
++#define WSMP2P_AT_FLAGS       16u
++#define WSMP2P_AT_NAME(i)     (20u + 20u * (i))
++#define WSMP2P_AT_VALUE(i)    (36u + 20u * (i))
++#define WDSP_FATAL            (1u << 0)
++#define WDSP_READY            (1u << 1)
++#define WITEM_SMP2P_OURS      428u
++#define WITEM_SMP2P_THEIRS    435u
++struct wsmp2p { uint32_t magic, version; uint16_t local, remote, total, valid; uint32_t flags;
++	struct { char name[16]; uint32_t value; } entry[16]; };
++static vm_offset_t wsmem_lock_base;
++static uint32_t    wour_item;
++
++static void
++wsmem_poke(uint32_t off, uint32_t val)
++{
++	if (!wsmem) { wsmem = (volatile uint8_t *)ml_io_map_wcomb(WSMEM_PHYS, WSMEM_SIZE); }
++	if (wsmem && (uint64_t)off + 4u <= WSMEM_SIZE) {
++		*(volatile uint32_t *)(wsmem + off) = val;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++}
++
++static uint32_t
++wsmem_item_off(uint32_t item, uint32_t *size)
++{
++	uint32_t cl = 0, psz = 0, part, found[64][3];
++	unsigned n, i;
++	part = wsmem_partition(WSMEM_US, WSMEM_MODEM, &cl, &psz);
++	n = wsmem_items(part, cl, found, 64);
++	for (i = 0; i < n; i++) {
++		if (found[i][0] == item) { *size = found[i][2]; return found[i][1]; }
++	}
++	return 0;
++}
++
++static void
++wifi_ring_modem(uint32_t bit)
++{
++	if (!wapcs_base) { (void)wifi_map_blocks(); }
++	if (wapcs_base) { wmmio_wr32(wapcs_base, WAPCS_IPC_PHYS & 0xfffu, 1u << bit); }
++}
++
++/* Allocate a private SMEM item in the (US,MPSS) partition under the hardware mutex (Linux qcom_smem_alloc_private). */
++static bool
++wour_item_make(uint32_t partition, uint32_t item, uint32_t bytes)
++{
++	struct wsmem_partition header;
++	struct wsmem_entry entry;
++	uint32_t item_size = (bytes + 7u) & ~7u, need_bytes = (uint32_t)sizeof(entry) + item_size;
++	uint32_t owner = ~0u, at, ms, z;
++	bool made = false;
++	if (!wsmem_lock_base) { wsmem_lock_base = ml_io_map(WSMEM_LOCK_PHYS, 0x1000u); }
++	if (!wsmem_lock_base) { printf("SWEET WIFI: [9] cannot map the SMEM mutex\n"); return false; }
++	for (ms = 0; ms <= 1000u; ms++) {
++		*(volatile uint32_t *)wsmem_lock_base = WSMEM_LOCK_US;
++		__asm__ volatile("dsb sy" ::: "memory");
++		owner = *(volatile uint32_t *)wsmem_lock_base;
++		if (owner == WSMEM_LOCK_US) { break; }
++		delay_for_interval(1, NSEC_PER_MSEC);
++	}
++	if (owner != WSMEM_LOCK_US) { printf("SWEET WIFI: [9] SMEM mutex held by %u for 1s -- not writing\n", owner); return false; }
++	if (!wsmem_peek(partition, &header, sizeof(header)) || header.free_uncached > header.free_cached ||
++	    header.free_cached > header.size) {
++		printf("SWEET WIFI: [9] partition marks make no sense -- not writing\n"); goto out;
++	}
++	for (at = (uint32_t)sizeof(header); at < header.free_uncached;) {
++		if (!wsmem_peek(partition + at, &entry, sizeof(entry)) || entry.canary != WSMEM_CANARY || entry.item == item ||
++		    entry.size > header.size) { break; }
++		at += (uint32_t)sizeof(entry) + entry.padding_header + entry.size;
++	}
++	if (at != header.free_uncached) {
++		printf("SWEET WIFI: [9] entries don't end at the mark (at %#x, mark %#x) -- not writing\n", at, header.free_uncached); goto out;
++	}
++	if (at + need_bytes > header.free_cached) {
++		printf("SWEET WIFI: [9] no room (%u wanted, %u free) -- not writing\n", need_bytes, header.free_cached - at); goto out;
++	}
++	wsmem_poke(partition + at, (uint32_t)WSMEM_CANARY | item << 16);
++	wsmem_poke(partition + at + 4u, item_size);
++	wsmem_poke(partition + at + 8u, item_size - bytes);
++	for (z = 0; z < item_size; z += 4u) { wsmem_poke(partition + at + (uint32_t)sizeof(entry) + z, 0); }
++	wsmem_poke(partition + at + 12u, 0);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wsmem_poke(partition + (uint32_t)__builtin_offsetof(struct wsmem_partition, free_uncached), at + need_bytes);
++	__asm__ volatile("dsb sy" ::: "memory");
++	made = true;
++out:
++	*(volatile uint32_t *)wsmem_lock_base = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	return made;
++}
++
++static uint32_t
++wsmp2p_state(const struct wsmp2p *w)
++{
++	unsigned i;
++	for (i = 0; i < w->valid && i < 16u; i++) {
++		if (strncmp(w->entry[i].name, "slave-kernel", 16) == 0) { return w->entry[i].value; }
++	}
++	return 0;
++}
++
++static void
++wifi_smp2p_up(void)
++{
++	uint32_t cl = 0, psz = 0, part, osz = 0, name[4] = { 0 }, a, w;
++	struct wsmp2p ours, theirs;
++	bool agreed = false, acked = false;
++	int t;
++
++	printf("SWEET WIFI: [9] M2a SMP2P: allocate item 428, fill it, ring modem (bit 14), handshake item 435 -> DSP_READY\n");
++	part = wsmem_partition(WSMEM_US, WSMEM_MODEM, &cl, &psz);
++	if (part == 0u) { printf("SWEET WIFI: [9] no (0,1) partition\n"); return; }
++	wour_item = wsmem_item_off(WITEM_SMP2P_OURS, &osz);
++	if (wour_item != 0u) {
++		printf("SWEET WIFI: [9] item 428 already present at off %#x (reused)\n", wour_item);
++	} else {
++		if (!wour_item_make(part, WITEM_SMP2P_OURS, (uint32_t)sizeof(struct wsmp2p))) { return; }
++		wour_item = wsmem_item_off(WITEM_SMP2P_OURS, &osz);
++		if (wour_item == 0u) { printf("SWEET WIFI: [9] item 428 not found after make\n"); return; }
++		printf("SWEET WIFI: [9] item 428 MADE at off %#x (%u bytes)\n", wour_item, osz);
++	}
++	for (a = 0; a < sizeof(struct wsmp2p); a += 4u) { wsmem_poke(wour_item + a, 0); }
++	__asm__ volatile("dsb sy" ::: "memory");
++	wsmem_poke(wour_item, WSMP2P_MAGIC);
++	wsmem_poke(wour_item + WSMP2P_AT_PROCESSORS, (uint32_t)WSMEM_US | (uint32_t)WSMEM_MODEM << 16);
++	strlcpy((char *)name, "master-kernel", sizeof(name));
++	for (w = 0; w < 4u; w++) { wsmem_poke(wour_item + WSMP2P_AT_NAME(0) + 4u * w, name[w]); }
++	wsmem_poke(wour_item + WSMP2P_AT_COUNTS, 16u | 1u << 16);
++	wsmem_poke(wour_item + WSMP2P_AT_VERSION, WSMP2P_RESTART_ACKS << 8);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wsmem_poke(wour_item + WSMP2P_AT_VERSION, WSMP2P_RESTART_ACKS << 8 | WSMP2P_VERSION);
++	__asm__ volatile("dsb sy" ::: "memory");
++	wifi_ring_modem(14);
++	if (!wsmem_peek(wour_item, &ours, sizeof(ours)) || ours.magic != WSMP2P_MAGIC) {
++		printf("SWEET WIFI: [9] our item 428 does not read back as written\n"); return;
++	}
++	printf("SWEET WIFI: [9] item 428 written (version %#x procs %#x valid %u) + rang bit 14; polling modem 435...\n",
++	    ours.version, ((uint32_t)WSMEM_US | (uint32_t)WSMEM_MODEM << 16), ours.valid);
++
++	for (t = 0; t < 50; t++) {
++		uint32_t toff = wsmem_item_off(WITEM_SMP2P_THEIRS, &psz), st;
++		if (toff != 0u && wsmem_peek(toff, &theirs, sizeof(theirs)) && theirs.magic == WSMP2P_MAGIC) {
++			st = wsmp2p_state(&theirs);
++			if (!agreed && (theirs.version & 0xffu) == (ours.version & 0xffu)) {
++				uint32_t feat = (ours.version >> 8) & (theirs.version >> 8);
++				if (feat != (ours.version >> 8)) { wsmem_poke(wour_item + WSMP2P_AT_VERSION, feat << 8 | (ours.version & 0xffu)); }
++				agreed = true;
++				printf("SWEET WIFI: [9] SMP2P agreed: version %u, features %#x\n", ours.version & 0xffu, feat);
++			}
++			if (agreed && (((theirs.flags & WSMP2P_RESTART_DONE) != 0u) != acked)) {
++				acked = !acked;
++				(void)wsmem_peek(wour_item, &ours, sizeof(ours));
++				wsmem_poke(wour_item + WSMP2P_AT_FLAGS, (ours.flags & ~WSMP2P_RESTART_ACK) | (acked ? WSMP2P_RESTART_ACK : 0u));
++				__asm__ volatile("dsb sy" ::: "memory");
++				wifi_ring_modem(14);
++			}
++			if (st & WDSP_READY) { printf("SWEET WIFI: [9]   >>>>> DSP_READY -- the modem SMP2P says UP (state %#x, valid %u) <<<<<\n", st, theirs.valid); break; }
++			if (st & WDSP_FATAL) { printf("SWEET WIFI: [9]   modem SMP2P says FATAL (state %#x)\n", st); break; }
++			if ((t % 10) == 0) { printf("SWEET WIFI: [9]   +%dms: modem 435 valid=%u slave-kernel=%#x flags=%#x\n", t * 100, theirs.valid, st, theirs.flags); }
++		} else if ((t % 10) == 0) {
++			printf("SWEET WIFI: [9]   +%dms: modem item 435 not readable yet\n", t * 100);
++		}
++		delay_for_interval(100, NSEC_PER_MSEC);
++	}
++	printf("SWEET WIFI: [9] M2a SMP2P step done\n");
 +}
 +
 +/*

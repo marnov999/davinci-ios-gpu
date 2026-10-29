@@ -40,7 +40,7 @@ import argparse, hashlib, os, plistlib, shutil, struct, sys
 # Claude session transcripts (push_file.py / push.sh, last push per path).
 FILES = [
     ('launchd', 'usr/local/gltest/sweettime', 'davinci-ios/gpu/userland/metal/sweettime', 0o755, '12ffbb8fc9df4a7a'),  # 2026-10-26: time of day = RTC (kern.sweet_rtc, 0162) + kept offset (job com.sweet.time)
-    ('launchd', 'usr/local/lib/libsweet-media.dylib', 'davinci-ios/camera/userland/libsweet-media.dylib', 0o755, 'da63efefb143ea7a'),  # 2026-10-28: mediaserverd camera (sweetcam=5; frames only on the graph's Start, no boot-probe pop-up), camera/userland/build.sh
+    ('launchd', 'usr/local/lib/libsweet-media.dylib', 'davinci-ios/camera/userland/libsweet-media.dylib', 0o755, 'f4677bffb1c2a052'),  # 2026-10-29 01:30: + MIUI tuning (.isp), AE reset on lens switch, total-zoom metadata (main/tele live), zoom asked at delivery; temporary diag: lines
     ('launchd', 'usr/local/lib/sweet_media_shim', 'davinci-ios/camera/userland/sweet_media_shim', 0o755, '9c48829ed46d8fb5'),  # 2026-10-26: mediaserverd ProgramArguments[0]; inserts libsweet-media (execs without it if missing)
     ('launchd', 'usr/local/gltest/scset', 'davinci-ios/gpu/userland/metal/scset', 0o755, 'a838fc11ea8053b7'),  # 2026-10-25: publishes Plugin:InterfaceNamer *QUIET* at boot (job com.sweet.scquiet)
     ('assets', 'usr/local/gltest/inplace_copy_lpf.fragment.spv', 'backup/ios-root-sources-20261025/phone-only/inplace_copy_lpf.fragment.spv', 0o644, '05f9adab013b54c8'),  # only on the phone; pulled 2026-10-25
@@ -66,9 +66,11 @@ FILES = [
     ('gl', 'usr/local/gltest/hello_gl', 'davinci-ios/gpu/userland/mesa/gltest/hello_gl', 0o755, '57d864c7ecb5f3e3'),  # inject_gltest.sh; job com.sweet.gltest (disabled)
     ('gl', 'usr/local/lib/libvulkan_freedreno.dylib', 'davinci-ios/gpu/userland/mesa/build-tu/src/freedreno/vulkan/libvulkan_freedreno.dylib', 0o755, 'a47aa312aa44dcf6'),  # push 10-21 (turnip, Vulkan era); == device copy
     # (usr/local/lib/logshim: pushed 10-24, no longer on the phone 2026-10-25 -- left out)
-    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, 'f5e3013ac60d2bb1'),  # 10-28 19:20: + one clear per pass (not per draw), CPU blit encoder, -iosurface, lenient GLES draws, sysmem switch, diagnostics
+    ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/RedwoodMetal', 'davinci-ios/gpu/userland/metal/redwood/RedwoodMetal', 0o755, 'c45c377fc4752c54'),  # 10-28 20:00: + Metal for a process SweetGLES.bundle is in (its first context)
     ('metal', 'System/Library/Extensions/RedwoodMetal.bundle/Info.plist', 'davinci-ios/gpu/userland/metal/redwood/metal_plugin.plist', 0o644, '96f6896e6e1137cb'),  # push 10-25 06:32Z
     ('metal', 'usr/local/lib/libredwoodair.dylib', 'davinci-ios/gpu/userland/metal/redwood/libredwoodair.dylib', 0o755, '84a043087f99f301'),  # 10-28 19:20: + half varyings linked as 32-bit, GL line loop / triangle fan, linear sampled RTs
+    ('metal', 'System/Library/Extensions/SweetGLES.bundle/SweetGLES', 'davinci-ios/gpu/sweetgles/out/SweetGLES.bundle/SweetGLES', 0o644, '8605c2a3c7496b87'),  # 10-29 03:15: every app's OpenGL ES on Mesa (IOGLESBundleName, kernel 0191); first-context device of its own, Apple's ES2 extension set, GMEM
+    ('metal', 'System/Library/Extensions/SweetGLES.bundle/Info.plist', 'davinci-ios/gpu/sweetgles/out/SweetGLES.bundle/Info.plist', 0o644, 'a98c8d7c9b202561'),
     ('apps', 'Applications/MetalDemo.app/MetalDemo', 'davinci-ios/gpu/userland/metal/demoapp/MetalDemo', 0o755, 'f34277acc0078ae5'),  # push 10-25 07:53Z (signed with demoapp/ents.plist)
     ('apps', 'Applications/MetalDemo.app/Info.plist', 'davinci-ios/gpu/userland/metal/demoapp/Info.plist', 0o644, '1dc8e501ab0ac4b1'),  # push 10-25 07:53Z
     ('apps', 'Applications/MetalDemo.app/AppIcon60x60@2x.png', 'davinci-ios/gpu/userland/metal/demoapp/AppIcon60x60@2x.png', 0o644, '2aa4673331efbbb0'),  # push 10-25 07:53Z

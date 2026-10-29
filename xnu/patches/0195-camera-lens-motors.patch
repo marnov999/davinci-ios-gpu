@@ -1,0 +1,252 @@
+diff --git a/bsd/dev/sweet_camera.c b/bsd/dev/sweet_camera.c
+index 7bdb6c2..bcf3ab3 100644
+--- a/bsd/dev/sweet_camera.c
++++ b/bsd/dev/sweet_camera.c
+@@ -270,19 +270,20 @@ struct sensor_hw {
+ 	uint8_t         bayer;          /* 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR (CamX CFA from the module, converted) */
+ 	uint16_t        gain_unity, gain_max;
+ 	bool            popup;          /* behind the pop-up: dark until the motor raises it (not done here) */
++	uint8_t         af_address;     /* the lens motor's (DW9763) 7-bit I2C address on the sensor's bus; 0: fixed focus */
+ };
+ static const struct sensor_hw sensors[] = {
+ 	[SWEET_CAMERA_WIDE] = {
+ 		.name = "wide", .chip = "IMX586", .tab = "camera-imx586.tab", .tab_alt = "camera-imx582.tab",
+ 		.sda = 17, .scl = 18, .reset = 26, .mclk_cmd = 0x5044, .mclk_cbcr = 0x505c, .mclk_pin = 15,
+ 		.vdig_kind = VDIG_PMIC, .vdig_gpio = 3, .csiphy = 0, .phy_cbcr = 0x6020, .timer_cmd = 0x6004, .timer_cbcr = 0x601c,
+-		.regs = REGS_SONY, .bayer = 0, .gain_unity = 256, .gain_max = 16 * 256,
++		.regs = REGS_SONY, .bayer = 0, .gain_unity = 256, .gain_max = 16 * 256, .af_address = 0x0c,
+ 	},
+ 	[SWEET_CAMERA_TELE] = {
+ 		.name = "tele", .chip = "OV8856", .tab = "camera-ov8856.tab",
+ 		.sda = 19, .scl = 20, .reset = 24, .mclk_cmd = 0x5064, .mclk_cbcr = 0x507c, .mclk_pin = 16,
+ 		.vdig_kind = VDIG_PMIC, .vdig_gpio = 8, .csiphy = 3, .phy_cbcr = 0x608c, .timer_cmd = 0x6070, .timer_cbcr = 0x6088,
+-		.regs = REGS_OV8856, .bayer = 3, .gain_unity = 0x80, .gain_max = 0x7c0,
++		.regs = REGS_OV8856, .bayer = 3, .gain_unity = 0x80, .gain_max = 0x7c0, .af_address = 0x0e,
+ 	},
+ 	[SWEET_CAMERA_FRONT] = {
+ 		.name = "front", .chip = "S5K3T2", .tab = "camera-s5k3t2.tab",
+@@ -616,7 +617,7 @@ pgpio_put_once(unsigned gpio, uint8_t reg, uint8_t value, uint8_t *back_out)
+ 	bool ok = false;
+ 	uint8_t back = 0;
+ 
+-	if (gpio != 3 && gpio != 8) {                   /* the wide's and the tele's VDIG enables only */
++	if (gpio != 3 && gpio != 8 && gpio != 11) {     /* the wide's and the tele's VDIG enables, the lens motors' VAF */
+ 		give_up("a PMIC GPIO this driver does not own");
+ 		return false;
+ 	}
+@@ -658,8 +659,11 @@ pgpio_put_once(unsigned gpio, uint8_t reg, uint8_t value, uint8_t *back_out)
+ 	return false;
+ }
+ 
+-static uint8_t pgpio_found[5];
+-static bool pgpio_changed;
++static uint8_t pgpio_found_[2][5];
++static bool pgpio_changed_[2];
++#define PGPIO_SLOT(gpio)        ((gpio) == 11 ? 1 : 0)  /* (the VAF enable is switched while a VDIG one is) */
++#define pgpio_found             pgpio_found_[PGPIO_SLOT(gpio)]
++#define pgpio_changed           pgpio_changed_[PGPIO_SLOT(gpio)]
+ static const uint8_t pgpio_regs[5] = { PGPIO_DIG_VIN_CTL, PGPIO_DIG_PULL_CTL, PGPIO_MODE_CTL, PGPIO_OUT_SOURCE_CTL, PGPIO_EN_CTL };
+ 
+ /* "normal" function, output, VIN0, no pull, enabled, level high/low (pinctrl-spmi-gpio LV/MV layout) */
+@@ -2505,6 +2509,130 @@ capture_tpg(void)
+ 	frames_free();
+ }
+ 
++/* ---- the lens motors (wide, tele) ------------------------------------------------------------------- */
++
++/*
++ * The wide and the tele lenses move on voice coils driven by a Dongwoon DW9763 each, on their sensor's own
++ * I2C (the module files' actuatorDriver: "davinci_imx582_dw9763_*" at 8-bit 0x18, "davinci_ov8856_dw9763_*"
++ * at 0x1c), powered by VAF: a fixed 2.8 V regulator that PM6150L GPIO 11 switches (both motors'). The
++ * modules' initialisation, as it is: 0x02 = 0x01 (power down), 0x02 = 0x00 and 1 ms, 0x02 = 0x02 (ring
++ * control), 0x06 = 0x60 (SAC mode), 0x07 = 0x02 (its timing); the position is ten bits, 0x03 (the high two)
++ * and 0x04 written together (registerParam). As HackiOS's DW9800 (redwood_camera.c): at the end the lens is
++ * let down in steps, the chip powered down and VAF switched off. A motor that does not answer leaves the
++ * camera fixed-focus for the session -- never the camera given up.
++ */
++#define AF_CONTROL              0x02
++#define AF_POSITION             0x03
++#define AF_MODE                 0x06
++#define AF_TIMING               0x07
++#define AF_VAF_PGPIO            11
++#define AF_FIRST_POSITION       180             /* the modules' first figure after their settings */
++
++static uint32_t af_position = SWEET_CAMERA_NO_FOCUS;
++static bool af_vaf_on;
++
++static bool
++af_write(uint8_t reg, uint16_t value)
++{
++	uint8_t out[3] = { reg, (uint8_t)value, 0 };
++
++	if (hw->af_address == 0) {
++		return false;
++	}
++	if (reg == AF_POSITION) {
++		out[1] = (uint8_t)(value >> 8 & 3);
++		out[2] = (uint8_t)value;
++	}
++	return i2c_transfer(&cci_bus, hw->af_address, out, reg == AF_POSITION ? 3 : 2, NULL, 0);
++}
++
++/* VAF on through GPIO 11 -- only if it is ours to write (a refusal is no reason to give the camera up) */
++static bool
++af_vaf(bool on)
++{
++	unsigned owner = 7, apid;
++
++	if (!on) {
++		if (af_vaf_on) {
++			(void)pgpio_drive(AF_VAF_PGPIO, false);
++			pgpio_restore(AF_VAF_PGPIO);
++			af_vaf_on = false;
++		}
++		return true;
++	}
++	if (!spmi_up()) {
++		return false;
++	}
++	lck_mtx_lock(&spmi_lock);
++	apid = spmi_apid(SID_PM6150L, PGPIO_PERIPH(AF_VAF_PGPIO), &owner);
++	lck_mtx_unlock(&spmi_lock);
++	if (apid == 0xffff || owner != 0) {
++		say("the lens motors' VAF (PM6150L GPIO %u): APID %#x owner EE %u, not ours: fixed focus\n", AF_VAF_PGPIO, apid, owner);
++		return false;
++	}
++	af_vaf_on = pgpio_drive(AF_VAF_PGPIO, true);
++	return af_vaf_on;
++}
++
++static void
++af_up(void)
++{
++	af_position = SWEET_CAMERA_NO_FOCUS;
++	if (hw->af_address == 0 || broken) {
++		return;
++	}
++	if (!af_vaf(true) || broken) {
++		return;
++	}
++	wait_ms(2);
++	if (!af_write(AF_CONTROL, 0x01) || !af_write(AF_CONTROL, 0x00)) {
++		say("the %s lens motor (DW9763 at %#x) does not answer: fixed focus this session\n", hw->name, hw->af_address);
++		(void)af_vaf(false);
++		return;
++	}
++	wait_ms(1);
++	if (!af_write(AF_CONTROL, 0x02) || !af_write(AF_MODE, 0x60) || !af_write(AF_TIMING, 0x02) ||
++	    !af_write(AF_POSITION, AF_FIRST_POSITION)) {
++		say("the %s lens motor stopped answering during its initialisation: fixed focus this session\n", hw->name);
++		(void)af_vaf(false);
++		return;
++	}
++	af_position = AF_FIRST_POSITION;
++	say("the %s lens motor (DW9763 at %#x) is up, the lens at %u\n", hw->name, hw->af_address, af_position);
++}
++
++static void
++af_move(uint32_t position)
++{
++	if (af_position == SWEET_CAMERA_NO_FOCUS) {
++		return;
++	}
++	position = position > 1023 ? 1023 : position;
++	if (position != af_position && af_write(AF_POSITION, (uint16_t)position)) {
++		af_position = position;
++	}
++}
++
++static void
++af_down(void)
++{
++	if (af_position != SWEET_CAMERA_NO_FOCUS) {
++		/* down in steps, not to knock the lens against its stop */
++		while (af_position > 0) {
++			uint32_t was = af_position;
++
++			af_move(af_position > 48 ? af_position - 48 : 0);
++			if (af_position == was) {
++				break;
++			}
++			wait_ms(10);
++		}
++		(void)af_write(AF_CONTROL, 0x01);
++		af_position = SWEET_CAMERA_NO_FOCUS;
++	}
++	(void)af_vaf(false);
++}
++
+ /* ---- exposure ------------------------------------------------------------------------------------------ */
+ 
+ #define EXPOSURE_MARGIN         40
+@@ -2753,7 +2881,7 @@ static uint64_t ring_place_bytes;
+ static uint32_t ring_frame_bytes, ios_line_ns;
+ static volatile bool ios_open, ios_streaming, ios_wanted;
+ static uint64_t ios_last_read, ios_given, ios_frames_done, ios_writes_late;
+-static struct { uint32_t lines, gain, frame_lines; bool pending; } ios_ask;
++static struct { uint32_t lines, gain, frame_lines; bool pending; uint32_t focus; bool focus_pending; } ios_ask;
+ static struct { uint32_t lines, gain, frame_lines; uint64_t from; } ios_now, ios_next;
+ static int ios_source = SOURCE_SENSOR;
+ static volatile unsigned ios_switch_to;
+@@ -2787,8 +2915,10 @@ ios_stop(const char *why)
+ 	lck_mtx_unlock(&ios_lock);
+ 	wakeup(&ios_frames_done);
+ 	if (!broken && ios_source != SOURCE_CSID_TPG && ctab != NULL) {
++		af_down();
+ 		(void)sensor_table("off");
+ 	}
++	(void)af_vaf(false);
+ 	if (csid_running || ife_running) {
+ 		show_paths("at the end");
+ 	}
+@@ -2835,6 +2965,10 @@ ios_start(void)
+ 	ios_now.gain = ios_next.gain = gain;
+ 	ios_now.frame_lines = ios_next.frame_lines = frame_lines;
+ 	ios_next.from = 0;
++	ios_ask.focus_pending = false;
++	if (ios_source != SOURCE_CSID_TPG) {
++		af_up();
++	}
+ 	say("frames for iOS: %s mode %u %ux%u; exposure %u lines, gain %#x, frame %u lines\n", hw->name, ios_mode_n, ios_mode->width,
+ 	    ios_mode->height, lines, gain, frame_lines);
+ 	return true;
+@@ -2917,11 +3051,15 @@ ios_session(void)
+ 				blk_put(ife, "IFE", IFE_REG_UPDATE, 0x2, false);
+ 			}
+ 		}
+-		bool ask = (bus & WM0_DONE) && ios_ask.pending;
+-		uint32_t lines = ios_ask.lines, gain = ios_ask.gain, frame_lines = ios_ask.frame_lines;
++		bool ask = (bus & WM0_DONE) && ios_ask.pending, focus = (bus & WM0_DONE) && ios_ask.focus_pending;
++		uint32_t lines = ios_ask.lines, gain = ios_ask.gain, frame_lines = ios_ask.frame_lines, position = ios_ask.focus;
+ 
+ 		ios_ask.pending = ios_ask.pending && !ask;
++		ios_ask.focus_pending = ios_ask.focus_pending && !focus;
+ 		lck_mtx_unlock(&ios_lock);
++		if (focus) {
++			af_move(position);
++		}
+ 		if (bus & WM0_DONE) {
+ 			wakeup(&ios_frames_done);
+ 		}
+@@ -3093,7 +3231,7 @@ camdev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 	f.frame_lines_max = FRAME_LINES_MAX;
+ 	f.margin = EXPOSURE_MARGIN;
+ 	f.sensor = hw_index;
+-	f.focus = SWEET_CAMERA_NO_FOCUS;        /* DW9763 (wide/tele) not done yet */
++	f.focus = af_position;                  /* SWEET_CAMERA_NO_FOCUS: fixed focus (ultra, front) or no motor */
+ 	lck_mtx_unlock(&ios_lock);
+ 
+ 	error = uiomove((caddr_t)&f, (int)MIN(sizeof(f), (size_t)uio_resid(uio)), uio);
+@@ -3134,7 +3272,11 @@ camdev_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ 		return 0;
+ 	}
+ 	if (c.command == SWEET_CAMERA_FOCUS) {
+-		return 0;                       /* no lens motor driven yet */
++		lck_mtx_lock(&ios_lock);
++		ios_ask.focus = c.a;
++		ios_ask.focus_pending = true;
++		lck_mtx_unlock(&ios_lock);
++		return 0;
+ 	}
+ 	if (c.command == SWEET_CAMERA_SENSOR) {
+ 		if (c.a >= SENSORS) {

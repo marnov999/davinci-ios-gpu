@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,7425 @@
+@@ -0,0 +1,7546 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7192,12 +7192,127 @@
 +	}
 +}
 +
-+/* M2c stub -- M2d replaces this with the QRTR parser (hello + service list). */
-+static void
-+wifi_qrtr_input(const uint8_t *data, uint32_t len)
++/* ---- M2d: QRTR -- hello both ways + the modem's service list (sweetwifi=12) -----------------------
++ * Port of hakios.mpss.c glink_send + the QRTR control handling. QRTR datagrams ride the IPCRTR channel
++ * as GLINK DATA. We only ever SEND in reply to something the modem sent (from inside the pump), so the
++ * send is a single shot into a modem intent (no inner pump -> no reentrancy). On the modem's HELLO we
++ * reply HELLO; each NEW_SERVER is logged as the service list (WLFW/wlan ~svc 0x27/39 = Wi-Fi). */
++#define QRTR_US_NODE      1u
++#define QRTR_CONTROL      0xfffffffeu
++enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_RESUME_TX = 7, QRTR_NEW_LOOKUP = 10 };
++struct wqrtr_header { uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port; };
++struct wqrtr_control { uint32_t command, words[4]; };
++static uint32_t wqrtr_peer, wqrtr_hellos, wqrtr_in;
++static struct { uint32_t service, instance, node, port; bool there; } wqrtr_servers[64];
++
++/* One GLINK DATA message into the smallest fitting modem intent; single-shot (safe to call from the pump). */
++static int
++wglink_send(const void *data, uint32_t length)
 +{
-+	uint32_t w0 = len >= 4u ? *(const uint32_t *)data : 0, w1 = len >= 8u ? *(const uint32_t *)(data + 4) : 0;
-+	printf("SWEET WIFI: [11] (QRTR datagram: %u bytes, first words %#x %#x -- parsing is M2d)\n", len, w0, w1);
++	struct { uint16_t cmd, p1; uint32_t p2, size, left; } header = { (uint16_t)WGL_DATA, (uint16_t)wgl.ch.ours, 0, length, 0 };
++	int found = -1;
++	unsigned n;
++	if (!wgl.up || !wgl.ch.open || wgl.broken) { return -1; }
++	for (n = 0; n < 64u; n++) {
++		if (!wgl.ch.their_intents[n].there || wgl.ch.their_intents[n].in_use || wgl.ch.their_intents[n].size < length) { continue; }
++		if (found < 0 || wgl.ch.their_intents[n].size < wgl.ch.their_intents[found].size) { found = (int)n; }
++	}
++	if (found < 0) { return -2; }
++	if (wglink_room() < ((length + (uint32_t)sizeof(header) + 7u) & ~7u)) { return -3; }
++	wgl.ch.their_intents[found].in_use = true;
++	header.p2 = wgl.ch.their_intents[found].id;
++	(void)wglink_put(&header, (uint32_t)sizeof(header), data, length);
++	return 0;
++}
++
++static int
++wqrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
++{
++	static uint8_t buf[sizeof(struct wqrtr_header) + 64];
++	struct wqrtr_header *h = (struct wqrtr_header *)buf;
++	uint32_t padded = (length + 3u) & ~3u;
++	if (length == 0u || sizeof(struct wqrtr_header) + padded > sizeof(buf)) { return -1; }
++	h->version = 1; h->type = type; h->from_node = QRTR_US_NODE; h->from_port = from_port; h->confirm = 0;
++	h->size = length; h->to_node = to_node; h->to_port = to_port;
++	memcpy(buf + sizeof(*h), data, length);
++	return wglink_send(buf, (uint32_t)sizeof(*h) + padded);
++}
++
++static void
++wifi_qrtr_input(const uint8_t *data, uint32_t length)
++{
++	struct wqrtr_header h;
++	struct wqrtr_control c;
++	uint32_t at;
++
++	if (length >= sizeof(h) && data[0] == 1) {
++		memcpy(&h, data, sizeof(h));
++		at = (uint32_t)sizeof(h);
++	} else if (length >= 16u && data[0] == 3) {
++		bzero(&h, sizeof(h));
++		h.type = data[1];
++		h.confirm = data[2] & 1u;
++		memcpy(&h.size, data + 4, 4);
++		h.from_node = (uint32_t)(data[8] | data[9] << 8);
++		h.from_port = (uint32_t)(data[10] | data[11] << 8);
++		h.to_node = (uint32_t)(data[12] | data[13] << 8);
++		h.to_port = (uint32_t)(data[14] | data[15] << 8);
++		h.from_port = h.from_port == 0xfffeu ? QRTR_CONTROL : h.from_port;
++		h.to_port = h.to_port == 0xfffeu ? QRTR_CONTROL : h.to_port;
++		at = 16u + data[3];
++	} else {
++		printf("SWEET WIFI: [11] qrtr: %u bytes, not a datagram (begins %#x)\n", length, length ? data[0] : 0);
++		return;
++	}
++	if (h.size == 0u || at + h.size > length) {
++		printf("SWEET WIFI: [11] qrtr: datagram size %u in a %u-byte message -- dropped\n", h.size, length);
++		return;
++	}
++	wqrtr_in++;
++	if (wqrtr_peer == 0u) { wqrtr_peer = h.from_node; }
++	if (h.type == QRTR_RESUME_TX) { return; }
++	if (h.confirm) {
++		struct wqrtr_control resume = { QRTR_RESUME_TX, { h.to_node, h.to_port, 0, 0 } };
++		(void)wqrtr_out_packet(QRTR_RESUME_TX, h.to_port, h.from_node, h.from_port, &resume, (uint32_t)sizeof(resume));
++	}
++	if (!(h.to_port == QRTR_CONTROL || h.type == QRTR_HELLO || h.type == QRTR_NEW_SERVER || h.type == QRTR_DEL_SERVER ||
++	    h.type == QRTR_BYE || h.type == QRTR_NEW_LOOKUP)) {
++		return;   /* data to a normal port: nothing here wants it yet (M3/M4) */
++	}
++	bzero(&c, sizeof(c));
++	memcpy(&c, data + at, h.size < sizeof(c) ? h.size : sizeof(c));
++	switch (c.command) {
++	case QRTR_HELLO: {
++		struct wqrtr_control hello = { QRTR_HELLO, { 0, 0, 0, 0 } };
++		int e = 0;
++		if (wqrtr_hellos++ == 0u) {
++			e = wqrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, h.from_node, QRTR_CONTROL, &hello, (uint32_t)sizeof(hello));
++		}
++		printf("SWEET WIFI: [11] qrtr: HELLO from node %u; our reply %s\n", h.from_node, e == 0 ? "SENT" : "NOT sent");
++		break;
++	}
++	case QRTR_NEW_SERVER: {
++		unsigned i, slot = 64u;
++		for (i = 0; i < 64u; i++) {
++			if (wqrtr_servers[i].there && wqrtr_servers[i].node == c.words[2] && wqrtr_servers[i].port == c.words[3]) { slot = i; break; }
++			if (!wqrtr_servers[i].there && slot == 64u) { slot = i; }
++		}
++		if (slot < 64u) {
++			wqrtr_servers[slot].there = true; wqrtr_servers[slot].service = c.words[0];
++			wqrtr_servers[slot].instance = c.words[1]; wqrtr_servers[slot].node = c.words[2]; wqrtr_servers[slot].port = c.words[3];
++		}
++		printf("SWEET WIFI: [11] qrtr: >>> SERVICE %u (%#x) version %u instance %u at node %u port %u%s\n",
++		    c.words[0], c.words[0], c.words[1] & 0xffu, c.words[1] >> 8, c.words[2], c.words[3],
++		    c.words[0] == 0x27u || c.words[0] == 39u ? "   <<< WLFW = Wi-Fi!" : "");
++		break;
++	}
++	case QRTR_DEL_SERVER:
++	case QRTR_BYE:
++		printf("SWEET WIFI: [11] qrtr: a service is gone (cmd %u, node %u port %u)\n", c.command, c.words[2], c.words[3]);
++		break;
++	default:
++		break;
++	}
 +}
 +
 +static void
@@ -7229,6 +7344,12 @@
 +	} else {
 +		printf("SWEET WIFI: [11] M2c: IPCRTR NOT open (agreed=%d theirs=%u ack=%d broken=%d said=%u heard=%u)\n",
 +		    wgl.agreed, wgl.ch.theirs, wgl.ch.acknowledged, wgl.broken, wgl.said, wgl.heard);
++	}
++	if (wgl.ch.open && wifi_level >= 12) {
++		printf("SWEET WIFI: [11] M2d: listening ~8 s for the QRTR hello + the modem's service list...\n");
++		for (t = 0; t < 800 && !wgl.broken; t++) { wglink_pump(); delay_for_interval(10, NSEC_PER_MSEC); }
++		printf("SWEET WIFI: [11] M2d DONE: qrtr hellos=%u, datagrams in=%u, modem node=%u (said=%u heard=%u)\n",
++		    wqrtr_hellos, wqrtr_in, wqrtr_peer, wgl.said, wgl.heard);
 +	}
 +}
 +

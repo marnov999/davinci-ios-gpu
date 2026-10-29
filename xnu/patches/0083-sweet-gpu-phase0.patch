@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,6843 @@
+@@ -0,0 +1,6845 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -6632,17 +6632,19 @@
 +	n = wsmem_items(part, cl, found, 64);
 +	printf("SWEET WIFI: [8] post-release SMEM re-survey: (0,1) modem/APSS partition %s, %u items (was 0 before release)\n",
 +	    part ? "there" : "NOT THERE", n);
++	/* dump every item the modem created -- these ARE davinci's GLINK/SMP2P SMEM structures (for M2) */
 +	for (k = 0; k < n; k++) {
-+		if (found[k][0] == 428u) {
-+			uint32_t w[5] = { 0, 0, 0, 0, 0 };
-+			(void)wsmem_peek(found[k][1], w, sizeof(w));
-+			printf("SWEET WIFI: [8]   >>> MODEM RAN: SMP2P item 428 present (magic %#x version %#x) <<<\n", w[0], w[1]);
-+		} else if (found[k][0] == 421u) {
++		uint32_t w[8] = { 0 };
++		uint32_t got = found[k][2] < 32u ? found[k][2] : 32u;
++		(void)wsmem_peek(found[k][1], w, got);
++		printf("SWEET WIFI: [8]   item %u: id=%u off=%#x size=%u  first=%08x %08x %08x %08x %08x %08x %08x %08x\n",
++		    k, found[k][0], found[k][1], found[k][2], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		if (found[k][0] == 421u) {
 +			char text[84];
 +			uint32_t len = found[k][2] < 80u ? found[k][2] : 80u;
 +			(void)wsmem_peek(found[k][1], text, len);
 +			text[len] = 0;
-+			printf("SWEET WIFI: [8]   modem last words (421): \"%s\"\n", text);
++			printf("SWEET WIFI: [8]     (item 421 modem last words: \"%s\")\n", text);
 +		}
 +	}
 +	if (n == 0u) {

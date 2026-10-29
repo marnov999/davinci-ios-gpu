@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,7032 @@
+@@ -0,0 +1,7144 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5815,6 +5815,7 @@
 +#define WMODEM_SCM_AUTH_RESET 0x42000205ull
 +static void wifi_modem_liveness(void);   /* defined after the wsmem helpers */
 +static void wifi_smp2p_up(void);         /* M2a: SMP2P bring-up, defined after the wsmem helpers */
++static void wifi_glink_attach(void);     /* M2b: GLINK FIFO attach */
 +static void
 +wifi_modem_release(void)
 +{
@@ -6452,6 +6453,9 @@
 +					if (wifi_level >= 9) {
 +						wifi_smp2p_up();        /* sweetwifi=9: M2a -- SMP2P handshake to DSP_READY */
 +					}
++					if (wifi_level >= 10) {
++						wifi_glink_attach();    /* sweetwifi=10: M2b -- attach GLINK FIFOs, peek modem VERSION */
++					}
 +				} else if (wifi_level == 7) {
 +					wifi_ddr_sweep();       /* sweetwifi=7: DDR-location sweep -- find a PA TZ accepts (AC_ERR_NOT_DDR_MEMORY) */
 +				} else {
@@ -6837,6 +6841,114 @@
 +		delay_for_interval(100, NSEC_PER_MSEC);
 +	}
 +	printf("SWEET WIFI: [9] M2a SMP2P step done\n");
++}
++
++/* ---- M2b: GLINK FIFO attach (sweetwifi=10) --------------------------------------------------------
++ * Port of hakios.mpss.c glink_find/glink_reset/glink_waiting/glink_peek. The modem created the GLINK
++ * descriptor (478, 4 FIFO indices) + its TX ring (480, modem->us). We allocate OUR TX ring (479,
++ * us->modem, 16 KiB) the same way as item 428, attach, reset our indices, then peek the modem's RX
++ * ring for its first GLINK message -- expected GLINK_VERSION (cmd 0). Read-only on the modem's ring;
++ * no send yet (that is M2c). Descriptor: OUR_TAIL@0 OUR_HEAD@4 THEIR_TAIL@8 THEIR_HEAD@12. */
++#define WITEM_GLINK_DESC      478u
++#define WITEM_GLINK_OURS      479u
++#define WITEM_GLINK_THEIRS    480u
++#define WGLINK_OUR_TAIL       0u
++#define WGLINK_OUR_HEAD       4u
++#define WGLINK_THEIR_TAIL     8u
++#define WGLINK_THEIR_HEAD     12u
++static uint32_t wglink_desc, wglink_ours, wglink_ours_size, wglink_theirs, wglink_theirs_size;
++
++static uint32_t
++wsmem_word(uint32_t off)
++{
++	uint32_t v = 0;
++	(void)wsmem_peek(off, &v, 4);
++	return v;
++}
++
++static bool
++wglink_find(void)
++{
++	uint32_t sz = 0;
++	wglink_desc = wsmem_item_off(WITEM_GLINK_DESC, &sz);
++	if (wglink_desc == 0u || sz != 32u) { return false; }
++	wglink_ours = wsmem_item_off(WITEM_GLINK_OURS, &wglink_ours_size);
++	wglink_theirs = wsmem_item_off(WITEM_GLINK_THEIRS, &wglink_theirs_size);
++	return wglink_ours != 0u && wglink_theirs != 0u && wglink_ours_size >= 1024u && wglink_theirs_size >= 1024u &&
++	       !(wglink_ours_size & 7u) && !(wglink_theirs_size & 7u);
++}
++
++static uint32_t
++wglink_waiting(void)
++{
++	uint32_t head = wsmem_word(wglink_desc + WGLINK_THEIR_HEAD), tail = wsmem_word(wglink_desc + WGLINK_THEIR_TAIL);
++	if (head >= wglink_theirs_size || tail >= wglink_theirs_size) { return 0; }
++	return head >= tail ? head - tail : wglink_theirs_size - tail + head;
++}
++
++static void
++wglink_peek(void *to, uint32_t offset, uint32_t count)
++{
++	uint32_t at = (wsmem_word(wglink_desc + WGLINK_THEIR_TAIL) + offset) % wglink_theirs_size, i;
++	for (i = 0; i < count; i++) {
++		((uint8_t *)to)[i] = wsmem[wglink_theirs + (at + i) % wglink_theirs_size];
++	}
++}
++
++static const char *
++wglink_cmd_name(uint32_t c)
++{
++	static const char *const n[] = { "version", "version-ack", "open", "close", "open-ack", "intent", "done",
++		"intent-request", "intent-request-ack", "data", "10", "close-ack", "data-more", "read-notify", "done-reuse", "signals" };
++	return c < sizeof(n) / sizeof(n[0]) ? n[c] : "?";
++}
++
++static void
++wifi_glink_attach(void)
++{
++	uint32_t cl = 0, psz = 0, part, sz = 0;
++	struct { uint16_t cmd, param1; uint32_t param2; } msg;
++	int t;
++
++	printf("SWEET WIFI: [10] M2b GLINK: allocate our TX ring (479), attach 478/479/480, peek the modem's VERSION\n");
++	part = wsmem_partition(WSMEM_US, WSMEM_MODEM, &cl, &psz);
++	if (part == 0u) { printf("SWEET WIFI: [10] no (0,1) partition\n"); return; }
++	if (wsmem_item_off(WITEM_GLINK_OURS, &sz) == 0u) {
++		if (!wour_item_make(part, WITEM_GLINK_OURS, 0x4000u)) { printf("SWEET WIFI: [10] could not make item 479\n"); return; }
++		printf("SWEET WIFI: [10] item 479 (our 16 KiB TX ring) MADE\n");
++	} else {
++		printf("SWEET WIFI: [10] item 479 already present (%u bytes)\n", sz);
++	}
++	if (!wglink_find()) {
++		printf("SWEET WIFI: [10] glink_find FAILED (desc@%#x ours@%#x/%u theirs@%#x/%u)\n",
++		    wglink_desc, wglink_ours, wglink_ours_size, wglink_theirs, wglink_theirs_size);
++		return;
++	}
++	printf("SWEET WIFI: [10] GLINK attached: desc@%#x ours@%#x(%uB) theirs@%#x(%uB); OUR_T=%#x OUR_H=%#x THEIR_T=%#x THEIR_H=%#x\n",
++	    wglink_desc, wglink_ours, wglink_ours_size, wglink_theirs, wglink_theirs_size,
++	    wsmem_word(wglink_desc + 0u), wsmem_word(wglink_desc + 4u), wsmem_word(wglink_desc + 8u), wsmem_word(wglink_desc + 12u));
++	if (wsmem_word(wglink_desc + WGLINK_OUR_HEAD) != 0u || wsmem_word(wglink_desc + WGLINK_THEIR_TAIL) != 0u) {
++		wsmem_poke(wglink_desc + WGLINK_OUR_HEAD, 0);
++		wsmem_poke(wglink_desc + WGLINK_THEIR_TAIL, 0);
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("SWEET WIFI: [10] reset our marks (OUR_HEAD, THEIR_TAIL) to 0 for a fresh link\n");
++	}
++	for (t = 0; t < 50; t++) {
++		uint32_t avail = wglink_waiting();
++		if (avail >= 8u) {
++			wglink_peek(&msg, 0, 8);
++			printf("SWEET WIFI: [10]   modem GLINK msg: cmd=%u (%s) param1=%#x param2=%#x (avail %u) %s\n",
++			    msg.cmd, wglink_cmd_name(msg.cmd), msg.param1, msg.param2, avail,
++			    msg.cmd == 0u ? "<<<<< GLINK_VERSION from the modem!" : "");
++			break;
++		}
++		if ((t % 10) == 0) {
++			printf("SWEET WIFI: [10]   +%dms: modem ring avail=%u (THEIR_HEAD=%#x THEIR_TAIL=%#x)\n",
++			    t * 100, avail, wsmem_word(wglink_desc + WGLINK_THEIR_HEAD), wsmem_word(wglink_desc + WGLINK_THEIR_TAIL));
++		}
++		delay_for_interval(100, NSEC_PER_MSEC);
++	}
++	printf("SWEET WIFI: [10] M2b GLINK attach done\n");
 +}
 +
 +/*

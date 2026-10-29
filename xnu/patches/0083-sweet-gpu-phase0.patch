@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,5999 @@
+@@ -0,0 +1,6051 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -5561,6 +5561,46 @@
 +#define WMODEM_SCM_MEM_SETUP    0x42000202ull
 +#define WMODEM_SCM_SHUTDOWN     0x42000206ull
 +#define WGPU_PAS_ID             13u             /* known-good: the GPU zap PAS works for pas-id 13 */
++#define QMP_MSG_LEN             64u             /* Linux qmp_send always writes 64 bytes, text + zero pad */
++
++/*
++ * Send one QMP message to the always-on processor over the channel step 3 opened (Linux qmp_send):
++ * the text goes into our mailbox behind its length (a fixed 64), the AOP's doorbell is rung, and the
++ * AOP has taken it when the length reads back 0. davinci's modem is qcom,signal-aop: the modem's proxy
++ * power (cx, mss rails) is brought up by telling the AOP "{class: image, res: load_state, name: modem,
++ * val: on}" -- which is what the stock pil-tz driver does, and why step 5 could not authenticate with
++ * the modem rail off. Returns true if the AOP took the message.
++ */
++static bool
++wifi_mailbox_send(const char *text)
++{
++	uint32_t words[QMP_MSG_LEN / 4] = { 0 };
++	unsigned i;
++
++	if (!waop_base || wifi_our_box == 0u) {
++		printf("SWEET WIFI: [5] AOP channel not open -- cannot send \"%s\"\n", text);
++		return false;
++	}
++	strlcpy((char *)words, text, sizeof(words));
++	if (wmmio_rd32(waop_base, wifi_our_box) != 0u) {
++		printf("SWEET WIFI: [5] our AOP box still holds a message (%#x) -- not sending\n",
++		    wmmio_rd32(waop_base, wifi_our_box));
++		return false;
++	}
++	for (i = 0; i < QMP_MSG_LEN / 4u; i++) {
++		wmmio_wr32(waop_base, wifi_our_box + 4u + 4u * i, words[i]);
++	}
++	wmmio_wr32(waop_base, wifi_our_box, QMP_MSG_LEN);     /* the length, in front -> message is queued */
++	(void)wmmio_rd32(waop_base, wifi_our_box);
++	wifi_ring_aop();
++	if (!wifi_qmp_wait(wifi_our_box, 0, 1000)) {
++		printf("SWEET WIFI: [5] AOP did NOT take \"%s\" within 1 s -- taking it back\n", text);
++		wmmio_wr32(waop_base, wifi_our_box, 0);
++		return false;
++	}
++	printf("SWEET WIFI: [5] AOP took \"%s\"\n", text);
++	return true;
++}
 +
 +static void
 +wifi_modem_pas_validate(void)
@@ -5611,6 +5651,14 @@
 +	    WMODEM_PAS_ID, (unsigned long long)x0, (unsigned long long)x1);
 +	gmub_flush();
 +
++	/* davinci's modem is qcom,signal-aop: its proxy power (cx, mss rails) is brought up by the AOP
++	 * when told the modem image is loading, NOT by an AP rail vote. Step 5 failed (0xffcffff6) with
++	 * that power off. So, over the channel step 3 opened, tell the AOP to power the modem for load
++	 * BEFORE init_image -- mainline q6v5 enables cx+mss proxy power before pas_init_image, and no
++	 * qcom_scm_assign_mem is needed for this modem class (only sm8550+). */
++	(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: on}");
++	delay_for_interval(20, NSEC_PER_MSEC);          /* let the AOP settle the rails */
++
 +	x1 = 0;
 +	x0 = gpu_scm_pas(WMODEM_SCM_INIT_IMAGE, 0x82u, (uint64_t)WMODEM_PAS_ID, mdt_pa, 0, &x1);
 +	printf("SWEET WIFI: [5] PAS init_image(%u, mdt) -> x0=%#llx x1=%#llx (0/0 => signature ACCEPTED)\n",
@@ -5618,6 +5666,7 @@
 +	if (x0 != 0u) {
 +		printf("SWEET WIFI: [5] TZ REJECTED the modem image header (x0=%#llx) -- stop; modem untouched, in reset\n",
 +		    (unsigned long long)x0);
++		(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: off}");
 +		return;
 +	}
 +
@@ -5627,10 +5676,13 @@
 +	    WMODEM_REGION_SIZE, (unsigned long long)x0, (unsigned long long)x1);
 +	if (x0 != 0u) {
 +		printf("SWEET WIFI: [5] mem_setup refused (x0=%#llx) -- stop; modem in reset\n", (unsigned long long)x0);
++		(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: off}");
 +		return;
 +	}
 +	printf("SWEET WIFI: [5] TRUSTZONE ACCEPTS THE MODEM IMAGE (signature ok, region set). Modem STILL IN RESET. "
 +	    "Next (higher-gated, reset-risk): copy the 29 segments in, then auth-and-reset to RELEASE the modem.\n");
++	/* validate-only step: release the AOP proxy power again (we are not proceeding to auth here). */
++	(void)wifi_mailbox_send("{class: image, res: load_state, name: modem, val: off}");
 +}
 +
 +extern vnode_t rootvnode;       /* also declared near sweet_push_exec_bit; a second extern is harmless */

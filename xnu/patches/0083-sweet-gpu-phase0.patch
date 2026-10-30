@@ -7256,7 +7256,7 @@
 +static int
 +wqrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
 +{
-+	static uint8_t buf[sizeof(struct wqrtr_header) + 64];
++	static uint8_t buf[sizeof(struct wqrtr_header) + 8192];   /* must hold a full TFTP data block (blksize up to 8000) + QRTR header, not just small QMI control msgs */
 +	struct wqrtr_header *h = (struct wqrtr_header *)buf;
 +	uint32_t padded = (length + 3u) & ~3u;
 +	if (length == 0u || sizeof(struct wqrtr_header) + padded > sizeof(buf)) { return -1; }

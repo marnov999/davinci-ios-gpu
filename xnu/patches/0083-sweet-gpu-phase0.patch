@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8473 @@
+@@ -0,0 +1,8506 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -6988,6 +6988,7 @@
 +	struct { uint32_t id, size; bool there, in_use; } their_intents[64];
 +	struct { uint32_t size, fill; uint8_t *data; } our_intents[24];
 +	uint32_t our_intent_count;
++	uint32_t intent_wanted;          /* outstanding GLINK_INTENT_REQUEST size (0 = none), for bulk sends */
 +};
 +static struct {
 +	bool up, broken, agreed;
@@ -7129,6 +7130,7 @@
 +						channel->their_intents[n].in_use = false;
 +						channel->their_intents[n].size = words[0];
 +						channel->their_intents[n].id = words[1];
++						if (channel->intent_wanted != 0u && words[0] >= channel->intent_wanted) { channel->intent_wanted = 0u; }
 +						break;
 +					}
 +				}
@@ -7229,7 +7231,16 @@
 +		if (!wgl.ch.their_intents[n].there || wgl.ch.their_intents[n].in_use || wgl.ch.their_intents[n].size < length) { continue; }
 +		if (found < 0 || wgl.ch.their_intents[n].size < wgl.ch.their_intents[found].size) { found = (int)n; }
 +	}
-+	if (found < 0) { return -2; }
++	if (found < 0) {
++		/* The modem granted no buffer big enough -- ask it for one (GLINK_INTENT_REQUEST). It replies with
++		 * a GLINK_INTENT grant (cleared in the pump), and the caller retries. Without this, bulk sends
++		 * (the 3.8 MB wlanmdsp.mbn) never get an intent and stall at the first data block. */
++		if (wgl.ch.intent_wanted == 0u) {
++			wgl.ch.intent_wanted = length;
++			wglink_say(WGL_INTENT_REQUEST, wgl.ch.ours, length, NULL, 0);
++		}
++		return -2;
++	}
 +	if (wglink_room() < ((length + (uint32_t)sizeof(header) + 7u) & ~7u)) { return -3; }
 +	wgl.ch.their_intents[found].in_use = true;
 +	header.p2 = wgl.ch.their_intents[found].id;
@@ -7262,6 +7273,7 @@
 +#define WPDR_SERVICE 66u
 +static bool wpdr_registered, wpdr_wlan_up;
 +static void wpdr_register_wlan(uint32_t node, uint32_t port);
++static void wtftp_drive(void);   /* M3c: stream the active firmware read (defined with the tftp block) */
 +
 +static struct wqrtr_port *
 +wqrtr_open(wqrtr_recv_t receive, void *context)
@@ -7440,6 +7452,7 @@
 +		printf("SWEET WIFI: [11] M2d/M3: listening %d ms for QRTR services + rmtfs/wlan activity...\n", listen_iters * 10);
 +		for (t = 0; t < listen_iters && !wgl.broken; t++) {
 +			wglink_pump();
++			if (wifi_level >= 14) { wtftp_drive(); }   /* stream firmware the modem is reading as intents free */
 +			delay_for_interval(10, NSEC_PER_MSEC);
 +			if (wifi_level >= 15 && !wpdr_registered && t >= 300) {
 +				/* once the modem's notifier (svc 66) is up, register for wlan_pd ONCE so the modem spawns it. */
@@ -7836,6 +7849,8 @@
 +static uint32_t wtftp_requests, wtftp_served, wtftp_refused, wservreg_requests;
 +
 +static void wtftp_transfer_receive(void *ctx, uint32_t node, uint32_t port, const void *data, uint32_t length);
++static void wtftp_send_window(struct wtftp_transfer *t, uint32_t from);
++static struct wtftp_transfer *wtftp_active;   /* the read being streamed by wtftp_drive() from the pump loop */
 +
 +static void
 +wtftp_error(struct wqrtr_port *from, uint32_t node, uint32_t port, uint16_t code, const char *text)
@@ -7856,7 +7871,23 @@
 +	t->data = NULL;
 +	if (t->written != NULL) { wkfree(t->written, WTFTP_WRITE_MAX); t->written = NULL; }
 +	if (t->port != NULL) { wqrtr_close(t->port); t->port = NULL; }
++	if (wtftp_active == t) { wtftp_active = NULL; }
 +	t->done = true;
++}
++
++/* Stream the active read forward as GLINK intents allow. GLINK is reliable + intent-flow-controlled, so we
++ * push blocks continuously (not one TFTP window per ACK) -- each send that lacks an intent asks the modem
++ * for one (wglink_send) and the next tick retries. Called every pump iteration. */
++static void
++wtftp_drive(void)
++{
++	struct wtftp_transfer *t = wtftp_active;
++	uint64_t eff;
++	uint32_t last;
++	if (t == NULL || t->done || t->writing || t->data == NULL) { return; }
++	eff = t->rsize != 0u ? (t->size - t->seek < t->rsize ? t->size - t->seek : t->rsize) : (t->size - t->seek);
++	last = (uint32_t)((eff + t->blksize - 1u) / t->blksize);
++	if (t->sent < last) { wtftp_send_window(t, t->sent); }
 +}
 +
 +/* Blocks `from`+1 onward, a window of them (TFTP blocks are numbered from 1). */
@@ -7948,7 +7979,8 @@
 +		}
 +		wtftp_served++; wtftp_transfer_end(t); return;
 +	}
-+	wtftp_send_window(t, block);
++	/* sending is driven by wtftp_drive() from the pump loop (reliable GLINK + intent flow control); the
++	 * modem's ACKs here only confirm progress and detect completion. */
 +}
 +
 +static const char *
@@ -8039,6 +8071,7 @@
 +	t->port = wqrtr_open(wtftp_transfer_receive, t);
 +	if (t->port == NULL) { if (!t->borrowed) { wkfree((uint8_t *)(uintptr_t)file, size); } wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_ENOENT, "no port"); return; }
 +	t->node = node; t->peer = port; t->data = file; t->size = size; t->blksize = blksize; t->wsize = wsize; t->rsize = rsize; t->seek = seek;
++	wtftp_active = t;   /* wtftp_drive() streams it from the pump loop */
 +	strlcpy(t->name, name, sizeof(t->name));
 +	printf("SWEET WIFI: [14] tftp: modem reads \"%s\": %llu bytes (blk %u win %u seek %u rsize %u)\n", name, size, blksize, wsize, seek, rsize);
 +	if (!options) { wtftp_send_window(t, 0); return; }

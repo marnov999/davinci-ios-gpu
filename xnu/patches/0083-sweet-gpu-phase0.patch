@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8511 @@
+@@ -0,0 +1,8580 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7279,6 +7279,9 @@
 +static bool wpdr_registered, wpdr_wlan_up;
 +static void wpdr_register_wlan(uint32_t node, uint32_t port);
 +static void wtftp_drive(void);   /* M3c: stream the active firmware read (defined with the tftp block) */
++#define WWLFW_SERVICE 69u        /* 0x45: the wlan firmware QMI service in wlan_pd */
++static bool wwlfw_started;
++static void wwlfw_start(uint32_t node, uint32_t port);   /* M4: WLFW QMI client (icnss emulation) */
 +
 +static struct wqrtr_port *
 +wqrtr_open(wqrtr_recv_t receive, void *context)
@@ -7395,7 +7398,7 @@
 +		}
 +		printf("SWEET WIFI: [11] qrtr: >>> SERVICE %u (%#x) version %u instance %u at node %u port %u%s\n",
 +		    c.words[0], c.words[0], c.words[1] & 0xffu, c.words[1] >> 8, c.words[2], c.words[3],
-+		    c.words[0] == 0x27u || c.words[0] == 39u ? "   <<< WLFW = Wi-Fi!" : "");
++		    c.words[0] == 0x45u || c.words[0] == 69u ? "   <<< WLFW = Wi-Fi!" : "");
 +		break;
 +	}
 +	case QRTR_NEW_LOOKUP: {
@@ -7473,10 +7476,11 @@
 +				if (wlfw_at < 0) {
 +					unsigned i;
 +					for (i = 0; i < 64u; i++) {
-+						if (wqrtr_servers[i].there && (wqrtr_servers[i].service == 0x27u || wqrtr_servers[i].service == 39u)) {
++						if (wqrtr_servers[i].there && (wqrtr_servers[i].service == 0x45u || wqrtr_servers[i].service == 69u)) {
 +							wlfw_at = t;
 +							printf("SWEET WIFI: [14] >>>>> WLFW (service 39, Wi-Fi firmware) IS UP after %d ms -- wlan_pd started! node %u port %u <<<<<\n",
 +							    t * 10, wqrtr_servers[i].node, wqrtr_servers[i].port);
++							if (wifi_level >= 16 && !wwlfw_started) { wwlfw_start(wqrtr_servers[i].node, wqrtr_servers[i].port); }
 +							break;
 +						}
 +					}
@@ -8292,6 +8296,71 @@
 +	(void)wqrtr_send(wpdr_port->number, node, port, req, at);
 +	wpdr_registered = true;
 +	printf("SWEET WIFI: [15] pdr: registered listener for %s with modem notifier (svc 66) node %u port %u\n", WPDR_WLAN_PATH, node, port);
++}
++
++/* ---- M4: WLFW QMI client (icnss emulation) -- talk to the wlan firmware in wlan_pd (QMI service 0x45) --
++ * Hand-rolled ath10k qmi_wlfw_v01 (hakios.wlfw.c is the shape; ids are ath10k's). M4a: open the client,
++ * IND_REGISTER (subscribe) + CAP (read chip/board), log what the firmware answers. Later: MSA, BDF, mode. */
++#define WWLFW_IND_REGISTER  0x0020u
++#define WWLFW_FW_READY_IND  0x0021u
++#define WWLFW_MSA_READY_IND 0x0022u
++#define WWLFW_CAP           0x0024u
++
++static struct wqrtr_port *wwlfw_port;
++static uint32_t wwlfw_node, wwlfw_portno;
++static uint16_t wwlfw_txn;
++
++static void
++wwlfw_req(uint16_t msg, const uint8_t *body, unsigned blen)
++{
++	uint8_t req[256];
++	if (wwlfw_port == NULL || 7u + blen > sizeof(req)) { return; }
++	req[0] = WQMI_REQUEST; req[1] = (uint8_t)(++wwlfw_txn); req[2] = (uint8_t)(wwlfw_txn >> 8);
++	req[3] = (uint8_t)msg; req[4] = (uint8_t)(msg >> 8);
++	req[5] = (uint8_t)blen; req[6] = (uint8_t)(blen >> 8);
++	if (blen != 0u) { memcpy(req + 7, body, blen); }
++	(void)wqrtr_send(wwlfw_port->number, wwlfw_node, wwlfw_portno, req, 7u + blen);
++}
++
++static void
++wwlfw_receive(void *ctx, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data, *v;
++	uint16_t msg, size = 0;
++	(void)ctx; (void)node; (void)port;
++	if (length < 5u) { return; }
++	msg = (uint16_t)(m[3] | m[4] << 8);
++	if (m[0] == WQMI_INDICATION) {
++		printf("SWEET WIFI: [16] wlfw: INDICATION %#x (%u bytes)%s\n", msg, length,
++		    msg == WWLFW_FW_READY_IND ? " = FW READY" : (msg == WWLFW_MSA_READY_IND ? " = MSA READY" : ""));
++		return;
++	}
++	v = wqmi_tlv(m, length, 0x02, &size);   /* QMI result TLV: result(2) error(2) */
++	printf("SWEET WIFI: [16] wlfw: response to %#x: %s (result %u err %u), %u bytes\n", msg,
++	    (v && size >= 4u && (v[0] | v[1] << 8) == 0) ? "SUCCESS" : "FAIL",
++	    v && size >= 4u ? (unsigned)(v[0] | v[1] << 8) : 0xffffu, v && size >= 4u ? (unsigned)(v[2] | v[3] << 8) : 0xffffu, length);
++	if (msg == WWLFW_CAP && length > 7u) {   /* dump the capability body raw (chip/board/fw-version) for now */
++		char line[520]; int at = 0; unsigned i, n = length < 200u ? length : 200u;
++		for (i = 7; i < n && at < (int)sizeof(line) - 4; i++) { at += snprintf(line + at, sizeof(line) - (size_t)at, "%02x", m[i]); }
++		printf("SWEET WIFI: [16] wlfw: CAP body[7..]: %s\n", line);
++	}
++}
++
++static void
++wwlfw_start(uint32_t node, uint32_t port)
++{
++	uint8_t ind[32]; unsigned at = 0;
++	if (wwlfw_port == NULL) { wwlfw_port = wqrtr_open(wwlfw_receive, NULL); }
++	if (wwlfw_port == NULL) { return; }
++	wwlfw_node = node; wwlfw_portno = port; wwlfw_started = true;
++	printf("SWEET WIFI: [16] wlfw: client up -- talking to WLFW (svc 69) node %u port %u\n", node, port);
++	/* IND_REGISTER: subscribe to fw-ready / msa-ready (ath10k optional TLVs 0x11/0x13 {valid u8, value u8},
++	 * client_id 0x16 {valid, u32}). Guessed TLV numbers -- the response tells us if the firmware minds. */
++	ind[at++] = 0x11; ind[at++] = 1; ind[at++] = 0; ind[at++] = 1;   /* fw_ready_enable = 1 */
++	ind[at++] = 0x13; ind[at++] = 1; ind[at++] = 0; ind[at++] = 1;   /* msa_ready_enable = 1 */
++	ind[at++] = 0x16; ind[at++] = 4; ind[at++] = 0; ind[at++] = 0x55; ind[at++] = 0; ind[at++] = 0; ind[at++] = 0;  /* client_id */
++	wwlfw_req(WWLFW_IND_REGISTER, ind, at);
++	wwlfw_req(WWLFW_CAP, NULL, 0);   /* CAP request is empty */
 +}
 +
 +static void

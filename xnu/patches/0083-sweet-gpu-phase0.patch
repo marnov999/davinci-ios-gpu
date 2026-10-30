@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8350 @@
+@@ -0,0 +1,8437 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7258,6 +7258,11 @@
 +static struct { uint32_t service, instance, port; } wour_servers[4];
 +static uint32_t wqrtr_next_port = 0x4000u;
 +
++/* M4 trigger (defined with the PDR client below wrmtfs_start, used from the listen loop above it). */
++#define WPDR_SERVICE 66u
++static bool wpdr_registered, wpdr_wlan_up;
++static void wpdr_register_wlan(uint32_t node, uint32_t port);
++
 +static struct wqrtr_port *
 +wqrtr_open(wqrtr_recv_t receive, void *context)
 +{
@@ -7436,6 +7441,17 @@
 +		for (t = 0; t < listen_iters && !wgl.broken; t++) {
 +			wglink_pump();
 +			delay_for_interval(10, NSEC_PER_MSEC);
++			if (wifi_level >= 15 && !wpdr_wlan_up && (t == 300 || (t > 300 && !wpdr_registered) || (t % 1500 == 0 && t > 0))) {
++				/* once the modem's notifier (svc 66) is up, register for wlan_pd so the modem spawns it;
++				 * re-send every 15 s until wlan_pd reports UP (the modem may not be ready on the first try). */
++				unsigned i;
++				for (i = 0; i < 64u; i++) {
++					if (wqrtr_servers[i].there && wqrtr_servers[i].service == WPDR_SERVICE) {
++						wpdr_register_wlan(wqrtr_servers[i].node, wqrtr_servers[i].port);
++						break;
++					}
++				}
++			}
 +			if (wifi_level >= 14) {
 +				if (wlfw_at < 0) {
 +					unsigned i;
@@ -8131,6 +8147,77 @@
 +	}
 +	answer[5] = (uint8_t)(at - 7); answer[6] = (uint8_t)((at - 7) >> 8);
 +	(void)wqrtr_send(wservreg_port->number, node, port, answer, at);
++}
++
++/* ---- servreg NOTIFIER client (PDR): make the modem spawn wlan_pd -------------------------------------
++ * MIUI's wlan driver connects to the modem's notifier (QMI service 66 / 0x42, instance 180) and registers
++ * a listener for "msm/modem/wlan_pd"; the modem then STARTS wlan_pd (loads wlanmdsp.mbn) and sends a
++ * state=UP(0x1fffffff) indication, which the host ACKs -> wlan_pd registers WLFW (service 39). Linux
++ * drivers/soc/qcom/pdr_interface.c. Without this the modem only pre-reads wlanmdsp.mbn and never starts
++ * the PD (seen in wifi23). */
++#define WPDR_REGISTER_LISTENER 0x20u
++#define WPDR_STATE_UPDATED_IND 0x22u
++#define WPDR_SET_ACK           0x23u
++#define WPDR_STATE_UP          0x1fffffffu
++#define WQMI_INDICATION        4u
++#define WPDR_WLAN_PATH         "msm/modem/wlan_pd"
++
++static struct wqrtr_port *wpdr_port;
++static uint16_t wpdr_txn;
++
++static void
++wpdr_ack(uint32_t node, uint32_t port, const char *path, uint16_t txn)
++{
++	uint8_t req[96];
++	unsigned at = 7, plen = (unsigned)strlen(path);
++	req[0] = WQMI_REQUEST; req[1] = (uint8_t)(++wpdr_txn); req[2] = (uint8_t)(wpdr_txn >> 8);
++	req[3] = WPDR_SET_ACK & 0xffu; req[4] = 0;
++	req[at++] = 0x01; req[at++] = (uint8_t)plen; req[at++] = (uint8_t)(plen >> 8); memcpy(req + at, path, plen); at += plen;
++	req[at++] = 0x02; req[at++] = 2; req[at++] = 0; req[at++] = (uint8_t)txn; req[at++] = (uint8_t)(txn >> 8);
++	req[5] = (uint8_t)(at - 7); req[6] = (uint8_t)((at - 7) >> 8);
++	(void)wqrtr_send(wpdr_port->number, node, port, req, at);
++}
++
++static void
++wpdr_receive(void *ctx, uint32_t node, uint32_t port, const void *data, uint32_t length)
++{
++	const uint8_t *m = data, *v;
++	uint16_t msg, size = 0;
++	(void)ctx;
++	if (length < 5u) { return; }
++	msg = (uint16_t)(m[3] | m[4] << 8);
++	if (m[0] == WQMI_RESPONSE && msg == WPDR_REGISTER_LISTENER) {
++		v = wqmi_tlv(m, length, 0x10, &size);
++		printf("SWEET WIFI: [15] pdr: wlan_pd register-listener response%s%s\n",
++		    v && size >= 4u ? ", current state " : "", v && size >= 4u ? (wle32(v) == WPDR_STATE_UP ? "UP" : "down") : "");
++		if (v && size >= 4u && wle32(v) == WPDR_STATE_UP) { wpdr_wlan_up = true; }
++	} else if (m[0] == WQMI_INDICATION && msg == WPDR_STATE_UPDATED_IND) {
++		uint32_t state = 0; uint16_t txn = 0; char path[64] = "";
++		v = wqmi_tlv(m, length, 0x01, &size); if (v && size >= 4u) { state = wle32(v); }
++		v = wqmi_tlv(m, length, 0x02, &size); if (v) { snprintf(path, sizeof(path), "%.*s", (int)(size < 63u ? size : 63u), (const char *)v); }
++		v = wqmi_tlv(m, length, 0x03, &size); if (v && size >= 2u) { txn = (uint16_t)(v[0] | v[1] << 8); }
++		printf("SWEET WIFI: [15] pdr: >>>>> %s is %s (state %#x) -- ACKing <<<<<\n", path, state == WPDR_STATE_UP ? "UP" : "down", state);
++		wpdr_ack(node, port, path, txn);
++		if (state == WPDR_STATE_UP) { wpdr_wlan_up = true; }
++	}
++}
++
++static void
++wpdr_register_wlan(uint32_t node, uint32_t port)
++{
++	uint8_t req[96];
++	unsigned at = 7, plen = (unsigned)strlen(WPDR_WLAN_PATH);
++	if (wpdr_port == NULL) { wpdr_port = wqrtr_open(wpdr_receive, NULL); }
++	if (wpdr_port == NULL) { return; }
++	req[0] = WQMI_REQUEST; req[1] = (uint8_t)(++wpdr_txn); req[2] = (uint8_t)(wpdr_txn >> 8);
++	req[3] = WPDR_REGISTER_LISTENER & 0xffu; req[4] = 0;
++	req[at++] = 0x01; req[at++] = 1; req[at++] = 0; req[at++] = 1;                   /* enable = 1 */
++	req[at++] = 0x02; req[at++] = (uint8_t)plen; req[at++] = (uint8_t)(plen >> 8);   /* service_path */
++	memcpy(req + at, WPDR_WLAN_PATH, plen); at += plen;
++	req[5] = (uint8_t)(at - 7); req[6] = (uint8_t)((at - 7) >> 8);
++	(void)wqrtr_send(wpdr_port->number, node, port, req, at);
++	wpdr_registered = true;
++	printf("SWEET WIFI: [15] pdr: registered listener for %s with modem notifier (svc 66) node %u port %u\n", WPDR_WLAN_PATH, node, port);
 +}
 +
 +static void

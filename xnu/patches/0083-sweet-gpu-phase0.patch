@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8580 @@
+@@ -0,0 +1,8668 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -8299,16 +8299,58 @@
 +}
 +
 +/* ---- M4: WLFW QMI client (icnss emulation) -- talk to the wlan firmware in wlan_pd (QMI service 0x45) --
-+ * Hand-rolled ath10k qmi_wlfw_v01 (hakios.wlfw.c is the shape; ids are ath10k's). M4a: open the client,
-+ * IND_REGISTER (subscribe) + CAP (read chip/board), log what the firmware answers. Later: MSA, BDF, mode. */
++ * Hand-rolled ath10k qmi_wlfw_v01; message ids/TLVs are EXACT (raphael ath10k is the same WCN3990). M4b:
++ * the full icnss server-arrive handshake -- IND_REGISTER -> HOST_CAP -> MSA_INFO -> TZ-assign the MSA
++ * carveout to {MSS_MSA,WLAN,WLAN_CE} -> MSA_READY -> CAP (reads chip/board/fw). Later: BDF, WLAN mode. */
 +#define WWLFW_IND_REGISTER  0x0020u
 +#define WWLFW_FW_READY_IND  0x0021u
 +#define WWLFW_MSA_READY_IND 0x0022u
 +#define WWLFW_CAP           0x0024u
++#define WWLFW_MSA_INFO      0x002Du
++#define WWLFW_MSA_READY     0x002Eu
++#define WWLFW_HOST_CAP      0x0034u
++#define WWLFW_CLIENT_ID     0x4b4e454cu   /* ATH10K_QMI_CLIENT_ID */
++#define WMSA_PA             0x97d00000ull /* wlan_msa_region (davinci DT) */
++#define WMSA_SIZE           0x180000u
++#define WVMID_WLAN          0x18u
++#define WVMID_WLAN_CE       0x19u
 +
 +static struct wqrtr_port *wwlfw_port;
 +static uint32_t wwlfw_node, wwlfw_portno;
 +static uint16_t wwlfw_txn;
++static bool wwlfw_msa_assigned;
++
++/* TZ mem-assign the MSA carveout: HLOS -> {MSS_MSA, WLAN[, WLAN_CE if !secure]} rw. Mirrors wrmtfs_assign
++ * (ath10k_qmi_map_msa_permission does exactly this). Returns the SCM result (0 = ok), fills *answer. */
++static int32_t
++wmsa_assign(uint64_t pa_region, uint32_t size, bool secure, uint64_t *answer)
++{
++	vm_offset_t cva = 0;
++	uint64_t pa = 0;
++	uint8_t *page;
++	unsigned destinations, i;
++	*answer = ~0ull;
++	if (gmub_alloc_phys(&cva, &pa, PAGE_SIZE) != 0) { return -1; }
++	page = (uint8_t *)cva;
++	for (i = 0; i < PAGE_SIZE; i += 8u) { *(volatile uint64_t *)(page + i) = 0; }
++	*(volatile uint64_t *)(page + 0) = pa_region;                   /* the memory */
++	*(volatile uint64_t *)(page + 8) = size;
++	*(volatile uint32_t *)(page + 64) = WVMID_HLOS;                 /* source: HLOS alone */
++	*(volatile uint32_t *)(page + 128 + 0)  = WVMID_MSS_MSA; *(volatile uint32_t *)(page + 128 + 4)  = WVM_PERM_RW;
++	*(volatile uint32_t *)(page + 128 + 24) = WVMID_WLAN;    *(volatile uint32_t *)(page + 128 + 28) = WVM_PERM_RW;
++	destinations = 2;
++	if (!secure) {
++		*(volatile uint32_t *)(page + 128 + 48) = WVMID_WLAN_CE; *(volatile uint32_t *)(page + 128 + 52) = WVM_PERM_RW;
++		destinations = 3;
++	}
++	*(volatile uint64_t *)(page + 240 + 0)  = 1u * 4u;                        /* arg3: sources size */
++	*(volatile uint64_t *)(page + 240 + 8)  = pa + 128u;                      /* arg4: destinations */
++	*(volatile uint64_t *)(page + 240 + 16) = (uint64_t)destinations * 24u;   /* arg5: their size */
++	*(volatile uint64_t *)(page + 240 + 24) = 0;
++	gpu_dcache_clean(cva, PAGE_SIZE);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return wifi_scm4(0xc16ull, 0x1117ull, pa, 16, pa + 64u, pa + 240u, answer);
++}
 +
 +static void
 +wwlfw_req(uint16_t msg, const uint8_t *body, unsigned blen)
@@ -8327,6 +8369,7 @@
 +{
 +	const uint8_t *m = data, *v;
 +	uint16_t msg, size = 0;
++	unsigned result = 0xffffu, err = 0xffffu;
 +	(void)ctx; (void)node; (void)port;
 +	if (length < 5u) { return; }
 +	msg = (uint16_t)(m[3] | m[4] << 8);
@@ -8336,31 +8379,76 @@
 +		return;
 +	}
 +	v = wqmi_tlv(m, length, 0x02, &size);   /* QMI result TLV: result(2) error(2) */
++	if (v && size >= 4u) { result = (unsigned)(v[0] | v[1] << 8); err = (unsigned)(v[2] | v[3] << 8); }
 +	printf("SWEET WIFI: [16] wlfw: response to %#x: %s (result %u err %u), %u bytes\n", msg,
-+	    (v && size >= 4u && (v[0] | v[1] << 8) == 0) ? "SUCCESS" : "FAIL",
-+	    v && size >= 4u ? (unsigned)(v[0] | v[1] << 8) : 0xffffu, v && size >= 4u ? (unsigned)(v[2] | v[3] << 8) : 0xffffu, length);
-+	if (msg == WWLFW_CAP && length > 7u) {   /* dump the capability body raw (chip/board/fw-version) for now */
-+		char line[520]; int at = 0; unsigned i, n = length < 200u ? length : 200u;
++	    result == 0 ? "SUCCESS" : "FAIL", result, err, length);
++
++	if (msg == WWLFW_MSA_INFO) {
++		/* mem-region array is TLV 0x03: <u8 count> then count x {addr u64, size u32, secure u8} = 13 B each
++		 * (QMI serializes structs field-by-field, no padding). Assign each; then MSA_READY. */
++		uint16_t rsz = 0; const uint8_t *r = wqmi_tlv(m, length, 0x03, &rsz);
++		unsigned n = (r && rsz >= 1u) ? r[0] : 0u, k;
++		const uint8_t *e = (r != NULL) ? r + 1 : NULL;
++		if (result != 0) { printf("SWEET WIFI: [16] wlfw: MSA_INFO rejected -- not assigning MSA\n"); return; }
++		if (n == 0u) {   /* firmware returned no regions: assign the one we declared */
++			uint64_t ans = ~0ull; int32_t rc = wmsa_assign(WMSA_PA, WMSA_SIZE, false, &ans);
++			printf("SWEET WIFI: [16] wlfw: MSA assign (declared) %#llx/%#x -> ret=%d answer=%#llx\n",
++			    (unsigned long long)WMSA_PA, WMSA_SIZE, rc, (unsigned long long)ans);
++			if (rc == 0 && ans == 0) { wwlfw_msa_assigned = true; }
++		}
++		for (k = 0; k < n && e != NULL && (unsigned)(e + 13 - m) <= length; k++, e += 13) {
++			uint64_t ra = 0, ans = ~0ull; uint32_t rs; uint8_t sec; int32_t rc; unsigned b;
++			for (b = 0; b < 8u; b++) { ra |= (uint64_t)e[b] << (8u * b); }
++			rs = (uint32_t)(e[8] | e[9] << 8 | e[10] << 16 | e[11] << 24); sec = e[12];
++			rc = wmsa_assign(ra, rs, sec != 0, &ans);
++			printf("SWEET WIFI: [16] wlfw: MSA region %u %#llx/%#x secure=%u -> ret=%d answer=%#llx\n",
++			    k, (unsigned long long)ra, rs, sec, rc, (unsigned long long)ans);
++			if (rc == 0 && ans == 0) { wwlfw_msa_assigned = true; }
++		}
++		wwlfw_req(WWLFW_MSA_READY, NULL, 0);   /* MSA_READY request is empty */
++		return;
++	}
++	if (msg == WWLFW_MSA_READY) {
++		if (result == 0) { wwlfw_req(WWLFW_CAP, NULL, 0); }   /* CAP should now succeed */
++		return;
++	}
++	if (msg == WWLFW_CAP && length > 7u) {   /* dump capability body raw (chip/board/fw-version) */
++		char line[520]; int at = 0; unsigned i, n = length < 220u ? length : 220u;
 +		for (i = 7; i < n && at < (int)sizeof(line) - 4; i++) { at += snprintf(line + at, sizeof(line) - (size_t)at, "%02x", m[i]); }
 +		printf("SWEET WIFI: [16] wlfw: CAP body[7..]: %s\n", line);
++		if (result == 0) { printf("SWEET WIFI: [16] wlfw: >>>>> CAP OK -- M4b DONE (chip/board/fw read, MSA assigned=%d) <<<<<\n", wwlfw_msa_assigned); }
 +	}
 +}
 +
 +static void
 +wwlfw_start(uint32_t node, uint32_t port)
 +{
-+	uint8_t ind[32]; unsigned at = 0;
++	uint8_t ind[32], hc[8], mi[24]; unsigned at, b;
 +	if (wwlfw_port == NULL) { wwlfw_port = wqrtr_open(wwlfw_receive, NULL); }
 +	if (wwlfw_port == NULL) { return; }
 +	wwlfw_node = node; wwlfw_portno = port; wwlfw_started = true;
 +	printf("SWEET WIFI: [16] wlfw: client up -- talking to WLFW (svc 69) node %u port %u\n", node, port);
-+	/* IND_REGISTER: subscribe to fw-ready / msa-ready (ath10k optional TLVs 0x11/0x13 {valid u8, value u8},
-+	 * client_id 0x16 {valid, u32}). Guessed TLV numbers -- the response tells us if the firmware minds. */
-+	ind[at++] = 0x11; ind[at++] = 1; ind[at++] = 0; ind[at++] = 1;   /* fw_ready_enable = 1 */
++
++	/* IND_REGISTER: ath10k sets fw_ready_enable(0x10,u8)=1, msa_ready_enable(0x13,u8)=1, client_id(0x15,u32). */
++	at = 0;
++	ind[at++] = 0x10; ind[at++] = 1; ind[at++] = 0; ind[at++] = 1;   /* fw_ready_enable = 1 */
 +	ind[at++] = 0x13; ind[at++] = 1; ind[at++] = 0; ind[at++] = 1;   /* msa_ready_enable = 1 */
-+	ind[at++] = 0x16; ind[at++] = 4; ind[at++] = 0; ind[at++] = 0x55; ind[at++] = 0; ind[at++] = 0; ind[at++] = 0;  /* client_id */
++	ind[at++] = 0x15; ind[at++] = 4; ind[at++] = 0;                  /* client_id (u32) */
++	for (b = 0; b < 4u; b++) { ind[at++] = (uint8_t)(WWLFW_CLIENT_ID >> (8u * b)); }
 +	wwlfw_req(WWLFW_IND_REGISTER, ind, at);
-+	wwlfw_req(WWLFW_CAP, NULL, 0);   /* CAP request is empty */
++
++	/* HOST_CAP (0x34): daemon_support(0x10,u8)=0. */
++	at = 0;
++	hc[at++] = 0x10; hc[at++] = 1; hc[at++] = 0; hc[at++] = 0;
++	wwlfw_req(WWLFW_HOST_CAP, hc, at);
++
++	/* MSA_INFO (0x2d): msa_addr(0x01,u64), size(0x02,u32). The response drives TZ-assign -> MSA_READY -> CAP. */
++	at = 0;
++	mi[at++] = 0x01; mi[at++] = 8; mi[at++] = 0;
++	for (b = 0; b < 8u; b++) { mi[at++] = (uint8_t)(WMSA_PA >> (8u * b)); }
++	mi[at++] = 0x02; mi[at++] = 4; mi[at++] = 0;
++	for (b = 0; b < 4u; b++) { mi[at++] = (uint8_t)(WMSA_SIZE >> (8u * b)); }
++	wwlfw_req(WWLFW_MSA_INFO, mi, at);
 +}
 +
 +static void

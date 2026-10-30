@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8328 @@
+@@ -0,0 +1,8350 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7428,11 +7428,33 @@
 +		    wgl.agreed, wgl.ch.theirs, wgl.ch.acknowledged, wgl.broken, wgl.said, wgl.heard);
 +	}
 +	if (wgl.ch.open && wifi_level >= 12) {
-+		int listen_iters = wifi_level >= 13 ? 3000 : 800;   /* rmtfs needs longer (modem OPEN/ALLOC/RW) */
-+		printf("SWEET WIFI: [11] M2d/M3: listening %d ms for QRTR services + rmtfs activity...\n", listen_iters * 10);
-+		for (t = 0; t < listen_iters && !wgl.broken; t++) { wglink_pump(); delay_for_interval(10, NSEC_PER_MSEC); }
-+		printf("SWEET WIFI: [11] M2d DONE: qrtr hellos=%u, datagrams in=%u, modem node=%u (said=%u heard=%u)\n",
-+		    wqrtr_hellos, wqrtr_in, wqrtr_peer, wgl.said, wgl.heard);
++		/* level 14 keeps the link pumping long enough for the modem to load wlan_pd from wlanmdsp.mbn over
++		 * TFTP (3.8 MB, read in ELF pieces) and register WLFW (service 39) -- that is M3 complete. */
++		int listen_iters = wifi_level >= 14 ? 18000 : (wifi_level >= 13 ? 3000 : 800);
++		int wlfw_at = -1;
++		printf("SWEET WIFI: [11] M2d/M3: listening %d ms for QRTR services + rmtfs/wlan activity...\n", listen_iters * 10);
++		for (t = 0; t < listen_iters && !wgl.broken; t++) {
++			wglink_pump();
++			delay_for_interval(10, NSEC_PER_MSEC);
++			if (wifi_level >= 14) {
++				if (wlfw_at < 0) {
++					unsigned i;
++					for (i = 0; i < 64u; i++) {
++						if (wqrtr_servers[i].there && (wqrtr_servers[i].service == 0x27u || wqrtr_servers[i].service == 39u)) {
++							wlfw_at = t;
++							printf("SWEET WIFI: [14] >>>>> WLFW (service 39, Wi-Fi firmware) IS UP after %d ms -- wlan_pd started! node %u port %u <<<<<\n",
++							    t * 10, wqrtr_servers[i].node, wqrtr_servers[i].port);
++							break;
++						}
++					}
++				}
++				if ((t % 1000) == 999) {
++					printf("SWEET WIFI: [14]   +%ds: datagrams in=%u, wlfw=%s\n", (t + 1) / 100, wqrtr_in, wlfw_at >= 0 ? "UP" : "waiting");
++				}
++			}
++		}
++		printf("SWEET WIFI: [11] M2d DONE: qrtr hellos=%u, datagrams in=%u, modem node=%u (said=%u heard=%u); WLFW %s\n",
++		    wqrtr_hellos, wqrtr_in, wqrtr_peer, wgl.said, wgl.heard, wlfw_at >= 0 ? "UP" : "not seen");
 +	}
 +}
 +
@@ -8033,7 +8055,7 @@
 +static void
 +wservreg_load(void)
 +{
-+	static const char *const files[] = { "modemr.jsn", "modemuw.jsn", "wlan.jsn", "modem_wlan.jsn", "adspr.jsn", "adsps.jsn", "cdspr.jsn", "slpi_v2.jsn" };
++	static const char *const files[] = { "modemr.jsn", "modemuw.jsn", "adspr.jsn", "adsps.jsn", "adspua.jsn", "cdspr.jsn" };
 +	unsigned f;
 +	wservreg_maps = 0;
 +	for (f = 0; f < sizeof(files) / sizeof(files[0]); f++) {

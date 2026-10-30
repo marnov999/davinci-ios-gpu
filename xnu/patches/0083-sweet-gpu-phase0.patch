@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8506 @@
+@@ -0,0 +1,8511 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7123,7 +7123,9 @@
 +			break;
 +		case WGL_INTENT:
 +			for (uint32_t i = 0; (message.param1 == channel->theirs || message.param1 == channel->ours) && i < message.param2; i++) {
++				static uint32_t wgl_intent_logs;
 +				wglink_peek(words, 8u + 8u * i, 8);
++				if (wgl_intent_logs < 40u) { printf("SWEET WIFI: [11] glink: modem GRANTS intent id %u size %u on ch %u\n", words[1], words[0], message.param1); wgl_intent_logs++; }
 +				for (unsigned n = 0; n < 64u; n++) {
 +					if (!channel->their_intents[n].there || channel->their_intents[n].id == words[1]) {
 +						channel->their_intents[n].there = true;
@@ -7232,12 +7234,15 @@
 +		if (found < 0 || wgl.ch.their_intents[n].size < wgl.ch.their_intents[found].size) { found = (int)n; }
 +	}
 +	if (found < 0) {
-+		/* The modem granted no buffer big enough -- ask it for one (GLINK_INTENT_REQUEST). It replies with
-+		 * a GLINK_INTENT grant (cleared in the pump), and the caller retries. Without this, bulk sends
++		/* The modem granted no buffer big enough -- ask it for one (GLINK_INTENT_REQUEST), re-asking while
++		 * stalled. It replies with a GLINK_INTENT grant (used on a later call). Without this, bulk sends
 +		 * (the 3.8 MB wlanmdsp.mbn) never get an intent and stall at the first data block. */
-+		if (wgl.ch.intent_wanted == 0u) {
-+			wgl.ch.intent_wanted = length;
++		static uint32_t wgl_req_count;
++		if ((wgl_req_count++ % 4u) == 0u) {
++			uint32_t big = 0; unsigned k;
++			for (k = 0; k < 64u; k++) { if (wgl.ch.their_intents[k].there && wgl.ch.their_intents[k].size > big) { big = wgl.ch.their_intents[k].size; } }
 +			wglink_say(WGL_INTENT_REQUEST, wgl.ch.ours, length, NULL, 0);
++			if (wgl_req_count < 120u) { printf("SWEET WIFI: [11] glink: INTENT_REQUEST size %u (biggest granted so far %u)\n", length, big); }
 +		}
 +		return -2;
 +	}

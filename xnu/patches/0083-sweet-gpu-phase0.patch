@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8437 @@
+@@ -0,0 +1,8461 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7930,6 +7930,10 @@
 +	}
 +	if (opcode != WTFTP_ACK) { wtftp_error(t->port, node, port, (uint16_t)WTFTP_EBADOP, "expected ACK"); wtftp_transfer_end(t); return; }
 +	if ((uint64_t)t->seek + (uint64_t)block * t->blksize >= t->size || (t->rsize != 0u && (uint64_t)block * t->blksize >= t->rsize)) {
++		if (strnstr(t->name, "mbn", sizeof(t->name)) || strnstr(t->name, "bdwlan", sizeof(t->name))) {
++			printf("SWEET WIFI: [14] tftp: COMPLETED read \"%s\" (seek %u, %u blocks x%u = %llu B of %llu)\n",
++			    t->name, t->seek, block, t->blksize, (uint64_t)block * t->blksize, t->size);
++		}
 +		wtftp_served++; wtftp_transfer_end(t); return;
 +	}
 +	wtftp_send_window(t, block);
@@ -8024,7 +8028,7 @@
 +	if (t->port == NULL) { if (!t->borrowed) { wkfree((uint8_t *)(uintptr_t)file, size); } wtftp_error(wtftp_port, node, port, (uint16_t)WTFTP_ENOENT, "no port"); return; }
 +	t->node = node; t->peer = port; t->data = file; t->size = size; t->blksize = blksize; t->wsize = wsize; t->rsize = rsize; t->seek = seek;
 +	strlcpy(t->name, name, sizeof(t->name));
-+	printf("SWEET WIFI: [14] tftp: modem reads \"%s\": %llu bytes (blk %u win %u)\n", name, size, blksize, wsize);
++	printf("SWEET WIFI: [14] tftp: modem reads \"%s\": %llu bytes (blk %u win %u seek %u rsize %u)\n", name, size, blksize, wsize, seek, rsize);
 +	if (!options) { wtftp_send_window(t, 0); return; }
 +oack:
 +	oack[0] = 0; oack[1] = (uint8_t)WTFTP_OACK; at = 2;
@@ -8156,6 +8160,7 @@
 + * drivers/soc/qcom/pdr_interface.c. Without this the modem only pre-reads wlanmdsp.mbn and never starts
 + * the PD (seen in wifi23). */
 +#define WPDR_REGISTER_LISTENER 0x20u
++#define WPDR_RESTART_PD        0x24u
 +#define WPDR_STATE_UPDATED_IND 0x22u
 +#define WPDR_SET_ACK           0x23u
 +#define WPDR_STATE_UP          0x1fffffffu
@@ -8164,6 +8169,24 @@
 +
 +static struct wqrtr_port *wpdr_port;
 +static uint16_t wpdr_txn;
++static bool wpdr_restart_sent;
++
++/* SERVREG_RESTART_PD (0x24): ask the modem to (re)start the PD -- a listener alone only subscribes; a
++ * never-started wlan_pd stays down until restarted. TLV 0x01 = service_path. */
++static void
++wpdr_restart(uint32_t node, uint32_t port)
++{
++	uint8_t req[96];
++	unsigned at = 7, plen = (unsigned)strlen(WPDR_WLAN_PATH);
++	if (wpdr_port == NULL) { return; }
++	req[0] = WQMI_REQUEST; req[1] = (uint8_t)(++wpdr_txn); req[2] = (uint8_t)(wpdr_txn >> 8);
++	req[3] = WPDR_RESTART_PD & 0xffu; req[4] = 0;
++	req[at++] = 0x01; req[at++] = (uint8_t)plen; req[at++] = (uint8_t)(plen >> 8); memcpy(req + at, WPDR_WLAN_PATH, plen); at += plen;
++	req[5] = (uint8_t)(at - 7); req[6] = (uint8_t)((at - 7) >> 8);
++	(void)wqrtr_send(wpdr_port->number, node, port, req, at);
++	wpdr_restart_sent = true;
++	printf("SWEET WIFI: [15] pdr: sent RESTART_PD for %s (node %u port %u)\n", WPDR_WLAN_PATH, node, port);
++}
 +
 +static void
 +wpdr_ack(uint32_t node, uint32_t port, const char *path, uint16_t txn)
@@ -8191,6 +8214,7 @@
 +		printf("SWEET WIFI: [15] pdr: wlan_pd register-listener response%s%s\n",
 +		    v && size >= 4u ? ", current state " : "", v && size >= 4u ? (wle32(v) == WPDR_STATE_UP ? "UP" : "down") : "");
 +		if (v && size >= 4u && wle32(v) == WPDR_STATE_UP) { wpdr_wlan_up = true; }
++		else if (!wpdr_restart_sent) { wpdr_restart(node, port); }   /* down -> ask the modem to start it */
 +	} else if (m[0] == WQMI_INDICATION && msg == WPDR_STATE_UPDATED_IND) {
 +		uint32_t state = 0; uint16_t txn = 0; char path[64] = "";
 +		v = wqmi_tlv(m, length, 0x01, &size); if (v && size >= 4u) { state = wle32(v); }

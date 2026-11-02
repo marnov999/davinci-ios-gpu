@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8938 @@
+@@ -0,0 +1,9119 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -8623,6 +8623,184 @@
 +	wwlfw_req(WWLFW_MSA_INFO, mi, at);
 +}
 +
++/* ---- the WLAN SMMU (ported from HackiOS hakios.wifi.c icnss_smmu_prepare, davinci stream 0x240) ----
++ * The radio (WCN3990) reaches the host CE rings + MSA through the apps-smmu @0x15000000 as stream
++ * 0x240 (mask 1). The boot chain leaves that stream faulting, so we give it a free stage-1 context
++ * with our own page tables: the MSA identity-mapped, and the driver's rings handed IOVAs from
++ * 0xa0000000. Without this, ath10k's first HTC message never reaches the firmware (HTC -60). */
++#define WSMMU_PA            0x15000000ull
++#define WSMMU_SIZE          0x100000u            /* the whole 1 MB (dt "reg") so every context page is mapped */
++#define WRADIO_STREAM       0x240u
++#define WRADIO_STREAM_MASK  1u
++#define WRADIO_ADDR         0xa0000000ull
++#define WRADIO_ADDR_SIZE    0x10000000u
++#define WRADIO_TABLES       32u
++#define WRADIO_PTE          (3ull | 1ull<<6 | 2ull<<8 | 1ull<<10 | 1ull<<11)
++#define WPTE_ADDRESS        0x0000fffffffff000ull
++#define WSMMU_SCR0          0x000u
++#define WSMMU_IDR0          0x020u
++#define WSMMU_IDR1          0x024u
++#define WSMMU_SGFSR         0x048u
++#define WSMMU_SMR(n)        (0x800u + 4u*(n))
++#define WSMMU_S2CR(n)       (0xc00u + 4u*(n))
++#define WSMMU_CBAR(n)       (4u*(n))             /* second page */
++#define WSMMU_CBA2R(n)      (0x800u + 4u*(n))    /* second page */
++#define WSMMU_CBAR_STAGE_1  (1u<<16 | 3u<<8 | 0xfu<<12)
++#define WSMMU_CB_SCTLR      0x00u
++#define WSMMU_CB_TCR2       0x10u
++#define WSMMU_CB_TTBR0      0x20u
++#define WSMMU_CB_TTBR1      0x28u
++#define WSMMU_CB_TCR        0x30u
++#define WSMMU_CB_MAIR0      0x38u
++#define WSMMU_CB_MAIR1      0x3cu
++#define WSMMU_CB_FSR        0x58u
++#define WSMMU_CB_TLBIASID   0x610u
++#define WSMMU_CB_TLBSYNC    0x7f0u
++#define WSMMU_CB_TLBSTATUS  0x7f4u
++#define WSMMU_SCTLR_ON      (1u<<0 | 1u<<1 | 1u<<2 | 1u<<5 | 1u<<8 | 1u<<12)
++#define WSMMU_TCR_39        (25u | 1u<<8 | 1u<<10 | 3u<<12 | 1u<<23)
++#define WSMMU_TCR2_V        (1u | 1u<<4 | 7u<<15)
++#define WSMMU_MAIR0_V       0xf404ff44u
++#define WSMMU_FSR_ALL       0xc00001feu
++
++static struct {
++	bool found, on;
++	uint32_t page, pages, match, context;
++	uint32_t old_smr, old_s2cr, old_sctlr;
++	vm_offset_t tables; uint32_t table_count;
++	uint64_t next;          /* next free IOVA offset from WRADIO_ADDR */
++	vm_offset_t glb, sec, ctx;   /* mapped apps-smmu: global page, second page, the radio's context page */
++} wsp;
++static vm_offset_t wsmmu_base;
++
++static uint64_t *wradio_table(uint32_t n) { return (uint64_t *)(wsp.tables + 4096u*n); }
++
++static uint64_t *
++wradio_next(uint64_t *entry)
++{
++	uint64_t *t;
++	if (*entry & 1) {
++		for (uint32_t i = 0; i < wsp.table_count; i++) {
++			if (kvtophys((vm_offset_t)wradio_table(i)) == (*entry & WPTE_ADDRESS)) { return wradio_table(i); }
++		}
++		return NULL;
++	}
++	if (wsp.table_count == WRADIO_TABLES) { return NULL; }
++	t = wradio_table(wsp.table_count++);
++	*entry = kvtophys((vm_offset_t)t) | 3;
++	return t;
++}
++
++static bool
++wradio_enter(uint64_t address, uint64_t physical, uint64_t size, uint64_t attr)
++{
++	if (wsp.tables == 0) {
++		if (kmem_alloc(kernel_map, &wsp.tables, round_page(4096u*WRADIO_TABLES), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) { return false; }
++		wsp.table_count = 1;
++	}
++	for (uint64_t off = 0; off < size; off += 4096) {
++		uint64_t at = address + off, *l2 = wradio_next(&wradio_table(0)[at >> 30 & 0x1ff]);
++		uint64_t *l3 = l2 == NULL ? NULL : wradio_next(&l2[at >> 21 & 0x1ff]);
++		if (l3 == NULL) { printf("SWEET WIFI: [smmu] no page table left for %#llx\n", at); return false; }
++		l3[at >> 12 & 0x1ff] = (physical + off) | attr;
++	}
++	gpu_dcache_clean(wsp.tables, 4096u*WRADIO_TABLES);
++	__asm__ volatile("dsb sy" ::: "memory");
++	return true;
++}
++
++static bool
++wradio_find(void)
++{
++	bool used[256] = { false };
++	uint32_t scr0 = gpu_rd(wsp.glb, WSMMU_SCR0), idr0 = gpu_rd(wsp.glb, WSMMU_IDR0);
++	uint32_t idr1 = gpu_rd(wsp.glb, WSMMU_IDR1), matches = idr0 & 0xff, contexts = idr1 & 0xff;
++	if (scr0 & 1u<<3) { printf("SWEET WIFI: [smmu] 16-bit stream ids unsupported here\n"); return false; }
++	wsp.page = (idr1 >> 31) ? 0x10000u : 0x1000u;
++	wsp.pages = 2u << (idr1 >> 28 & 7);
++	wsp.match = ~0u;
++	for (uint32_t n = 0; n < matches && WSMMU_SMR(n) < 0xc00u; n++) {
++		uint32_t smr = gpu_rd(wsp.glb, WSMMU_SMR(n)), s2cr = gpu_rd(wsp.glb, WSMMU_S2CR(n));
++		if (smr >> 31) {
++			used[s2cr & 0xff] = true;
++			if ((((smr & 0x7fff) ^ WRADIO_STREAM) & ~((smr >> 16 & 0x7fff) | WRADIO_STREAM_MASK)) == 0) {
++				printf("SWEET WIFI: [smmu] radio stream already matched (n=%u) -- leaving alone\n", n); return false;
++			}
++		} else if (wsp.match == ~0u) { wsp.match = n; wsp.old_smr = smr; wsp.old_s2cr = s2cr; }
++	}
++	for (wsp.context = 0; wsp.context < contexts && used[wsp.context]; wsp.context++) { }
++	if (wsp.match == ~0u || wsp.context >= contexts) { printf("SWEET WIFI: [smmu] no free match/context\n"); return false; }
++	wsp.sec = wsmmu_base + wsp.page;
++	wsp.ctx = wsmmu_base + (wsp.pages + wsp.context) * wsp.page;
++	wsp.old_sctlr = gpu_rd(wsp.ctx, WSMMU_CB_SCTLR);
++	if (wsp.old_sctlr & 1) { printf("SWEET WIFI: [smmu] context %u already ON -- leaving alone\n", wsp.context); return false; }
++	printf("SWEET WIFI: [smmu] free match %u context %u (page %#x, %u pages), stream %#x\n",
++	    wsp.match, wsp.context, wsp.page, wsp.pages, WRADIO_STREAM);
++	wsp.found = true;
++	return true;
++}
++
++static bool
++wradio_on(void)
++{
++	uint32_t sees = 1u<<31 | WRADIO_STREAM_MASK<<16 | WRADIO_STREAM;
++	uint64_t root = kvtophys(wsp.tables) | (uint64_t)wsp.context << 48;
++	gpu_wr(wsp.ctx, WSMMU_CB_SCTLR, 0);
++	gpu_wr(wsp.sec, WSMMU_CBA2R(wsp.context), 1u);                 /* 64-bit */
++	gpu_wr(wsp.sec, WSMMU_CBAR(wsp.context), WSMMU_CBAR_STAGE_1);
++	gpu_wr(wsp.ctx, WSMMU_CB_TCR2, WSMMU_TCR2_V);
++	gpu_wr(wsp.ctx, WSMMU_CB_TCR, WSMMU_TCR_39);
++	gpu_wr(wsp.ctx, WSMMU_CB_TTBR0, (uint32_t)root);
++	gpu_wr(wsp.ctx, WSMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
++	gpu_wr(wsp.ctx, WSMMU_CB_TTBR1, 0); gpu_wr(wsp.ctx, WSMMU_CB_TTBR1 + 4, 0);
++	gpu_wr(wsp.ctx, WSMMU_CB_MAIR0, WSMMU_MAIR0_V); gpu_wr(wsp.ctx, WSMMU_CB_MAIR1, 0);
++	gpu_wr(wsp.ctx, WSMMU_CB_FSR, WSMMU_FSR_ALL);
++	gpu_wr(wsp.ctx, WSMMU_CB_TLBIASID, wsp.context);
++	gpu_wr(wsp.ctx, WSMMU_CB_TLBSYNC, 1);
++	for (unsigned ms = 0; gpu_rd(wsp.ctx, WSMMU_CB_TLBSTATUS) & 1; ms++) {
++		if (ms == 100) { printf("SWEET WIFI: [smmu] TLBSYNC stuck\n"); return false; }
++		delay_for_interval(1000, NSEC_PER_USEC);
++	}
++	gpu_wr(wsp.ctx, WSMMU_CB_SCTLR, WSMMU_SCTLR_ON);
++	wsp.on = true;
++	gpu_wr(wsp.glb, WSMMU_S2CR(wsp.match), wsp.context);
++	gpu_wr(wsp.glb, WSMMU_SMR(wsp.match), sees);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (gpu_rd(wsp.glb, WSMMU_SMR(wsp.match)) != sees || (gpu_rd(wsp.glb, WSMMU_S2CR(wsp.match)) & 0x300ff) != wsp.context ||
++	    !(gpu_rd(wsp.ctx, WSMMU_CB_SCTLR) & 1)) {
++		printf("SWEET WIFI: [smmu] SMMU did not take the write -- stream %#x not routed\n", WRADIO_STREAM);
++		return false;
++	}
++	printf("SWEET WIFI: [smmu] >>> stream %#x now goes through context %u with our page tables <<<\n", WRADIO_STREAM, wsp.context);
++	return true;
++}
++
++/* Called from sweet_wifi.c before ath10k starts: give the radio its SMMU context + identity-map the MSA. */
++bool
++sweet_wlan_smmu_prepare(void)
++{
++	if (wsp.on) { return true; }
++	if (wsmmu_base == 0) { wsmmu_base = ml_io_map(WSMMU_PA, WSMMU_SIZE); }
++	if (wsmmu_base == 0) { printf("SWEET WIFI: [smmu] cannot map apps-smmu\n"); return false; }
++	wsp.glb = wsmmu_base;
++	if (!wradio_find()) { return false; }
++	if (!wradio_enter(WMSA_PA, WMSA_PA, WMSA_SIZE, WRADIO_PTE)) { return false; }   /* MSA identity-mapped */
++	return wradio_on();
++}
++
++/* radio_map for hakios_wifi_radio_map: hand out an IOVA, map our memory behind it. */
++bool
++sweet_wlan_radio_map(uint64_t physical, uint64_t size, unsigned long long *address)
++{
++	size = (size + 4095u) & ~4095ull;
++	if (!wsp.on || wsp.next + size > WRADIO_ADDR_SIZE) { return false; }
++	*address = WRADIO_ADDR + wsp.next;
++	if (!wradio_enter(*address, physical, size, WRADIO_PTE)) { return false; }
++	wsp.next += size;
++	return true;
++}
++
 +/* ---- the ath10k graft (B1c): our wqrtr wrapped as the QMI engine's transport (hakios_qrtr_ops),
 + * plus the bridge sweet_wifi.c calls. Lets real upstream ath10k run the WLFW handshake + the CE
 + * datapath over our modem + QRTR when booted with wifi_ath=1. ---- */
@@ -8708,6 +8886,9 @@
 +	thread_t wt;
 +	if (started) { return; }
 +	started = true; wath_powered = true;
++	if (!sweet_wlan_smmu_prepare()) {   /* give the radio its SMMU context so it can DMA our CE rings */
++		printf("SWEET WIFI: [lx] WLAN SMMU setup FAILED -- ath10k CE datapath will not work\n");
++	}
 +	{   /* ath10k skips the MSA assign (qcom,msa-fixed-perm); establish it here as ICNSS would. The WLFW
 +	     * firmware splits MSA 0x97d00000/0x180000 into a 0x4000 secure head + the rest (seen in M4b). */
 +		uint64_t ans = 0;

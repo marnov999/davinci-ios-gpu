@@ -88,11 +88,10 @@ hakios_wifi_network(unsigned char *name, unsigned *name_length, unsigned char *p
 bool
 hakios_wifi_radio_map(uint64_t physical, unsigned long size, unsigned long long *address)
 {
-	/* davinci's WLAN apps-smmu stream (0x240) is stage-1 bypass, so the address the radio uses is
-	 * the physical address. (If a fault shows the stream is not bypassed, program a context here.) */
-	(void)size;
-	*address = physical;
-	return true;
+	/* The radio reaches our memory through its apps-smmu context (sweet_wlan_smmu_prepare): hand out
+	 * an IOVA and map host physical behind it. The boot chain leaves stream 0x240 faulting, so bypass
+	 * is not an option -- a real context + page tables are required (else ath10k HTC times out). */
+	return sweet_wlan_radio_map(physical, size, address);
 }
 
 /* ---- modem state: wired to sweet_gpu.c (our M1-M3 bring-up + firmware store) ------------------- */

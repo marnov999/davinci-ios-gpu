@@ -19,6 +19,8 @@ __BEGIN_DECLS
 int             sweet_wifi_radio_powered(void);                                /* our modem + wlan_pd + WLFW are up */
 const uint8_t  *sweet_wifi_read_firmware(const char *name, uint64_t *size);    /* firmware from WFW_DIR (wfw_read) */
 const struct hakios_qrtr_ops *sweet_wifi_qrtr_ops(void);                        /* our wqrtr wrapped for the QMI engine */
+bool            sweet_wlan_smmu_prepare(void);                                 /* give the radio stream 0x240 an SMMU context + map the MSA */
+bool            sweet_wlan_radio_map(uint64_t physical, uint64_t size, unsigned long long *address);  /* map host mem -> a radio IOVA */
 
 void            hakios_wifi_say(const char *format, ...) __printflike(1, 2);   /* debug log (may be held back) */
 void            hakios_wifi_tell(const char *format, ...) __printflike(1, 2);  /* always logged */

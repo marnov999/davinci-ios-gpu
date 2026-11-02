@@ -590,7 +590,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/sys/sweet_wifi.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,46 @@
 +/*
 + * davinci graft seam: what hakios.lx.c (the Linux-compat host glue for ath10k) asks of the
 + * platform. On HackiOS these are answered by their modem orchestration (hakios.wifi.c); here
@@ -612,6 +612,8 @@
 +int             sweet_wifi_radio_powered(void);                                /* our modem + wlan_pd + WLFW are up */
 +const uint8_t  *sweet_wifi_read_firmware(const char *name, uint64_t *size);    /* firmware from WFW_DIR (wfw_read) */
 +const struct hakios_qrtr_ops *sweet_wifi_qrtr_ops(void);                        /* our wqrtr wrapped for the QMI engine */
++bool            sweet_wlan_smmu_prepare(void);                                 /* give the radio stream 0x240 an SMMU context + map the MSA */
++bool            sweet_wlan_radio_map(uint64_t physical, uint64_t size, unsigned long long *address);  /* map host mem -> a radio IOVA */
 +
 +void            hakios_wifi_say(const char *format, ...) __printflike(1, 2);   /* debug log (may be held back) */
 +void            hakios_wifi_tell(const char *format, ...) __printflike(1, 2);  /* always logged */
@@ -2172,7 +2174,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/sweet_wifi.c
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,140 @@
 +/*
 + * davinci WiFi graft (M5): the platform seam between the Linux-compat ath10k host glue
 + * (hakios.lx.c + the ath10k.o object) and our own modem bring-up in sweet_gpu.c.
@@ -2263,11 +2265,10 @@
 +bool
 +hakios_wifi_radio_map(uint64_t physical, unsigned long size, unsigned long long *address)
 +{
-+	/* davinci's WLAN apps-smmu stream (0x240) is stage-1 bypass, so the address the radio uses is
-+	 * the physical address. (If a fault shows the stream is not bypassed, program a context here.) */
-+	(void)size;
-+	*address = physical;
-+	return true;
++	/* The radio reaches our memory through its apps-smmu context (sweet_wlan_smmu_prepare): hand out
++	 * an IOVA and map host physical behind it. The boot chain leaves stream 0x240 faulting, so bypass
++	 * is not an option -- a real context + page tables are required (else ath10k HTC times out). */
++	return sweet_wlan_radio_map(physical, size, address);
 +}
 +
 +/* ---- modem state: wired to sweet_gpu.c (our M1-M3 bring-up + firmware store) ------------------- */

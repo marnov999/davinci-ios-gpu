@@ -11,11 +11,19 @@ OUT = os.path.join(REF, '..', 'xnu', 'patches', '0200-sweet-wifi.patch')
 FILES = [
     ('xnu/files/bsd/sys/hakios.qrtr.h', 'bsd/sys/hakios.qrtr.h'),
     ('xnu/files/bsd/sys/hakios.qmi.h',  'bsd/sys/hakios.qmi.h'),
+    ('xnu/files/bsd/sys/hakios.sta.h',  'bsd/sys/hakios.sta.h'),
+    ('xnu/files/bsd/sys/hakios.net.h',  'bsd/sys/hakios.net.h'),
+    ('xnu/files/bsd/sys/hakios.lx.h',   'bsd/sys/hakios.lx.h'),
+    ('xnu/files/bsd/sys/sweet_wifi.h',  'bsd/sys/sweet_wifi.h'),
     ('xnu/files/bsd/dev/hakios.qmi.c',  'bsd/dev/hakios.qmi.c'),
+    ('xnu/files/bsd/dev/hakios.lx.c',   'bsd/dev/hakios.lx.c'),
+    ('xnu/files/bsd/dev/sweet_wifi.c',  'bsd/dev/sweet_wifi.c'),
 ]
 # bsd/conf/files lines to add (after the sweet_gpu.c anchor), in order
 CONF_ADD = [
     'bsd/dev/hakios.qmi.c\t\t\tstandard',
+    'bsd/dev/hakios.lx.c\t\t\tstandard',
+    'bsd/dev/sweet_wifi.c\t\t\tstandard',
 ]
 
 def newfile_hunk(src, dest):

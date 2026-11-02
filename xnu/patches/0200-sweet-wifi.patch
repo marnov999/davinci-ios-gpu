@@ -1,11 +1,13 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -117,7 +117,8 @@
+@@ -117,7 +117,10 @@
  bsd/dev/sweet_gpu.c			standard
  bsd/dev/sweet_dpu.c			standard
  bsd/dev/sweet_prof.c			standard
  bsd/dev/sweet_camera.c			standard
 +bsd/dev/hakios.qmi.c			standard
++bsd/dev/hakios.lx.c			standard
++bsd/dev/sweet_wifi.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
@@ -283,6 +285,350 @@
 +#endif
 +
 +#endif /* _SYS_HAKIOS_QMI_H_ */
+--- /dev/null
++++ b/bsd/sys/hakios.sta.h
+@@ -0,0 +1,122 @@
++/*
++ * Darwin-on-hakios: the station boundary.
++ *
++ * On one side whatever does the scanning and the joining with a radio: the station logic over
++ * ath11k on the phone (wifi/lx in the repository). On the other whoever wants a network: the
++ * Apple80211 requests of iOS's Wi-Fi side, answered in bsd/dev/hakios.apple80211.c, and the
++ * kernel's own join of the network it was given in a file (bsd/dev/hakios.wifi.c). Frames do
++ * not pass here, and neither does "the link is up": those go through bsd/sys/hakios.net.h,
++ * which the station side calls itself.
++ *
++ * Between the two stands bsd/dev/hakios.sta.c: one thread, on which every call into the station
++ * side is made, one at a time, and what the last scan heard, kept for whoever asks.
++ *
++ * Nothing but C's own types here: the station side is not compiled as XNU's code.
++ */
++#ifndef _SYS_HAKIOS_STA_H_
++#define _SYS_HAKIOS_STA_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define HAKIOS_STA_ELEMENTS_MOST       1024
++
++/* One access point, as a scan heard it. */
++struct hakios_sta_bss {
++	uint8_t bssid[6];
++	uint8_t ssid[32], ssid_length;
++	uint16_t frequency;                     /* MHz */
++	int16_t rssi;                           /* dBm */
++	uint16_t beacon_interval;               /* in units of 1024 microseconds */
++	uint16_t capability;                    /* the beacon's capability field */
++	uint32_t age_ms;                        /* how long ago it was last heard */
++	uint16_t elements_length;               /* the beacon's information elements as received: who asks */
++	uint8_t elements[HAKIOS_STA_ELEMENTS_MOST];    /* reads the network's protection out of them itself */
++};
++
++/* What to scan for. All zero: every channel, the radio's own way. */
++struct hakios_sta_scan {
++	uint8_t ssid[32], ssid_length;          /* ask for this network by name (a hidden one answers only then) */
++	uint16_t frequencies[64], frequency_count;      /* only these channels */
++	bool passive;                           /* only listen */
++	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
++};
++
++enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK, HAKIOS_STA_WPA3_SAE };
++
++struct hakios_sta_join {
++	uint8_t ssid[32], ssid_length;
++	uint8_t bssid[6];                       /* all zero: the access point of that name heard best */
++	int security;
++	uint8_t pmk[32];                        /* WPA2 with a passphrase: the key made of the passphrase and the name ... */
++	uint8_t passphrase[64], passphrase_length;      /* ... or, if this is not empty, the passphrase itself */
++};
++
++enum hakios_sta_phase { HAKIOS_STA_OFF, HAKIOS_STA_IDLE, HAKIOS_STA_SCANNING, HAKIOS_STA_JOINING, HAKIOS_STA_JOINED };
++
++struct hakios_sta_state {
++	enum hakios_sta_phase phase;
++	struct hakios_sta_bss bss;             /* the network joined or being joined */
++	int last_error;                         /* why the last join failed or the network was lost (an errno); 0: it was not */
++};
++
++#define HAKIOS_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */
++#define HAKIOS_STA_CHANNEL_RADAR       2u      /* ... and has to look out for radar */
++
++struct hakios_sta_channel {
++	uint16_t frequency;                     /* MHz */
++	uint16_t flags;
++};
++
++/*
++ * What the station side supplies. All but state() are called on one thread, one at a time, and
++ * may take as long as the thing takes: scan() returns when the scan is over, join() when frames
++ * can pass or it is known why not. Each gives 0 or an errno.
++ */
++struct hakios_sta_ops {
++	int (*power)(bool on);                  /* off: leave the network, stop the radio; on: start it */
++	int (*scan)(const struct hakios_sta_scan *what);
++	void (*heard)(void (*each)(const struct hakios_sta_bss *bss, void *context), void *context);   /* by the last scan */
++	int (*join)(const struct hakios_sta_join *what);
++	int (*leave)(void);
++	void (*state)(struct hakios_sta_state *state);         /* on any thread; does not sleep */
++	unsigned (*channels)(struct hakios_sta_channel *channels, unsigned most);      /* what the radio may tune to */
++	uint8_t address[6];
++};
++
++/* What happens, said to whoever listens (the Apple80211 side). */
++enum hakios_sta_event {
++	HAKIOS_STA_POWER,                      /* status: 1 on, 0 off */
++	HAKIOS_STA_SCAN_DONE,                  /* status: 0, or the scan's errno */
++	HAKIOS_STA_JOIN_DONE,                  /* status: 0, or the join's errno */
++	HAKIOS_STA_LINK,                       /* status: 1 a network is joined, 0 it has been left when asked,
++	                                         * an errno: it was lost (the access point showed us the door) */
++};
++
++#ifdef KERNEL
++/* ---- the station side ---- */
++void     hakios_sta_attach(const struct hakios_sta_ops *ops);         /* NULL: it is going away (waits for a call under way) */
++void     hakios_sta_lost(int error);                                   /* the network joined is gone by itself */
++
++/* ---- who wants a network: each asks and returns; the outcome is an event. 0, or an errno ---- */
++bool     hakios_sta_present(void);
++int      hakios_sta_ask_power(bool on);
++int      hakios_sta_ask_scan(const struct hakios_sta_scan *what);
++int      hakios_sta_ask_join(const struct hakios_sta_join *what);
++/* ... and joined again whenever the radio is turned on, until some other network is asked for */
++int      hakios_sta_ask_join_standing(const struct hakios_sta_join *what);
++int      hakios_sta_ask_leave(void);
++bool     hakios_sta_busy(void);                                        /* something asked for is not over yet */
++bool     hakios_sta_powered(void);
++/* the `index`th access point the last scan heard: true, or false when there are not that many */
++bool     hakios_sta_heard(unsigned index, struct hakios_sta_bss *bss);
++void     hakios_sta_state(struct hakios_sta_state *state);
++unsigned hakios_sta_channels(struct hakios_sta_channel *channels, unsigned most);
++bool     hakios_sta_address(uint8_t *address);
++
++/* ---- the listener: bsd/dev/hakios.apple80211.c ---- */
++void     hakios_apple80211_event(enum hakios_sta_event event, int status);
++void     hakios_apple80211_summary(void);                              /* what was asked in this run, to the log */
++#endif
++
++#endif
+--- /dev/null
++++ b/bsd/sys/hakios.net.h
+@@ -0,0 +1,67 @@
++/*
++ * en0, and what stands behind it.
++ *
++ * The network interface iOS uses here is made in bsd/dev/hakios.net.c with the kernel's own
++ * interface KPI: Ethernet as far as the rest of the kernel and user space can tell. What carries
++ * the frames is a "link", a driver of its own that knows nothing about interfaces: QEMU's virtio
++ * network device today (bsd/dev/hakios.virtio_net.c), the phone's radio or frames carried over
++ * the boot loader's USB channel tomorrow. This is all the two know of each other.
++ *
++ * A link driver
++ *   - fills in a struct hakios_net_link and calls hakios_net_attach() once, when it is ready
++ *     to carry frames (for a radio: when its firmware is up, not when it has joined a network);
++ *   - hands every frame that arrives to hakios_net_input(): from its own thread, or from
++ *     the poll function the interface's thread calls for it. Not from interrupt context;
++ *   - says with hakios_net_link_state() when frames can pass and when they no longer can
++ *     (the cable, or for a radio: associated and the keys set). configd starts DHCP on that.
++ * A frame is what goes over an Ethernet cable without the checksum at its end: destination,
++ * source, type, payload; at most HAKIOS_NET_FRAME_MAX bytes. A radio whose frames are 802.11
++ * converts in its driver (or has its firmware do it: "Ethernet decap/encap").
++ */
++#ifndef _SYS_HAKIOS_NET_H_
++#define _SYS_HAKIOS_NET_H_
++
++#ifdef KERNEL
++#include <sys/kpi_mbuf.h>
++
++#define HAKIOS_NET_FRAME_MAX   1514
++#define HAKIOS_NET_UNITS       2       /* en0: the radio (or virtio); en1: the modem's packets (hakios.cell.c) */
++
++struct hakios_net_link {
++	const char *    name;           /* for the log */
++	unsigned        unit;           /* which enN this is (0 unless said otherwise) */
++	uint8_t         address[6];     /* the interface's Ethernet address */
++	bool            wireless;       /* the interface is told to be Wi-Fi (its "subfamily"), which is how the
++	                                 * network stack and configd tell a radio from a cable */
++	bool            up;             /* frames can pass from the start (else: wait for hakios_net_link_state()) */
++	/*
++	 * Send one frame: a chain of mbufs, `length` bytes in all, the Ethernet header first. The
++	 * packet stays the caller's: copy it (mbuf_copydata()). Returns false if it had to be dropped.
++	 * Called by one thread at a time, never from interrupt context.
++	 */
++	bool            (*transmit)(mbuf_t packet, size_t length);
++	/*
++	 * Optional. Look whether frames have arrived and call hakios_net_input() for each; returns
++	 * how many there were. The interface's thread calls it every 2 ms while frames are coming and
++	 * every 10 ms when none has for a while. A link that has a thread or an interrupt of its own
++	 * leaves it NULL.
++	 */
++	unsigned        (*poll)(void);
++};
++
++/* Make en<unit> on top of that link (the structure must stay). One link per unit, once: false if there is one already. */
++bool hakios_net_attach(const struct hakios_net_link *link);
++/* A frame has arrived (on en0 / on en<unit>). Copied; the buffer is the caller's again on return. */
++void hakios_net_input(const uint8_t *frame, size_t length);
++void hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length);
++/* Frames can pass now / can no longer pass (on en0 / on en<unit>). */
++void hakios_net_link_state(bool up);
++void hakios_net_link_state_unit(unsigned unit, bool up);
++
++void hakios_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
++/* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: hakios.apple80211.c */
++errno_t hakios_apple80211_ioctl(u_long command, void *data);
++void hakios_virtio_net_init(void);     /* boot-arg virtio_net=1: QEMU's virtio network device */
++#endif /* KERNEL */
++
++#endif /* _SYS_HAKIOS_NET_H_ */
+--- /dev/null
++++ b/bsd/sys/hakios.lx.h
+@@ -0,0 +1,105 @@
++/*
++ * The whole of what the Wi-Fi driver's object asks of the kernel it is linked into. That object
++ * (tools/mk-ath11k.sh in the repository: Linux's ath11k on FreeBSD's LinuxKPI headers and our
++ * wifi/lx) is compiled as FreeBSD kernel code, bsd/dev/hakios.lx.c on this side as XNU's;
++ * neither sees the other's headers, so nothing but C's own types crosses (and the station
++ * boundary's, hakios.sta.h, which is written for both). Everything the
++ * driver's side knows of locks, timers, work queues and buffers is built in wifi/lx/src on the
++ * few calls here.
++ *
++ * Threads: the driver's code runs on threads made by lx_os_thread() and on the kernel's own
++ * threads that call into it; never in an interrupt.
++ */
++#ifndef _SYS_HAKIOS_LX_H_
++#define _SYS_HAKIOS_LX_H_
++
++#include "hakios.sta.h"
++
++/* ---- memory ---- */
++void	*lx_os_alloc(unsigned long size);			/* zeroed; NULL when there is none */
++void	 lx_os_free(void *memory, unsigned long size);
++/*
++ * Memory the radio itself reads and writes: whole pages, zeroed, which the radio knows from
++ * *address on (the machine says where: the radio sees memory through an SMMU). What either
++ * side writes the other sees at once: the processor's cache is not in between, which makes
++ * reading it slow. NULL when there is none; never given back.
++ */
++void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
++void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
++
++/* ---- saying things ---- */
++void	 lx_os_print(const char *text);				/* for whoever looks for a fault: may be kept back */
++void	 lx_os_tell(const char *text);				/* for whoever runs the machine: always said */
++void	 lx_os_panic(const char *text) __attribute__((noreturn));
++
++/* ---- time, threads, sleeping ---- */
++unsigned long long lx_os_nanoseconds(void);			/* since some moment; never goes back */
++void	*lx_os_thread_self(void);				/* a value that tells the kernel's threads apart */
++/* a thread that runs function(argument) and ends when that returns: 0, or an errno */
++int	 lx_os_thread(const char *name, void (*function)(void *), void *argument);
++/*
++ * One lock, and sleeping under it as with a condition variable: lx_os_sleep() is called with the
++ * lock held, gives it up while asleep and has it again when it returns -- 0 when woken by
++ * lx_os_wakeup() on the same address, 1 when the time (nanoseconds; 0: no limit) ran out.
++ * The lock is held for a few instructions at a time and never across a call out of the layer.
++ */
++void	 lx_os_lock(void);
++void	 lx_os_unlock(void);
++int	 lx_os_sleep(const void *address, unsigned long long nanoseconds);
++void	 lx_os_wakeup(const void *address);			/* everyone asleep on it */
++
++/* ---- the rest of the machine ---- */
++void	 lx_os_random(void *buffer, unsigned long size);	/* bytes nobody can guess */
++/* a number given to the kernel when it was started ("wifi_lx=2"); 0 if it was not */
++unsigned lx_os_option(const char *name);
++/* a file the driver asks for by the name Linux has for it, in place: 0, or an errno (ENOENT) */
++int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
++/* the processor that runs the radio's firmware: started, and up when this returns; 0 or an errno */
++int	 lx_os_rproc_boot(void);
++int	 lx_os_radio_powered(void);	/* ICNSS firmware, five rails and QDSS are ready */
++/* the radio's own address (six bytes), if the machine has one for it: 1, or 0 and nothing written */
++int	 lx_os_radio_address(unsigned char *address);
++/*
++ * The network the radio is to join, if the machine was given one: its name and its passphrase,
++ * into buffers whose sizes come in and whose contents' lengths go out. 1, or 0.
++ */
++int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length);
++
++/* ---- frames: the radio as what carries the machine's network interface ---- */
++void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
++void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
++void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
++
++/*
++ * ---- the radio's interrupts (wifi_irq=1). The radio raises one by writing a number to an address
++ * (an "MSI": the GIC's register that raises the SPI of that number); vector v of its 32 is data + v.
++ * The driver's work for one is done in thread context, on the kernel's thread for them: the
++ * function given for a vector is called there after it has fired, with the vector masked until
++ * lx_os_irq_enable(). Nothing of the driver runs in an interrupt.
++ */
++int	 lx_os_irq_msi(unsigned long long *address, unsigned *data);	/* where and what: 1, or 0 (no interrupts) */
++int	 lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument);	/* masked to begin with; 0 or an errno */
++void	 lx_os_irq_enable(unsigned vector);
++void	 lx_os_irq_disable(unsigned vector);			/* returns when its function is not running */
++void	 lx_os_irq_detach_all(void);				/* returns when no function is running */
++unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived */
++
++/* ---- the station: scanning and joining, for whoever asks the kernel (hakios.sta.h) ---- */
++void	 lx_os_station(const struct hakios_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
++void	 lx_os_station_lost(int error);				/* the network joined is gone by itself */
++
++/*
++ * ---- the names the object shows the kernel. lx_start(): bring the driver up on the radio and
++ * do what the kernel's options ask (scan; join a network). 0, or an errno. Returns when that is
++ * over or has failed; with a network joined the driver stays up, lx_transmit() sends an
++ * Ethernet frame through it (0, or an errno; called by one thread, the kernel's own for that),
++ * and lx_stop() leaves the network and takes the driver down in order (and does nothing if it
++ * is not up).
++ */
++int	 lx_start(void);
++void	 lx_stop(void);
++int	 lx_transmit(const unsigned char *frame, unsigned long length);
++/* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
++int	 lx_prepare(void);
++
++#endif
+--- /dev/null
++++ b/bsd/sys/sweet_wifi.h
+@@ -0,0 +1,38 @@
++/*
++ * davinci graft seam: what hakios.lx.c (the Linux-compat host glue for ath10k) asks of the
++ * platform. On HackiOS these are answered by their modem orchestration (hakios.wifi.c); here
++ * they are answered by sweet_wifi.c, which bridges to our own modem bring-up in sweet_gpu.c
++ * (M1-M3: MPSS + wlan_pd + WLFW up) and to wfw_read for firmware. Declared in one place so the
++ * upstream glue sees real prototypes, not implicit int-returning declarations.
++ */
++#ifndef _SYS_SWEET_WIFI_H_
++#define _SYS_SWEET_WIFI_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <sys/cdefs.h>
++
++__BEGIN_DECLS
++
++void            hakios_wifi_say(const char *format, ...) __printflike(1, 2);   /* debug log (may be held back) */
++void            hakios_wifi_tell(const char *format, ...) __printflike(1, 2);  /* always logged */
++const uint8_t  *hakios_wifi_driver_file(const char *name, uint64_t *size);     /* firmware by Linux name; NULL = ENOENT */
++int             hakios_wifi_dsp_is_up(void);                                   /* the WLAN DSP/PD is running */
++bool            hakios_wifi_icnss_ready(void);                                 /* modem + wlan_pd + WLFW up (our M3) */
++unsigned        hakios_wifi_option(const char *name);                          /* boot-arg "name" as a number; 0 if absent */
++int             hakios_wifi_radio_address(unsigned char *address);             /* the radio's MAC: 1 and 6 bytes, or 0 */
++int             hakios_wifi_network(unsigned char *name, unsigned *name_length,
++                    unsigned char *passphrase, unsigned *passphrase_length);   /* network to join: 1, or 0 */
++/* Map `size` bytes at host physical `physical` so the radio sees them (through the WLAN SMMU); the
++ * device address the radio uses goes in *address. The davinci WLAN stream is stage-1 bypass, so the
++ * device address is the physical address. true on success. */
++bool            hakios_wifi_radio_map(uint64_t physical, unsigned long size, unsigned long long *address);
++
++/* Orchestration entry (sweet_wifi.c): once our modem + wlan_pd + WLFW are up, install the QRTR
++ * transport and bring the ath10k driver up (hakios_lx_prepare + hakios_lx_start). A no-op until
++ * the radio is powered. Called from sweet_gpu.c's WiFi path on the boot-arg. */
++void            sweet_wifi_driver_up(void);
++
++__END_DECLS
++
++#endif /* _SYS_SWEET_WIFI_H_ */
 --- /dev/null
 +++ b/bsd/dev/hakios.qmi.c
 @@ -0,0 +1,963 @@
@@ -1248,4 +1594,705 @@
 +	result = txn->done ? txn->result : -ETIMEDOUT;
 +	os_unlock(&s->lock);
 +	return result;
++}
+--- /dev/null
++++ b/bsd/dev/hakios.lx.c
+@@ -0,0 +1,566 @@
++/*
++ * Darwin-on-hakios: the kernel's side of the Wi-Fi driver's object.
++ *
++ * The driver of the phone's radio is Linux's ath11k, compiled unmodified outside this tree on a
++ * layer that gives it the kernel interfaces it expects, and tied into one object that the
++ * kernel links when it is there (tools/mk-ath11k.sh and wifi/lx in the repository; the kernel
++ * is built with that object when xnu-build.sh finds it). The object shows one name, lx_start(),
++ * and asks for the calls of sys/hakios.lx.h, which are here: memory, time, threads, one lock
++ * to sleep under, the kernel's options. What it asks of the radio itself -- its firmware's
++ * files, its view of memory, the processor its firmware runs on -- is hakios.wifi.c's to
++ * answer, which knows the phone.
++ *
++ * A kernel built without the object has the lx_start() at the end of this file, which says so.
++ */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <os/atomic_private.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
++#include <sys/errno.h>
++#include <sys/random.h>
++#include <sys/hakios.lx.h>
++#include <sys/hakios.net.h>
++#include <sys/sweet_wifi.h>
++#include <sys/systm.h>
++#include <vm/memory_types.h>
++#include <vm/vm_kern.h>
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
++extern kern_return_t thread_terminate(thread_t thread);
++extern void thread_set_thread_name(thread_t thread, const char *name);
++
++#define say hakios_wifi_say
++
++static LCK_GRP_DECLARE(lx_lock_group, "hakios-lx");
++static LCK_MTX_DECLARE(lx_lock, &lx_lock_group);
++
++/* ---- memory ------------------------------------------------------------------------------------------ */
++
++void *
++lx_os_alloc(unsigned long size)
++{
++	return kalloc_data(size, Z_WAITOK | Z_ZERO);
++}
++
++void
++lx_os_free(void *memory, unsigned long size)
++{
++	kfree_data(memory, size);
++}
++
++/*
++ * In one physical piece, so that it can be mapped a second time without this processor's cache
++ * in between (as hakios.adreno.c does with what it shares with the GPU); the first, cached
++ * view is written out and never used again.
++ */
++void *
++lx_os_radio_memory(unsigned long size, unsigned long long *address)
++{
++	vm_offset_t cached = 0, uncached;
++	uint64_t physical;
++
++	size = round_page(size);
++	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		say("lx: no %lu bytes of memory in one piece\n", size);
++		return NULL;
++	}
++	physical = kvtophys(cached);
++	bzero((void *)cached, size);
++	for (vm_offset_t line = cached; line < cached + size; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line));
++	}
++	__asm__ volatile ("dsb sy");
++	uncached = ml_io_map_unmappable(physical, size, VM_WIMG_WCOMB);
++	if (uncached == 0 || !hakios_wifi_radio_map(physical, size, address)) {
++		return NULL;
++	}
++	return (void *)uncached;
++}
++
++void *
++lx_os_map_registers(unsigned long long physical, unsigned long size)
++{
++	unsigned long long page = trunc_page(physical);
++	vm_offset_t mapped = ml_io_map_unmappable(page, round_page(physical + size) - page, VM_WIMG_IO);
++
++	return mapped == 0 ? NULL : (void *)(mapped + (physical - page));
++}
++
++/* ---- saying things ----------------------------------------------------------------------------------- */
++
++void
++lx_os_print(const char *text)
++{
++	say("%s", text);
++}
++
++void
++lx_os_tell(const char *text)
++{
++	hakios_wifi_tell("%s", text);
++}
++
++void
++lx_os_panic(const char *text)
++{
++	panic("%s", text);
++}
++
++/* ---- time, threads, sleeping --------------------------------------------------------------------------- */
++
++unsigned long long
++lx_os_nanoseconds(void)
++{
++	uint64_t nanoseconds;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &nanoseconds);
++	return nanoseconds;
++}
++
++void *
++lx_os_thread_self(void)
++{
++	return current_thread();
++}
++
++struct lx_thread {
++	void (*function)(void *);
++	void *argument;
++};
++
++static void
++lx_thread_runs(void *parameter, __unused wait_result_t result)
++{
++	struct lx_thread start = *(struct lx_thread *)parameter;
++
++	kfree_type(struct lx_thread, parameter);
++	start.function(start.argument);
++	thread_terminate(current_thread());
++}
++
++int
++lx_os_thread(const char *name, void (*function)(void *), void *argument)
++{
++	struct lx_thread *start = kalloc_type(struct lx_thread, Z_WAITOK | Z_ZERO);
++	thread_t thread;
++
++	if (start == NULL) {
++		return ENOMEM;
++	}
++	start->function = function;
++	start->argument = argument;
++	if (kernel_thread_start(lx_thread_runs, start, &thread) != KERN_SUCCESS) {
++		kfree_type(struct lx_thread, start);
++		return EAGAIN;
++	}
++	thread_set_thread_name(thread, name);
++	thread_deallocate(thread);
++	return 0;
++}
++
++void
++lx_os_lock(void)
++{
++	lck_mtx_lock(&lx_lock);
++}
++
++void
++lx_os_unlock(void)
++{
++	lck_mtx_unlock(&lx_lock);
++}
++
++int
++lx_os_sleep(const void *address, unsigned long long nanoseconds)
++{
++	uint64_t deadline;
++
++	if (nanoseconds == 0) {
++		return lck_mtx_sleep(&lx_lock, LCK_SLEEP_DEFAULT, (event_t)address, THREAD_UNINT) == THREAD_TIMED_OUT;
++	}
++	nanoseconds_to_absolutetime(nanoseconds, &deadline);
++	deadline += mach_absolute_time();
++	return lck_mtx_sleep_deadline(&lx_lock, LCK_SLEEP_DEFAULT, (event_t)address, THREAD_UNINT, deadline) == THREAD_TIMED_OUT;
++}
++
++void
++lx_os_wakeup(const void *address)
++{
++	thread_wakeup((event_t)address);
++}
++
++/* ---- the rest of the machine ------------------------------------------------------------------------- */
++
++void
++lx_os_random(void *buffer, unsigned long size)
++{
++	read_random(buffer, (u_int)size);
++}
++
++unsigned
++lx_os_option(const char *name)
++{
++	return hakios_wifi_option(name);
++}
++
++int
++lx_os_firmware(const char *name, const void **data, unsigned long *size)
++{
++	uint64_t length = 0;
++	const uint8_t *file = hakios_wifi_driver_file(name, &length);
++
++	if (file == NULL) {
++		return ENOENT;
++	}
++	*data = file;
++	*size = (unsigned long)length;
++	return 0;
++}
++
++int
++lx_os_rproc_boot(void)
++{
++	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
++}
++
++int lx_os_radio_powered(void) { return hakios_wifi_icnss_ready(); }
++
++int
++lx_os_radio_address(unsigned char *address)
++{
++	return hakios_wifi_radio_address(address);
++}
++
++int
++lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length)
++{
++	return hakios_wifi_network(name, name_length, passphrase, passphrase_length);
++}
++
++/* ---- frames: the radio as the link behind en0 (sys/hakios.net.h) ------------------------------------ */
++
++/*
++ * A frame from the network stack comes on whatever thread sends it, and the driver's side keeps
++ * a record of every thread that enters it: so frames are put in a queue here, and one thread of
++ * ours takes them to the driver. A queue that is full drops what comes (TCP sends it again).
++ */
++#define LX_QUEUE        256
++
++struct lx_frame {
++	uint16_t length;
++	uint8_t bytes[HAKIOS_NET_FRAME_MAX];
++};
++
++static bool lx_link_attached;
++static LCK_MTX_DECLARE(lx_queue_lock, &lx_lock_group);
++static struct lx_frame *lx_queue;
++static uint32_t lx_queue_in, lx_queue_out;      /* frames put in and taken out, counted from the start */
++static uint64_t lx_queue_dropped;
++
++static void
++lx_queue_runs(__unused void *parameter, __unused wait_result_t result)
++{
++	for (;;) {
++		struct lx_frame *frame;
++
++		lck_mtx_lock(&lx_queue_lock);
++		while (lx_queue_in == lx_queue_out) {
++			lck_mtx_sleep(&lx_queue_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_queue_in, THREAD_UNINT);
++		}
++		frame = &lx_queue[lx_queue_out % LX_QUEUE];     /* (stays ours until lx_queue_out moves) */
++		lck_mtx_unlock(&lx_queue_lock);
++		lx_transmit(frame->bytes, frame->length);
++		lck_mtx_lock(&lx_queue_lock);
++		lx_queue_out++;
++		lck_mtx_unlock(&lx_queue_lock);
++	}
++}
++
++static bool
++lx_link_transmit(mbuf_t packet, size_t length)
++{
++	struct lx_frame *frame;
++
++	lck_mtx_lock(&lx_queue_lock);
++	if (length > HAKIOS_NET_FRAME_MAX || lx_queue_in - lx_queue_out == LX_QUEUE) {
++		lx_queue_dropped++;
++		lck_mtx_unlock(&lx_queue_lock);
++		return false;
++	}
++	frame = &lx_queue[lx_queue_in % LX_QUEUE];
++	if (mbuf_copydata(packet, 0, length, frame->bytes) != 0) {
++		lck_mtx_unlock(&lx_queue_lock);
++		return false;
++	}
++	frame->length = (uint16_t)length;
++	lx_queue_in++;
++	lck_mtx_unlock(&lx_queue_lock);
++	thread_wakeup((event_t)&lx_queue_in);
++	return true;
++}
++
++static struct hakios_net_link lx_link = {
++	.name = "the phone's radio (ath11k)",
++	.wireless = true,
++	.transmit = lx_link_transmit,
++};
++
++void
++lx_os_net_attach(const unsigned char *address)
++{
++	thread_t thread;
++
++	if (lx_link_attached) {
++		return;
++	}
++	lx_queue = kalloc_data(LX_QUEUE * sizeof(*lx_queue), Z_WAITOK | Z_ZERO);
++	if (lx_queue == NULL || kernel_thread_start(lx_queue_runs, NULL, &thread) != KERN_SUCCESS) {
++		say("lx: no memory or no thread for the frames to send: the radio's frames go nowhere\n");
++		return;
++	}
++	thread_set_thread_name(thread, "wifi-send");
++	thread_deallocate(thread);
++	memcpy(lx_link.address, address, sizeof(lx_link.address));
++	lx_link_attached = hakios_net_attach(&lx_link);
++	say("lx: %s\n", lx_link_attached ? "the radio is the link behind en0" : "EN0 HAS A LINK ALREADY: the radio's frames go "
++	    "nowhere");
++}
++
++/*
++ * With wifi=1 the interface is made when the kernel starts, before the radio is up: iOS's Wi-Fi
++ * side looks for it and for its registry entry as soon as it runs, once, and a radio that
++ * turns up twelve seconds later is one it has already failed to open.
++ */
++void
++hakios_lx_net_early(void)
++{
++	uint8_t address[6];
++
++	if (hakios_wifi_radio_address(address)) {
++		lx_os_net_attach(address);
++	}
++}
++
++void
++lx_os_net_link(int up)
++{
++	if (lx_link_attached) {
++		hakios_net_link_state(up != 0);
++	}
++}
++
++void
++lx_os_net_input(const unsigned char *frame, unsigned long length)
++{
++	if (lx_link_attached && length <= HAKIOS_NET_FRAME_MAX) {
++		hakios_net_input(frame, length);
++	}
++}
++
++/* ---- the radio's interrupts ------------------------------------------------------------------------------- */
++
++/*
++ * davinci: Apple XNU on this GICv3 hardware delivers no SPI to a driver (our GPU driver polls as
++ * well), so the radio's CE interrupts are POLLED -- the dispatch thread marks every enabled vector
++ * pending on a ~1 ms interval and runs ath10k's handler, which drains whatever the CE ring holds
++ * (NAPI by polling). No gic_v3_spi_*, no MSI.
++ */
++#define LX_VECTORS      32
++#define LX_IRQ_POLL_US  1000
++
++static struct {
++	void (*function)(void *);
++	void *argument;
++	bool attached;
++} lx_vector[LX_VECTORS];
++static uint32_t lx_irq_pending;                 /* vectors marked to run, not yet dealt with */
++static uint32_t lx_irq_running;                 /* the vectors whose function the thread is in */
++static uint32_t lx_irq_enabled;                 /* vectors the driver has unmasked */
++static uint64_t lx_irq_counts[LX_VECTORS];      /* times each handler has run */
++static thread_t lx_irq_thread;
++static LCK_MTX_DECLARE(lx_irq_lock, &lx_lock_group);
++
++static void
++lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
++{
++	for (;;) {
++		uint32_t pending;
++
++		for (;;) {
++			uint64_t deadline;
++			clock_interval_to_deadline(LX_IRQ_POLL_US, NSEC_PER_USEC, &deadline);
++			assert_wait_deadline((event_t)&lx_irq_pending, THREAD_UNINT, deadline);
++			if ((pending = os_atomic_xchg(&lx_irq_pending, 0, acquire)) != 0) {
++				clear_wait(current_thread(), THREAD_AWAKENED);
++				break;
++			}
++			thread_block(THREAD_CONTINUE_NULL);
++			/* woke by a signal or the poll interval: run every enabled vector */
++			if ((pending = os_atomic_load(&lx_irq_enabled, relaxed)) != 0) {
++				break;
++			}
++		}
++		for (unsigned v = 0; v < LX_VECTORS; v++) {
++			if (!(pending & 1u << v)) {
++				continue;
++			}
++			lck_mtx_lock(&lx_irq_lock);
++			if (!lx_vector[v].attached || !(lx_irq_enabled & 1u << v)) {
++				lck_mtx_unlock(&lx_irq_lock);
++				continue;
++			}
++			lx_irq_running |= 1u << v;
++			lck_mtx_unlock(&lx_irq_lock);
++			lx_vector[v].function(lx_vector[v].argument);
++			lx_irq_counts[v]++;
++			lck_mtx_lock(&lx_irq_lock);
++			lx_irq_running &= ~(1u << v);
++			lck_mtx_unlock(&lx_irq_lock);
++			thread_wakeup((event_t)&lx_irq_running);
++		}
++	}
++}
++
++int
++lx_os_irq_msi(__unused unsigned long long *address, __unused unsigned *data)
++{
++	return 0;                               /* the CE interrupts are polled, not MSI */
++}
++
++int
++lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
++{
++	if (vector >= LX_VECTORS || function == NULL) {
++		return EINVAL;
++	}
++	if (lx_irq_thread == THREAD_NULL) {
++		hakios_wifi_tell("lx: wifi irq: the radio's %d CE vectors are polled every %u us (no GIC SPI on this XNU)\n",
++		    LX_VECTORS, LX_IRQ_POLL_US);
++		if (kernel_thread_start(lx_irq_runs, NULL, &lx_irq_thread) != KERN_SUCCESS) {
++			lx_irq_thread = THREAD_NULL;
++			return ENOMEM;
++		}
++		thread_set_thread_name(lx_irq_thread, "wifi-irq");
++	}
++	lck_mtx_lock(&lx_irq_lock);
++	lx_vector[vector].function = function;
++	lx_vector[vector].argument = argument;
++	lx_vector[vector].attached = true;
++	lck_mtx_unlock(&lx_irq_lock);
++	return 0;
++}
++
++void
++lx_os_irq_enable(unsigned vector)
++{
++	if (vector < LX_VECTORS && lx_vector[vector].attached) {
++		os_atomic_or(&lx_irq_enabled, 1u << vector, relaxed);
++		thread_wakeup((event_t)&lx_irq_pending);
++	}
++}
++
++void
++lx_os_irq_disable(unsigned vector)
++{
++	if (vector >= LX_VECTORS) {
++		return;
++	}
++	os_atomic_and(&lx_irq_enabled, ~(1u << vector), relaxed);
++	if (current_thread() == lx_irq_thread) {
++		return;                         /* from the vector's own function: nothing to wait for */
++	}
++	lck_mtx_lock(&lx_irq_lock);
++	while (lx_irq_running & 1u << vector) {
++		lck_mtx_sleep(&lx_irq_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_irq_running, THREAD_UNINT);
++	}
++	lck_mtx_unlock(&lx_irq_lock);
++}
++
++void
++lx_os_irq_detach_all(void)
++{
++	os_atomic_store(&lx_irq_enabled, 0, relaxed);
++	lck_mtx_lock(&lx_irq_lock);
++	for (unsigned v = 0; v < LX_VECTORS; v++) {
++		lx_vector[v].attached = false;
++	}
++	while (lx_irq_running != 0 && current_thread() != lx_irq_thread) {
++		lck_mtx_sleep(&lx_irq_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_irq_running, THREAD_UNINT);
++	}
++	lck_mtx_unlock(&lx_irq_lock);
++	os_atomic_store(&lx_irq_pending, 0, relaxed);
++}
++
++unsigned long long
++lx_os_irq_count(unsigned vector)
++{
++	return vector < LX_VECTORS ? lx_irq_counts[vector] : 0;
++}
++
++/* ---- the station (sys/hakios.sta.h) --------------------------------------------------------------------- */
++
++void
++lx_os_station(const struct hakios_sta_ops *ops)
++{
++	hakios_sta_attach(ops);
++}
++
++void
++lx_os_station_lost(int error)
++{
++	hakios_sta_lost(error);
++}
++
++/* ---- the driver ---------------------------------------------------------------------------------------- */
++
++/* The object has its own; this is the one of a kernel built without it. */
++__attribute__((weak)) int
++lx_start(void)
++{
++	say("lx: THE DRIVER IS NOT BUILT IN: its object was not there when this kernel was built (tools/mk-ath11k.sh, then "
++	    "build the kernel again)\n");
++	return ENXIO;
++}
++
++__attribute__((weak)) void
++lx_stop(void)
++{
++}
++
++__attribute__((weak)) int
++lx_prepare(void)
++{
++	return 0;
++}
++
++__attribute__((weak)) int
++lx_transmit(__unused const unsigned char *frame, __unused unsigned long length)
++{
++	return ENXIO;
++}
++
++int
++hakios_lx_start(void)
++{
++	return lx_start();
++}
++
++void
++hakios_lx_stop(void)
++{
++	lx_stop();
++}
++
++int
++hakios_lx_prepare(void)
++{
++	return lx_prepare();
++}
+--- /dev/null
++++ b/bsd/dev/sweet_wifi.c
+@@ -0,0 +1,129 @@
++/*
++ * davinci WiFi graft (M5): the platform seam between the Linux-compat ath10k host glue
++ * (hakios.lx.c + the ath10k.o object) and our own modem bring-up in sweet_gpu.c.
++ *
++ * Phase B1: provide every symbol the glue needs so the kernel links the driver object and boots.
++ * The modem-tied answers (firmware, "is the radio powered") and the QRTR transport are wired to
++ * sweet_gpu.c in a later phase; here they report not-ready, so the driver stays down and a normal
++ * boot is unaffected. The network/station bridges to iOS (hakios.net.c/sta.c/apple80211.c) come
++ * in Phase D; until then they are harmless stubs.
++ */
++#include <sys/sweet_wifi.h>
++#include <sys/hakios.net.h>
++#include <sys/hakios.sta.h>
++#include <sys/hakios.qrtr.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++#include <stdarg.h>
++#include <string.h>
++
++/* The driver object (ath10k.o) and the glue export these; declared here so the orchestration can
++ * call them without pulling in the whole lx header set. */
++extern int  hakios_lx_prepare(void);
++extern int  hakios_lx_start(void);
++extern void hakios_lx_stop(void);
++
++/* ---- logging ------------------------------------------------------------------------------------ */
++
++static void
++wsay(const char *format, va_list args)
++{
++	char line[256];
++	vsnprintf(line, sizeof(line), format, args);
++	printf("%s", line);
++}
++
++void
++hakios_wifi_say(const char *format, ...)
++{
++	va_list args;
++	va_start(args, format);
++	wsay(format, args);
++	va_end(args);
++}
++
++void
++hakios_wifi_tell(const char *format, ...)
++{
++	va_list args;
++	va_start(args, format);
++	wsay(format, args);
++	va_end(args);
++}
++
++/* ---- boot-args --------------------------------------------------------------------------------- */
++
++unsigned
++hakios_wifi_option(const char *name)
++{
++	unsigned value = 0;
++	return PE_parse_boot_argn(name, &value, sizeof(value)) ? value : 0;
++}
++
++int
++hakios_wifi_radio_address(unsigned char *address)
++{
++	uint64_t mac = 0;   /* boot-arg wifi_mac=0x0203040506 style; 0 = none */
++	if (!PE_parse_boot_argn("wifi_mac", &mac, sizeof(mac)) || mac == 0) {
++		return 0;
++	}
++	for (int i = 0; i < 6; i++) {
++		address[5 - i] = (unsigned char)(mac >> (8 * i));
++	}
++	return 1;
++}
++
++int
++hakios_wifi_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length)
++{
++	/* The SSID/passphrase come from iOS Settings via apple80211 (Phase D); none is baked in. */
++	(void)name; (void)passphrase;
++	*name_length = 0;
++	*passphrase_length = 0;
++	return 0;
++}
++
++/* ---- the radio's DMA memory through the WLAN SMMU ---------------------------------------------- */
++
++bool
++hakios_wifi_radio_map(uint64_t physical, unsigned long size, unsigned long long *address)
++{
++	/* davinci's WLAN apps-smmu stream (0x240) is stage-1 bypass, so the address the radio uses is
++	 * the physical address. (If a fault shows the stream is not bypassed, program a context here.) */
++	(void)size;
++	*address = physical;
++	return true;
++}
++
++/* ---- modem state: wired to sweet_gpu.c in a later phase ---------------------------------------- */
++
++int  hakios_wifi_dsp_is_up(void)   { return 0; }   /* B1: not yet wired -> driver stays down */
++bool hakios_wifi_icnss_ready(void) { return false; }
++
++const uint8_t *
++hakios_wifi_driver_file(const char *name, uint64_t *size)
++{
++	(void)name;
++	*size = 0;
++	return NULL;   /* B1: firmware fetch wired to wfw_read in a later phase */
++}
++
++/* ---- network + station bridges to iOS: Phase D (harmless stubs for now) ------------------------ */
++
++bool hakios_net_attach(const struct hakios_net_link *link)      { (void)link; return false; }
++void hakios_net_input(const uint8_t *frame, size_t length)      { (void)frame; (void)length; }
++void hakios_net_link_state(bool up)                             { (void)up; }
++void hakios_sta_attach(const struct hakios_sta_ops *ops)        { (void)ops; }
++void hakios_sta_lost(int error)                                 { (void)error; }
++
++/* ---- orchestration ----------------------------------------------------------------------------- */
++
++void
++sweet_wifi_driver_up(void)
++{
++	if (!hakios_wifi_icnss_ready()) {
++		hakios_wifi_tell("SWEET WIFI: [lx] radio not powered yet -- ath10k not started (B1)\n");
++		return;
++	}
++	/* B1c: hakios_qmi_set_transport(sweet_wifi_qrtr_ops()); hakios_lx_prepare(); hakios_lx_start(); */
 +}

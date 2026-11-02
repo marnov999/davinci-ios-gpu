@@ -24,9 +24,9 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/random.h>
-#include <sys/hakios.input.h>
 #include <sys/hakios.lx.h>
 #include <sys/hakios.net.h>
+#include <sys/sweet_wifi.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -231,7 +231,6 @@ lx_os_rproc_boot(void)
 	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
 }
 
-extern bool hakios_wifi_icnss_ready(void);
 int lx_os_radio_powered(void) { return hakios_wifi_icnss_ready(); }
 
 int
@@ -368,33 +367,26 @@ lx_os_net_input(const unsigned char *frame, unsigned long length)
 
 /* ---- the radio's interrupts ------------------------------------------------------------------------------- */
 
-extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
-extern void gic_v3_spi_mask(uint32_t intid);
-extern void gic_v3_spi_unmask(uint32_t intid);
-extern void gic_v3_spi_detach(uint32_t intid);
-extern uint64_t gic_v3_spi_count(uint32_t intid);
-
+/*
+ * davinci: Apple XNU on this GICv3 hardware delivers no SPI to a driver (our GPU driver polls as
+ * well), so the radio's CE interrupts are POLLED -- the dispatch thread marks every enabled vector
+ * pending on a ~1 ms interval and runs ath10k's handler, which drains whatever the CE ring holds
+ * (NAPI by polling). No gic_v3_spi_*, no MSI.
+ */
 #define LX_VECTORS      32
+#define LX_IRQ_POLL_US  1000
 
 static struct {
 	void (*function)(void *);
 	void *argument;
 	bool attached;
 } lx_vector[LX_VECTORS];
-static uint32_t lx_irq_first;                   /* the GIC's number of vector 0; 0: no interrupts */
-static uint32_t lx_irq_pending;                 /* the vectors that have fired and are not dealt with yet */
+static uint32_t lx_irq_pending;                 /* vectors marked to run, not yet dealt with */
 static uint32_t lx_irq_running;                 /* the vectors whose function the thread is in */
+static uint32_t lx_irq_enabled;                 /* vectors the driver has unmasked */
+static uint64_t lx_irq_counts[LX_VECTORS];      /* times each handler has run */
 static thread_t lx_irq_thread;
 static LCK_MTX_DECLARE(lx_irq_lock, &lx_lock_group);
-
-/* In interrupt context: the vector masked, and the thread told. */
-static void
-lx_irq_arrived(__unused void *context, uint32_t intid)
-{
-	gic_v3_spi_mask(intid);
-	os_atomic_or(&lx_irq_pending, 1u << (intid - lx_irq_first), relaxed);
-	thread_wakeup((event_t)&lx_irq_pending);
-}
 
 static void
 lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
@@ -403,25 +395,32 @@ lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
 		uint32_t pending;
 
 		for (;;) {
-			assert_wait((event_t)&lx_irq_pending, THREAD_UNINT);
+			uint64_t deadline;
+			clock_interval_to_deadline(LX_IRQ_POLL_US, NSEC_PER_USEC, &deadline);
+			assert_wait_deadline((event_t)&lx_irq_pending, THREAD_UNINT, deadline);
 			if ((pending = os_atomic_xchg(&lx_irq_pending, 0, acquire)) != 0) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 				break;
 			}
 			thread_block(THREAD_CONTINUE_NULL);
+			/* woke by a signal or the poll interval: run every enabled vector */
+			if ((pending = os_atomic_load(&lx_irq_enabled, relaxed)) != 0) {
+				break;
+			}
 		}
 		for (unsigned v = 0; v < LX_VECTORS; v++) {
 			if (!(pending & 1u << v)) {
 				continue;
 			}
 			lck_mtx_lock(&lx_irq_lock);
-			if (!lx_vector[v].attached) {
+			if (!lx_vector[v].attached || !(lx_irq_enabled & 1u << v)) {
 				lck_mtx_unlock(&lx_irq_lock);
 				continue;
 			}
 			lx_irq_running |= 1u << v;
 			lck_mtx_unlock(&lx_irq_lock);
 			lx_vector[v].function(lx_vector[v].argument);
+			lx_irq_counts[v]++;
 			lck_mtx_lock(&lx_irq_lock);
 			lx_irq_running &= ~(1u << v);
 			lck_mtx_unlock(&lx_irq_lock);
@@ -431,29 +430,20 @@ lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
 }
 
 int
-lx_os_irq_msi(unsigned long long *address, unsigned *data)
+lx_os_irq_msi(__unused unsigned long long *address, __unused unsigned *data)
 {
-	uint32_t first = 0;
-
-	if (!hakios_wifi_radio_msi(address, data, &first)) {
-		return 0;
-	}
-	lx_irq_first = first;
-	return 1;
+	return 0;                               /* the CE interrupts are polled, not MSI */
 }
 
 int
 lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 {
-	kern_return_t kr;
-	if (hakios_is_raphael()) lx_irq_first = 446; /* SM8150 SNOC CE SPIs 414..425, level high. */
-
-	if (vector >= LX_VECTORS || lx_irq_first == 0 || function == NULL) {
+	if (vector >= LX_VECTORS || function == NULL) {
 		return EINVAL;
 	}
 	if (lx_irq_thread == THREAD_NULL) {
-		hakios_wifi_tell("lx: wifi_irq: the radio's SPIs (%u + v), %s-triggered, group 1, routed to this processor\n",
-		    lx_irq_first, hakios_is_raphael() ? "level" : "edge");
+		hakios_wifi_tell("lx: wifi irq: the radio's %d CE vectors are polled every %u us (no GIC SPI on this XNU)\n",
+		    LX_VECTORS, LX_IRQ_POLL_US);
 		if (kernel_thread_start(lx_irq_runs, NULL, &lx_irq_thread) != KERN_SUCCESS) {
 			lx_irq_thread = THREAD_NULL;
 			return ENOMEM;
@@ -465,13 +455,6 @@ lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 	lx_vector[vector].argument = argument;
 	lx_vector[vector].attached = true;
 	lck_mtx_unlock(&lx_irq_lock);
-	if ((kr = gic_v3_spi_attach(lx_irq_first + vector, !hakios_is_raphael(), lx_irq_arrived, NULL)) != KERN_SUCCESS) {
-		lck_mtx_lock(&lx_irq_lock);
-		lx_vector[vector].attached = false;
-		lck_mtx_unlock(&lx_irq_lock);
-		return kr == KERN_NAME_EXISTS ? EBUSY : EINVAL;
-	}
-	gic_v3_spi_mask(lx_irq_first + vector);
 	return 0;
 }
 
@@ -479,19 +462,20 @@ void
 lx_os_irq_enable(unsigned vector)
 {
 	if (vector < LX_VECTORS && lx_vector[vector].attached) {
-		gic_v3_spi_unmask(lx_irq_first + vector);
+		os_atomic_or(&lx_irq_enabled, 1u << vector, relaxed);
+		thread_wakeup((event_t)&lx_irq_pending);
 	}
 }
 
 void
 lx_os_irq_disable(unsigned vector)
 {
-	if (vector >= LX_VECTORS || !lx_vector[vector].attached) {
+	if (vector >= LX_VECTORS) {
 		return;
 	}
-	gic_v3_spi_mask(lx_irq_first + vector);
+	os_atomic_and(&lx_irq_enabled, ~(1u << vector), relaxed);
 	if (current_thread() == lx_irq_thread) {
-		return;                         /* (from the vector's own function, or another's: nothing to wait for) */
+		return;                         /* from the vector's own function: nothing to wait for */
 	}
 	lck_mtx_lock(&lx_irq_lock);
 	while (lx_irq_running & 1u << vector) {
@@ -503,11 +487,7 @@ lx_os_irq_disable(unsigned vector)
 void
 lx_os_irq_detach_all(void)
 {
-	for (unsigned v = 0; v < LX_VECTORS; v++) {
-		if (lx_vector[v].attached) {
-			gic_v3_spi_detach(lx_irq_first + v);
-		}
-	}
+	os_atomic_store(&lx_irq_enabled, 0, relaxed);
 	lck_mtx_lock(&lx_irq_lock);
 	for (unsigned v = 0; v < LX_VECTORS; v++) {
 		lx_vector[v].attached = false;
@@ -522,7 +502,7 @@ lx_os_irq_detach_all(void)
 unsigned long long
 lx_os_irq_count(unsigned vector)
 {
-	return vector < LX_VECTORS && lx_irq_first != 0 ? gic_v3_spi_count(lx_irq_first + vector) : 0;
+	return vector < LX_VECTORS ? lx_irq_counts[vector] : 0;
 }
 
 /* ---- the station (sys/hakios.sta.h) --------------------------------------------------------------------- */

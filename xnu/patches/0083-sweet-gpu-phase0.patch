@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8903 @@
+@@ -0,0 +1,8931 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7218,6 +7218,7 @@
 +#include <sys/sweet_wifi.h>   /* the ath10k graft: wrap our QRTR as the QMI engine's transport (B1c) */
 +static bool wath_mode;        /* boot-arg wifi_ath=1: hand WLFW to the real ath10k driver, not our wwlfw */
 +static bool wath_powered;     /* our modem + wlan_pd + WLFW are up -> ath10k may start */
++static void sweet_wifi_driver_start(void);   /* spawn ath10k's blocking lx_start off the QRTR pump thread */
 +
 +enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_RESUME_TX = 7, QRTR_NEW_LOOKUP = 10 };
 +struct wqrtr_header { uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port; };
@@ -7482,7 +7483,7 @@
 +	if (wgl.ch.open && wifi_level >= 12) {
 +		/* level 14 keeps the link pumping long enough for the modem to load wlan_pd from wlanmdsp.mbn over
 +		 * TFTP (3.8 MB, read in ELF pieces) and register WLFW (service 39) -- that is M3 complete. */
-+		int listen_iters = wifi_level >= 14 ? 18000 : (wifi_level >= 13 ? 3000 : 800);
++		int listen_iters = wath_mode ? 180000 : (wifi_level >= 14 ? 18000 : (wifi_level >= 13 ? 3000 : 800));
 +		int wlfw_at = -1;
 +		printf("SWEET WIFI: [11] M2d/M3: listening %d ms for QRTR services + rmtfs/wlan activity...\n", listen_iters * 10);
 +		for (t = 0; t < listen_iters && !wgl.broken; t++) {
@@ -7507,7 +7508,7 @@
 +							wlfw_at = t;
 +							printf("SWEET WIFI: [14] >>>>> WLFW (service 39, Wi-Fi firmware) IS UP after %d ms -- wlan_pd started! node %u port %u <<<<<\n",
 +							    t * 10, wqrtr_servers[i].node, wqrtr_servers[i].port);
-+							if (wath_mode) { wath_powered = true; sweet_wifi_driver_up(); }   /* real ath10k over our QRTR */
++							if (wath_mode) { sweet_wifi_driver_start(); }   /* real ath10k over our QRTR (runs on its own thread) */
 +							else if (wifi_level >= 16 && !wwlfw_started) { wwlfw_start(wqrtr_servers[i].node, wqrtr_servers[i].port); }
 +							break;
 +						}
@@ -8682,7 +8683,34 @@
 +
 +const struct hakios_qrtr_ops *sweet_wifi_qrtr_ops(void) { return &wath_qrtr_ops; }
 +int sweet_wifi_radio_powered(void) { return wath_powered ? 1 : 0; }
-+const uint8_t *sweet_wifi_read_firmware(const char *name, uint64_t *size) { return wfw_read(name, size); }
++const uint8_t *sweet_wifi_read_firmware(const char *name, uint64_t *size)
++{
++	const char *base = name, *p;   /* ath10k asks by Linux path (ath10k/WCN3990/hw1.0/board-2.bin); our store is flat */
++	for (p = name; *p != '\0'; p++) { if (*p == '/') { base = p + 1; } }
++	printf("SWEET WIFI: [lx] ath10k firmware request \"%s\" -> %s\n", name, base);
++	return wfw_read(base, size);
++}
++
++/* ath10k's lx_start() blocks ~20s waiting for registration (the QMI handshake), whose responses our
++ * QRTR pump must deliver -- so run it on its own thread, never on the pump thread. */
++static void
++wath_driver_thread(void *arg, wait_result_t result)
++{
++	(void)arg; (void)result;
++	sweet_wifi_driver_up();
++	(void)thread_terminate(current_thread());
++}
++
++static void
++sweet_wifi_driver_start(void)
++{
++	static bool started;
++	thread_t wt;
++	if (started) { return; }
++	started = true; wath_powered = true;
++	printf("SWEET WIFI: [lx] spawning ath10k driver thread (lx_start)\n");
++	if (kernel_thread_start(wath_driver_thread, NULL, &wt) == KERN_SUCCESS) { thread_deallocate(wt); }
++}
 +
 +static void
 +wrmtfs_start(void)

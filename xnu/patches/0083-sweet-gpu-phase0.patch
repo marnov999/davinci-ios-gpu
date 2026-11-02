@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8668 @@
+@@ -0,0 +1,8741 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -8309,16 +8309,26 @@
 +#define WWLFW_MSA_INFO      0x002Du
 +#define WWLFW_MSA_READY     0x002Eu
 +#define WWLFW_HOST_CAP      0x0034u
++#define WWLFW_BDF_DOWNLOAD  0x0025u
++#define WWLFW_CAL_REPORT    0x0026u
++#define WWLFW_FW_READY_IND2 0x0021u
 +#define WWLFW_CLIENT_ID     0x4b4e454cu   /* ATH10K_QMI_CLIENT_ID */
 +#define WMSA_PA             0x97d00000ull /* wlan_msa_region (davinci DT) */
 +#define WMSA_SIZE           0x180000u
 +#define WVMID_WLAN          0x18u
 +#define WVMID_WLAN_CE       0x19u
++#define WWLFW_BDF_CHUNK     6144u         /* QMI_WLFW_MAX_DATA_SIZE_V01 */
++#define WWLFW_BDF_FILE      "bdwlan.bin"  /* davinci board_id 0 (MIUI: "Board id: 0, version 8.0.0.6") */
 +
 +static struct wqrtr_port *wwlfw_port;
 +static uint32_t wwlfw_node, wwlfw_portno;
 +static uint16_t wwlfw_txn;
 +static bool wwlfw_msa_assigned;
++/* M4c BDF-download streaming state (board data file pushed to the FW in <=6144 B segments). */
++static const uint8_t *wwlfw_bdf;
++static uint64_t wwlfw_bdf_len, wwlfw_bdf_off;
++static uint32_t wwlfw_bdf_seg;
++static uint8_t wwlfw_big[6400];           /* one BDF segment QMI message (max 6182) */
 +
 +/* TZ mem-assign the MSA carveout: HLOS -> {MSS_MSA, WLAN[, WLAN_CE if !secure]} rw. Mirrors wrmtfs_assign
 + * (ath10k_qmi_map_msa_permission does exactly this). Returns the SCM result (0 = ok), fills *answer. */
@@ -8362,6 +8372,38 @@
 +	req[5] = (uint8_t)blen; req[6] = (uint8_t)(blen >> 8);
 +	if (blen != 0u) { memcpy(req + 7, body, blen); }
 +	(void)wqrtr_send(wwlfw_port->number, wwlfw_node, wwlfw_portno, req, 7u + blen);
++}
++
++/* BDF_DOWNLOAD (0x25): push the board data file to the FW in <=6144 B segments. ath10k sets, per segment,
++ * valid(0x01)=1, file_id(0x10,u32)=0, total_size(0x11,u32), seg_id(0x12,u32), data(0x13: u16 len + bytes),
++ * end(0x14,u8)=last. One segment per call; the response drives the next (then cal_report). */
++static void
++wwlfw_bdf_send_seg(void)
++{
++	uint8_t *b = wwlfw_big;
++	unsigned at, i, dn;
++	uint64_t remain;
++	if (wwlfw_port == NULL || wwlfw_bdf == NULL) { return; }
++	remain = wwlfw_bdf_len - wwlfw_bdf_off;
++	dn = remain > WWLFW_BDF_CHUNK ? WWLFW_BDF_CHUNK : (unsigned)remain;
++	b[0] = WQMI_REQUEST; b[1] = (uint8_t)(++wwlfw_txn); b[2] = (uint8_t)(wwlfw_txn >> 8);
++	b[3] = (uint8_t)WWLFW_BDF_DOWNLOAD; b[4] = (uint8_t)(WWLFW_BDF_DOWNLOAD >> 8);
++	at = 7;
++	b[at++] = 0x01; b[at++] = 1; b[at++] = 0; b[at++] = 1;                       /* valid = 1 */
++	b[at++] = 0x10; b[at++] = 4; b[at++] = 0; b[at++] = 0; b[at++] = 0; b[at++] = 0; b[at++] = 0;  /* file_id = 0 */
++	b[at++] = 0x11; b[at++] = 4; b[at++] = 0;                                    /* total_size */
++	for (i = 0; i < 4u; i++) { b[at++] = (uint8_t)(wwlfw_bdf_len >> (8u * i)); }
++	b[at++] = 0x12; b[at++] = 4; b[at++] = 0;                                    /* seg_id */
++	for (i = 0; i < 4u; i++) { b[at++] = (uint8_t)(wwlfw_bdf_seg >> (8u * i)); }
++	b[at++] = 0x13; b[at++] = (uint8_t)((2u + dn)); b[at++] = (uint8_t)((2u + dn) >> 8);  /* data TLV: u16 len + bytes */
++	b[at++] = (uint8_t)dn; b[at++] = (uint8_t)(dn >> 8);
++	memcpy(b + at, wwlfw_bdf + wwlfw_bdf_off, dn); at += dn;
++	b[at++] = 0x14; b[at++] = 1; b[at++] = 0; b[at++] = (wwlfw_bdf_off + dn >= wwlfw_bdf_len) ? 1u : 0u;  /* end */
++	{ unsigned blen = at - 7u; b[5] = (uint8_t)blen; b[6] = (uint8_t)(blen >> 8); }
++	(void)wqrtr_send(wwlfw_port->number, wwlfw_node, wwlfw_portno, b, at);
++	printf("SWEET WIFI: [16] wlfw: BDF seg %u off %llu +%u of %llu%s\n", wwlfw_bdf_seg,
++	    (unsigned long long)wwlfw_bdf_off, dn, (unsigned long long)wwlfw_bdf_len,
++	    (wwlfw_bdf_off + dn >= wwlfw_bdf_len) ? " (END)" : "");
 +}
 +
 +static void
@@ -8412,11 +8454,42 @@
 +		if (result == 0) { wwlfw_req(WWLFW_CAP, NULL, 0); }   /* CAP should now succeed */
 +		return;
 +	}
-+	if (msg == WWLFW_CAP && length > 7u) {   /* dump capability body raw (chip/board/fw-version) */
-+		char line[520]; int at = 0; unsigned i, n = length < 220u ? length : 220u;
-+		for (i = 7; i < n && at < (int)sizeof(line) - 4; i++) { at += snprintf(line + at, sizeof(line) - (size_t)at, "%02x", m[i]); }
-+		printf("SWEET WIFI: [16] wlfw: CAP body[7..]: %s\n", line);
-+		if (result == 0) { printf("SWEET WIFI: [16] wlfw: >>>>> CAP OK -- M4b DONE (chip/board/fw read, MSA assigned=%d) <<<<<\n", wwlfw_msa_assigned); }
++	if (msg == WWLFW_CAP) {
++		if (length > 7u) {   /* dump capability body raw (chip/board/fw-version) */
++			char line[520]; int at = 0; unsigned i, n = length < 220u ? length : 220u;
++			for (i = 7; i < n && at < (int)sizeof(line) - 4; i++) { at += snprintf(line + at, sizeof(line) - (size_t)at, "%02x", m[i]); }
++			printf("SWEET WIFI: [16] wlfw: CAP body[7..]: %s\n", line);
++		}
++		if (result == 0) {
++			uint64_t blen = 0;
++			printf("SWEET WIFI: [16] wlfw: >>>>> CAP OK -- M4b DONE (chip/board/fw read, MSA assigned=%d) <<<<<\n", wwlfw_msa_assigned);
++			/* M4c: push the board data file, then cal_report. */
++			if (wwlfw_bdf == NULL) { wwlfw_bdf = wfw_read(WWLFW_BDF_FILE, &blen); }
++			if (wwlfw_bdf != NULL) {
++				wwlfw_bdf_len = blen; wwlfw_bdf_off = 0; wwlfw_bdf_seg = 0;
++				printf("SWEET WIFI: [16] wlfw: BDF \"%s\" loaded %llu B -- downloading\n", WWLFW_BDF_FILE, (unsigned long long)blen);
++				wwlfw_bdf_send_seg();
++			} else {
++				printf("SWEET WIFI: [16] wlfw: BDF \"%s\" NOT in %s -- push it; skipping BDF\n", WWLFW_BDF_FILE, WFW_DIR);
++			}
++		}
++		return;
++	}
++	if (msg == WWLFW_BDF_DOWNLOAD) {
++		if (result != 0) { printf("SWEET WIFI: [16] wlfw: BDF seg %u REJECTED (err %u) -- stop\n", wwlfw_bdf_seg, err); return; }
++		{
++			unsigned dn = (wwlfw_bdf_len - wwlfw_bdf_off) > WWLFW_BDF_CHUNK ? WWLFW_BDF_CHUNK : (unsigned)(wwlfw_bdf_len - wwlfw_bdf_off);
++			wwlfw_bdf_off += dn; wwlfw_bdf_seg++;
++		}
++		if (wwlfw_bdf_off < wwlfw_bdf_len) { wwlfw_bdf_send_seg(); return; }
++		printf("SWEET WIFI: [16] wlfw: >>>>> BDF download COMPLETE (%llu B, %u segs) <<<<<\n",
++		    (unsigned long long)wwlfw_bdf_len, wwlfw_bdf_seg);
++		{ uint8_t cr[4]; cr[0] = 0x01; cr[1] = 1; cr[2] = 0; cr[3] = 0; wwlfw_req(WWLFW_CAL_REPORT, cr, 4); }  /* cal_report meta_data_len=0 */
++		return;
++	}
++	if (msg == WWLFW_CAL_REPORT) {
++		if (result == 0) { printf("SWEET WIFI: [16] wlfw: >>>>> CAL_REPORT OK -- M4c DONE (board data + cal in; FW awaits WLAN_MODE) <<<<<\n"); }
++		return;
 +	}
 +}
 +

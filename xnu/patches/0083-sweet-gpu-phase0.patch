@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8809 @@
+@@ -0,0 +1,8811 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -8469,6 +8469,8 @@
 +	if (m[0] == WQMI_INDICATION) {
 +		printf("SWEET WIFI: [16] wlfw: INDICATION %#x (%u bytes)%s\n", msg, length,
 +		    msg == WWLFW_FW_READY_IND ? " = FW READY" : (msg == WWLFW_MSA_READY_IND ? " = MSA READY" : ""));
++		/* FW_READY arrives after cal; ath10k only now does wlan_enable (CFG rejected err90 if sent earlier). */
++		if (msg == WWLFW_FW_READY_IND && !wwlfw_configured) { wwlfw_configured = true; wwlfw_wlan_cfg(); }
 +		return;
 +	}
 +	v = wqmi_tlv(m, length, 0x02, &size);   /* QMI result TLV: result(2) error(2) */
@@ -8540,8 +8542,8 @@
 +	}
 +	if (msg == WWLFW_CAL_REPORT) {
 +		if (result == 0) {
-+			printf("SWEET WIFI: [16] wlfw: >>>>> CAL_REPORT OK -- M4c DONE (board data + cal in) <<<<<\n");
-+			if (!wwlfw_configured) { wwlfw_configured = true; wwlfw_wlan_cfg(); }  /* M4d: start the radio */
++			printf("SWEET WIFI: [16] wlfw: >>>>> CAL_REPORT OK -- M4c DONE (board data + cal in; waiting FW_READY) <<<<<\n");
++			/* WLAN_CFG is now driven by the FW_READY indication (sending it here is too early -> err 90). */
 +		}
 +		return;
 +	}

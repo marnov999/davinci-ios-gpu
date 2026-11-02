@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8931 @@
+@@ -0,0 +1,8938 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -8708,6 +8708,13 @@
 +	thread_t wt;
 +	if (started) { return; }
 +	started = true; wath_powered = true;
++	{   /* ath10k skips the MSA assign (qcom,msa-fixed-perm); establish it here as ICNSS would. The WLFW
++	     * firmware splits MSA 0x97d00000/0x180000 into a 0x4000 secure head + the rest (seen in M4b). */
++		uint64_t ans = 0;
++		int32_t r0 = wmsa_assign(WMSA_PA, 0x4000u, true, &ans);
++		int32_t r1 = wmsa_assign(WMSA_PA + 0x4000u, WMSA_SIZE - 0x4000u, false, &ans);
++		printf("SWEET WIFI: [lx] MSA pre-assign for ath10k: secure=%d nonsecure=%d\n", r0, r1);
++	}
 +	printf("SWEET WIFI: [lx] spawning ath10k driver thread (lx_start)\n");
 +	if (kernel_thread_start(wath_driver_thread, NULL, &wt) == KERN_SUCCESS) { thread_deallocate(wt); }
 +}

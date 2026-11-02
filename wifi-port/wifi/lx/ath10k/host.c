@@ -60,12 +60,12 @@ struct device_node *of_get_child_by_name(const struct device_node *np, const cha
 int of_reserved_mem_region_to_resource(const struct device_node *np, unsigned index, struct resource *r)
 {
 	if (np != &node || index || !r) return -EINVAL;
-	*r = (struct resource){ .start = 0x8bc00000, .end = 0x8bd7ffff, .flags = IORESOURCE_MEM };
+	*r = (struct resource){ .start = 0x97d00000, .end = 0x97e7ffff, .flags = IORESOURCE_MEM };   /* davinci MSA (was raphael 0x8bc00000) */
 	return 0;
 }
 void *devm_memremap(struct device *dev, unsigned long address, size_t size, unsigned long flags)
 {
-	if (dev != &phone.dev || address != 0x8bc00000 || size != 0x180000) return ERR_PTR(-EINVAL);
+	if (dev != &phone.dev || address != 0x97d00000 || size != 0x180000) return ERR_PTR(-EINVAL);
 	void *p = lx_os_map_registers(address, size);
 	return p ? p : ERR_PTR(-ENOMEM);
 }

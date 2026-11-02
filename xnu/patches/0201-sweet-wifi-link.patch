@@ -1,0 +1,10 @@
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -859,6 +859,6 @@
+ #
+ # Default runtime libraries to be linked with the kernel
+ #
+-LD_KERNEL_LIBS	   = -lcc_kext
++LD_KERNEL_LIBS	   = -lcc_kext $(WIFI_ATH10K_OBJ)
+ LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
+ # Link opensource binary library

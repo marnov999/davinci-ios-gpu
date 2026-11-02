@@ -67,6 +67,28 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      - name: Cache WiFi source downloads
+        uses: actions/cache@v4
+        with:
+          path: wifi-port/xnu-deps/build/ath10k/cache
+          key: ath10k-src-v1
+
+      - name: Build ath10k.o (WiFi driver object)
+        env:
+          CC: xcrun -sdk iphoneos clang
+        run: |
+          set -eux
+          brew install ripgrep >/dev/null 2>&1 || brew install ripgrep
+          export ATH_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export ATH_LD="$(xcrun --sdk iphoneos --find ld)"
+          export ATH_NM="$(xcrun --find nm)"
+          python3 wifi-port/tools/mk-ath10k.py
+          OBJ="$PWD/wifi-port/xnu-deps/build/ath10k/out/ath10k.o"
+          test -f "$OBJ"
+          # make links this into the kernel via LD_KERNEL_LIBS (patch 0201)
+          echo "WIFI_ATH10K_OBJ=$OBJ" >> "$GITHUB_ENV"
+          echo "linked WiFi object: $OBJ"
+
       - name: Build
         working-directory: dxb
         env:

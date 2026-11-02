@@ -1,0 +1,640 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 5d14b67..5228113 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_thermal.c			standard
++bsd/dev/sweet_outputs.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+diff --git a/bsd/dev/sweet_outputs.c b/bsd/dev/sweet_outputs.c
+new file mode 100644
+index 0000000..5542a77
+--- /dev/null
++++ b/bsd/dev/sweet_outputs.c
+@@ -0,0 +1,448 @@
++/*
++ * SWEET outputs: the flashlight and the vibration motor, both PMIC peripherals written over SPMI (by
++ * sweet_spmi_write_out(), which takes only the registers below and reads every write back). After HakiOS's
++ * drivers/camera/hakios.torch.c and drivers/haptic/hakios.haptic.c (oosexgang, MIT): the staging and the limits;
++ * the hardware is the Mi 9T's own, from its live DT and MIUI's drivers (msm-4.14):
++ *
++ *   flashlight  PM6150L (SID 5) flash LED module v2 at 0xd300 (qcom,qpnp-flash-v2, leds-qpnp-flash-v2.c), its two
++ *               torch nodes torch_0 / torch_1 (LED 1 and 2, the dual-tone flash): MIUI's torch current 300 mA
++ *               each (max 500), IRES 12.5 mA (idx 0), software strobe, safety timer off (0x13). On, as
++ *               qpnp_flash_led_switch_set() does it: IRES 0x47, STROBE_CTRL 0x49+id bit 2 clear, TGR_CURRENT
++ *               0x43+id = round(mA / 12.5) - 1, SAFETY_TMR 0x40+id, MOD_CTRL 0x46 bit 7, EN_LED_CTRL 0x4c
++ *               bits 0-1. Off in the reverse order (qpnp_flash_led_switch_disable()). Faults: LED_STATUS1 0x08
++ *               (short / open), LED_STATUS2 0x09 bit 4 (VPH droop) and bits 2:0 (over-temperature).
++ *   vibration   PM6150 (SID 1) vibrator LDO at 0x5300 (qcom,qpnp-vibrator-ldo, leds-qpnp-vibrator-ldo.c), an
++ *               ERM motor: MIUI's 3000 mV (qcom,vib-ldo-volt-uv), no overdrive (qcom,disable-overdrive).
++ *               On: VSET_LB/UB 0x40/0x41 = mV, EN_CTL 0x46 bit 7, then STATUS1 0x08 bit 7 (VREG_READY).
++ *
++ * Nothing is done unless a boot-arg asks for it:
++ *   sweettorch=1   a look, reads only: the module's type and registers, in the log
++ *   sweettorch=2   ... and both torch LEDs on at sweettorch_ma (100) for 2 s, then off; every write read back
++ *   sweettorch=3   ... no light at the start; /dev/sweet-torch until the end of the run: write a level 0..1000 as
++ *                  text (thousandths of MIUI's 300 mA, 0 off), read gives the level lit now
++ *   sweetvibe=1    a look, reads only
++ *   sweetvibe=2    ... and one 300 ms buzz
++ *   sweetvibe=3    ... /dev/sweet-vibe: write a duration in ms as text (0 stops, at most 5000), read gives ms left
++ *
++ * Limits, whatever asks: never above MIUI's currents and voltage; the torch on for sweettorch_max_s (30, at most 120)
++ * at a time, then off until asked anew; while lit, every 100 ms, the module's fault flags and the SoC's temperature
++ * (sweet_thermal.c: 80 C): either, or a write that does not read back, and the torch goes off for the rest of the
++ * run. The motor runs 5 s at most at a stretch and then rests 1 s; a write that does not read back ends it too.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++extern void sweet_outputs_init(void);
++extern int sweet_thermal_max_mc(void);
++
++#define FL_SID                  5u
++#define FL_BASE                 0xd300u
++#define FL_STATUS1              0x08u
++#define FL_STATUS2              0x09u
++#define FL_SAFETY_TMR(id)       (0x40u + (id))
++#define FL_TGR_CURRENT(id)      (0x43u + (id))
++#define FL_MOD_CTRL             0x46u
++#define FL_IRES                 0x47u
++#define FL_STROBE_CTRL(id)      (0x49u + (id))
++#define FL_EN_LED_CTRL          0x4cu
++#define FL_SAFETY_TMR_OFF       0x13u
++#define FL_TORCH_MA             300u            /* MIUI's torch_0 / torch_1 qcom,current-ma */
++#define FL_IRES_UA              12500u
++
++#define VIB_SID                 1u
++#define VIB_BASE                0x5300u
++#define VIB_STATUS1             0x08u
++#define VIB_VSET_LB             0x40u
++#define VIB_VSET_UB             0x41u
++#define VIB_EN_CTL              0x46u
++#define VIB_MV                  3000u           /* qcom,vib-ldo-volt-uv */
++#define VIB_MAX_MS              5000u
++#define VIB_REST_MS             1000u
++
++static uint32_t torch_mode, vibe_mode, torch_test_ma = 100, torch_max_s = 30;
++static LCK_GRP_DECLARE(out_lck_grp, "sweet-outputs");
++static LCK_MTX_DECLARE(out_lock, &out_lck_grp);
++static int out_chan;
++
++/* asked for (under out_lock) */
++static uint32_t torch_want;                     /* 0..1000 */
++static uint32_t torch_generation, vibe_generation;
++static uint32_t vibe_want_ms;
++/* what is (the worker's) */
++static uint32_t torch_lit;
++static uint64_t torch_lit_since, vibe_until, vibe_since, vibe_rest_until;
++static bool torch_broken, vibe_broken, vibe_on;
++
++static uint64_t
++now_ms(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static bool
++rd(unsigned sid, unsigned addr, uint8_t *value)
++{
++	return sweet_spmi_read(sid, addr, value) == 0;
++}
++
++static bool
++wr(unsigned sid, unsigned addr, uint8_t value)
++{
++	int rc = sweet_spmi_write_out(sid, addr, value);
++	if (rc != 0) {
++		printf("SWEET OUT: SID %u %#x <- %#x failed (%d)\n", sid, addr, value, rc);
++	}
++	return rc == 0;
++}
++
++static void
++look(const char *what, unsigned sid, unsigned base, const uint8_t *regs, unsigned n)
++{
++	char line[256];
++	size_t len = 0;
++	line[0] = 0;
++	for (unsigned i = 0; i < n && len + 12 < sizeof(line); i++) {
++		uint8_t v = 0;
++		bool ok = rd(sid, base + regs[i], &v);
++		len += (size_t)snprintf(line + len, sizeof(line) - len, " %02x=%s%02x", regs[i], ok ? "" : "?", v);
++	}
++	printf("SWEET OUT: %s (SID %u %#x):%s\n", what, sid, base, line);
++}
++
++/* ---------------- the flashlight ---------------- */
++
++static bool
++torch_set(uint32_t level)
++{
++	uint8_t v = 0;
++	bool ok = true;
++
++	if (level == 0) {
++		ok = rd(FL_SID, FL_BASE + FL_EN_LED_CTRL, &v) && wr(FL_SID, FL_BASE + FL_EN_LED_CTRL, v & ~0x03u);
++		ok = rd(FL_SID, FL_BASE + FL_MOD_CTRL, &v) && wr(FL_SID, FL_BASE + FL_MOD_CTRL, v & ~0x80u) && ok;
++		for (unsigned id = 0; id < 2; id++) {
++			ok = wr(FL_SID, FL_BASE + FL_TGR_CURRENT(id), 0) && ok;
++		}
++		torch_lit = 0;
++		return ok;
++	}
++	uint32_t ma = FL_TORCH_MA * MIN(level, 1000u) / 1000u;
++	ma = MAX(ma, FL_IRES_UA / 1000u + 1u);
++	uint8_t code = (uint8_t)((ma * 1000u + FL_IRES_UA / 2u) / FL_IRES_UA - 1u);
++	if (torch_lit == 0) {
++		ok = rd(FL_SID, FL_BASE + FL_IRES, &v) && wr(FL_SID, FL_BASE + FL_IRES, v & ~0x0fu);   /* LED 1, 2: 12.5 mA */
++		for (unsigned id = 0; ok && id < 2; id++) {
++			ok = rd(FL_SID, FL_BASE + FL_STROBE_CTRL(id), &v) && wr(FL_SID, FL_BASE + FL_STROBE_CTRL(id), v & ~0x04u) &&
++			    wr(FL_SID, FL_BASE + FL_TGR_CURRENT(id), code) &&
++			    wr(FL_SID, FL_BASE + FL_SAFETY_TMR(id), FL_SAFETY_TMR_OFF);
++		}
++		ok = ok && rd(FL_SID, FL_BASE + FL_MOD_CTRL, &v) && wr(FL_SID, FL_BASE + FL_MOD_CTRL, v | 0x80u);
++		ok = ok && rd(FL_SID, FL_BASE + FL_EN_LED_CTRL, &v) && wr(FL_SID, FL_BASE + FL_EN_LED_CTRL, v | 0x03u);
++		torch_lit_since = now_ms();
++	} else {
++		for (unsigned id = 0; ok && id < 2; id++) {
++			ok = wr(FL_SID, FL_BASE + FL_TGR_CURRENT(id), code);
++		}
++	}
++	torch_lit = level;
++	if (ok) {
++		printf("SWEET OUT: torch %u/1000 = %u mA a LED (code %#x)\n", level, ma, code);
++	}
++	return ok;
++}
++
++static void
++torch_give_up(const char *why)
++{
++	printf("SWEET OUT: torch: %s: off, and no more torch in this boot\n", why);
++	torch_broken = true;
++	(void)torch_set(0);
++}
++
++/* while lit: the module's faults, the SoC's temperature, the time limit */
++static void
++torch_watch(uint64_t now)
++{
++	uint8_t s1 = 0, s2 = 0;
++	int mc = sweet_thermal_max_mc();
++
++	if (now - torch_lit_since < 200) {
++		return;
++	}
++	if (!rd(FL_SID, FL_BASE + FL_STATUS1, &s1) || !rd(FL_SID, FL_BASE + FL_STATUS2, &s2)) {
++		torch_give_up("status unreadable");
++	} else if (s1 != 0 || (s2 & 0x17u) != 0) {
++		printf("SWEET OUT: torch: LED_STATUS1 %#x LED_STATUS2 %#x\n", s1, s2);
++		torch_give_up(s1 ? "short / open circuit" : (s2 & 0x10u) ? "VPH droop" : "over-temperature");
++	} else if (mc >= 80000) {
++		torch_give_up("SoC at 80 C");
++	} else if (now - torch_lit_since >= (uint64_t)torch_max_s * 1000u) {
++		printf("SWEET OUT: torch on for sweettorch_max_s=%u: off until asked anew\n", torch_max_s);
++		(void)torch_set(0);
++		lck_mtx_lock(&out_lock);
++		torch_want = 0;
++		lck_mtx_unlock(&out_lock);
++	}
++}
++
++/* ---------------- the motor ---------------- */
++
++static bool
++vibe_set(bool on)
++{
++	uint8_t v = 0;
++	bool ok;
++
++	if (!on) {
++		ok = rd(VIB_SID, VIB_BASE + VIB_EN_CTL, &v) && wr(VIB_SID, VIB_BASE + VIB_EN_CTL, v & ~0x80u);
++		vibe_on = false;
++		return ok;
++	}
++	ok = wr(VIB_SID, VIB_BASE + VIB_VSET_LB, VIB_MV & 0xffu) && wr(VIB_SID, VIB_BASE + VIB_VSET_UB, VIB_MV >> 8) &&
++	    rd(VIB_SID, VIB_BASE + VIB_EN_CTL, &v) && wr(VIB_SID, VIB_BASE + VIB_EN_CTL, v | 0x80u);
++	vibe_on = true;
++	if (ok) {
++		for (unsigned i = 0; i < 20 && rd(VIB_SID, VIB_BASE + VIB_STATUS1, &v) && !(v & 0x80u); i++) {
++			delay(500);
++		}
++		if (!(v & 0x80u)) {
++			printf("SWEET OUT: vibe: VREG_READY not set (STATUS1 %#x)\n", v);
++		}
++	}
++	return ok;
++}
++
++static void
++vibe_give_up(const char *why)
++{
++	printf("SWEET OUT: vibe: %s: off, and no more vibration in this boot\n", why);
++	vibe_broken = true;
++	(void)vibe_set(false);
++}
++
++/* ---------------- the worker ---------------- */
++
++static void
++outputs_thread(__unused void *arg, __unused wait_result_t wr_result)
++{
++	static const uint8_t fl_regs[] = { 0x04, 0x05, 0x08, 0x09, 0x10, 0x40, 0x41, 0x43, 0x44, 0x46, 0x47, 0x49, 0x4a,
++		                           0x4c, 0x4d, 0x4e, 0x50, 0x51, 0x52 };
++	static const uint8_t vib_regs[] = { 0x04, 0x05, 0x08, 0x40, 0x41, 0x46 };
++	uint32_t torch_seen = 0, vibe_seen = 0;
++
++	if (sweet_spmi_init() != 0) {
++		printf("SWEET OUT: no SPMI: off\n");
++		return;
++	}
++	if (torch_mode) {
++		look("flash LED module", FL_SID, FL_BASE, fl_regs, sizeof(fl_regs));
++	}
++	if (vibe_mode) {
++		look("vibrator LDO", VIB_SID, VIB_BASE, vib_regs, sizeof(vib_regs));
++	}
++	if (torch_mode == 2) {
++		if (!torch_set(torch_test_ma * 1000u / FL_TORCH_MA)) {
++			torch_give_up("a write did not read back");
++		} else {
++			delay(200000);
++			look("flash LED module, lit", FL_SID, FL_BASE, fl_regs, sizeof(fl_regs));
++			delay(1800000);
++			if (!torch_set(0)) {
++				torch_give_up("a write did not read back");
++			}
++			printf("SWEET OUT: torch test done\n");
++		}
++	}
++	if (vibe_mode == 2) {
++		bool ok = vibe_set(true);
++		delay(300000);
++		if (!vibe_set(false) || !ok) {
++			vibe_give_up("a write did not read back");
++		}
++		printf("SWEET OUT: vibe test done\n");
++	}
++	if (torch_mode < 3 && vibe_mode < 3) {
++		return;
++	}
++	for (;;) {
++		uint32_t want_torch, want_vibe_ms, tg, vg;
++		uint64_t now;
++
++		lck_mtx_lock(&out_lock);
++		want_torch = torch_want;
++		want_vibe_ms = vibe_want_ms;
++		tg = torch_generation;
++		vg = vibe_generation;
++		lck_mtx_unlock(&out_lock);
++		now = now_ms();
++
++		if (torch_mode == 3 && !torch_broken) {
++			if (tg != torch_seen || (want_torch == 0 && torch_lit != 0)) {
++				torch_seen = tg;
++				if (want_torch != torch_lit && !torch_set(want_torch)) {
++					torch_give_up("a write did not read back");
++				}
++			}
++			if (torch_lit != 0) {
++				torch_watch(now);
++			}
++		}
++		if (vibe_mode == 3 && !vibe_broken) {
++			if (vg != vibe_seen) {
++				vibe_seen = vg;
++				vibe_until = want_vibe_ms ? now + MIN(want_vibe_ms, VIB_MAX_MS) : 0;
++			}
++			bool run = vibe_until > now && now >= vibe_rest_until;
++			if (run && vibe_on && now - vibe_since >= VIB_MAX_MS) {
++				vibe_rest_until = now + VIB_REST_MS;           /* 5 s at a stretch: a rest */
++				run = false;
++			}
++			if (run != vibe_on) {
++				if (run) {
++					vibe_since = now;
++				}
++				if (!vibe_set(run)) {
++					vibe_give_up("a write did not read back");
++				}
++			}
++		}
++
++		lck_mtx_lock(&out_lock);
++		if (tg == torch_generation && vg == vibe_generation) {
++			bool active = torch_lit != 0 || vibe_on || vibe_until > now;
++			struct timespec ts = { 0, 100 * NSEC_PER_MSEC };
++			(void)msleep(&out_chan, &out_lock, PZERO, "sweetout", active ? &ts : NULL);
++		}
++		lck_mtx_unlock(&out_lock);
++	}
++}
++
++/* ---------------- /dev/sweet-torch (minor 0), /dev/sweet-vibe (minor 1) ---------------- */
++
++static int
++out_open(dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return minor(dev) == 0 ? (torch_mode == 3 ? 0 : ENXIO) : minor(dev) == 1 ? (vibe_mode == 3 ? 0 : ENXIO) : ENXIO;
++}
++
++static int
++out_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++out_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char text[16];
++	uint32_t value;
++	if (uio_offset(uio) != 0) {
++		return 0;
++	}
++	if (minor(dev) == 0) {
++		value = torch_broken ? 0 : torch_lit;
++	} else {
++		uint64_t now = now_ms();
++		value = vibe_until > now ? (uint32_t)(vibe_until - now) : 0;
++	}
++	int n = snprintf(text, sizeof(text), "%u\n", value);
++	return uiomove(text, n, uio);
++}
++
++static int
++out_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	char text[16];
++	uint32_t value = 0;
++	user_ssize_t n = MIN(uio_resid(uio), (user_ssize_t)sizeof(text) - 1);
++	int error = uiomove(text, (int)n, uio);
++	if (error) {
++		return error;
++	}
++	text[n] = 0;
++	for (char *c = text; *c >= '0' && *c <= '9'; c++) {
++		value = value * 10u + (uint32_t)(*c - '0');
++		if (value > 1000000u) {
++			return EINVAL;
++		}
++	}
++	lck_mtx_lock(&out_lock);
++	if (minor(dev) == 0) {
++		torch_want = MIN(value, 1000u);
++		torch_generation++;
++	} else {
++		vibe_want_ms = value;
++		vibe_generation++;
++	}
++	wakeup(&out_chan);
++	lck_mtx_unlock(&out_lock);
++	return 0;
++}
++
++static const struct cdevsw out_cdevsw = {
++	.d_open       = out_open,
++	.d_close      = out_close,
++	.d_read       = out_read,
++	.d_write      = out_write,
++	.d_ioctl      = eno_ioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = 0,
++};
++
++void
++sweet_outputs_init(void)
++{
++	thread_t thread;
++	uint32_t v;
++
++	(void)PE_parse_boot_argn("sweettorch", &torch_mode, sizeof(torch_mode));
++	(void)PE_parse_boot_argn("sweetvibe", &vibe_mode, sizeof(vibe_mode));
++	torch_mode = MIN(torch_mode, 3u);
++	vibe_mode = MIN(vibe_mode, 3u);
++	if (torch_mode == 0 && vibe_mode == 0) {
++		return;
++	}
++	if (PE_parse_boot_argn("sweettorch_ma", &v, sizeof(v)) && v >= 13 && v <= FL_TORCH_MA) {
++		torch_test_ma = v;
++	}
++	if (PE_parse_boot_argn("sweettorch_max_s", &v, sizeof(v)) && v >= 1 && v <= 120) {
++		torch_max_s = v;
++	}
++	if (torch_mode == 3 || vibe_mode == 3) {
++		int major = cdevsw_add(-1, &out_cdevsw);
++		if (major < 0) {
++			printf("SWEET OUT: no character device major\n");
++		} else {
++			if (torch_mode == 3) {
++				devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-torch");
++			}
++			if (vibe_mode == 3) {
++				devfs_make_node(makedev(major, 1), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "sweet-vibe");
++			}
++		}
++	}
++	printf("SWEET OUT: torch level %u (test %u mA, at most %u s), vibe level %u\n", torch_mode, torch_test_ma,
++	    torch_max_s, vibe_mode);
++	if (kernel_thread_start(outputs_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index ceae89a..0ecf84a 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,8 +1,8 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a 1..8-byte read command.
+- * No interrupt clear, peripheral enable, charger config, or PMIC writes.
+- * Init is serialized by the single built-in SweetBattery personality.
++ * PMIC reads; the only writes are the SDAM SOC parameters and the two outputs at the end.
++ * No interrupt clear, peripheral enable or charger config.
++ * Init may be called by several drivers (sp_state).
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <libkern/OSAtomic.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -22,7 +23,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
++static bool sp_ready;
++static volatile UInt32 sp_state;        /* 0 not tried, 1 being set up, 2 done: init is called by more than one driver */
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
+@@ -51,13 +53,25 @@ sp_find_apid(unsigned ppid)
+ 	return found;
+ }
+ 
++static int sp_init_once(void);
++
+ int
+ sweet_spmi_init(void)
+ {
+-	if (sp_attempted) {
++	if (!OSCompareAndSwap(0, 1, &sp_state)) {
++		while (sp_state == 1) {
++			delay(1000);
++		}
+ 		return sp_ready ? 0 : -1;
+ 	}
+-	sp_attempted = true;
++	(void)sp_init_once();
++	sp_state = 2;
++	return sp_ready ? 0 : -1;
++}
++
++static int
++sp_init_once(void)
++{
+ 	sp_lock = IOLockAlloc();
+ 	if (!sp_lock) {
+ 		return -1;
+@@ -92,11 +106,12 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read_n(unsigned sid, unsigned addr, uint8_t *out, unsigned n)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/* Restrict access to the battery blocks (and the two outputs below); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu || n < 1 || n > 8 ||
+-	    (addr & 0xffu) + n > 0x100u ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
++	bool output = (sid == 1 && peripheral == 0x53) || (sid == 5 && peripheral == 0xd3);
++	if (!sp_ready || !out || addr > 0xffffu || n < 1 || n > 8 ||
++	    (addr & 0xffu) + n > 0x100u || (!output && sid != 0) ||
++	    (!output && peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0x60 &&   /* 0x60: RTC_RW (reads) */
+ 	    peripheral != 0xb6)) {                                               /* 0xB6: QG SDAM (reads) */
+ 		return -1;
+@@ -196,4 +211,61 @@ sweet_spmi_write_sdam(unsigned addr, const uint8_t *buf, unsigned n)
+ 	return rc;
+ }
+ 
++/*
++ * The other writes this file allows: the vibrator and the flashlight, exactly the registers MIUI's drivers write
++ * (leds-qpnp-vibrator-ldo.c, leds-qpnp-flash-v2.c):
++ *   PM6150 (SID 1) vibrator LDO 0x5300: VSET_LB/UB 0x40/0x41, EN_CTL 0x46               (bsd/dev/sweet_outputs.c)
++ *   PM6150L (SID 5) flash LED 0xd300:   SAFETY_TMR 0x40/0x41, TGR_CURRENT 0x43/0x44 (LED 1, 2), MOD_CTRL 0x46,
++ *                                       IRES 0x47, STROBE_CTRL 0x49/0x4a, EN_LED_CTRL 0x4c   (bsd/dev/sweet_outputs.c)
++ * One byte by our own (EE 0) channel, only on an APID EE 0 owns, then read back: 0 when it reads back as written.
++ */
++int
++sweet_spmi_write_out(unsigned sid, unsigned addr, uint8_t value)
++{
++	static vm_offset_t ch[2];
++	static uint16_t ch_apid[2] = { SP_NO_APID, SP_NO_APID };
++	unsigned reg = addr & 0xffu, slot;
++	bool vib = sid == 1 && (addr >> 8) == 0x53u && (reg == 0x40u || reg == 0x41u || reg == 0x46u);
++	bool flash = sid == 5 && (addr >> 8) == 0xd3u && (reg == 0x40u || reg == 0x41u || reg == 0x43u ||
++	    reg == 0x44u || reg == 0x46u || reg == 0x47u || reg == 0x49u || reg == 0x4au || reg == 0x4cu);
++	uint8_t back = 0;
++
++	if (!sp_ready || !(vib || flash)) {
++		return -1;
++	}
++	slot = vib ? 0 : 1;
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		IOLockUnlock(sp_lock);
++		return -2;
++	}
++	if (ch[slot] == 0 || ch_apid[slot] != apid) {
++		ch[slot] = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000u);
++		ch_apid[slot] = apid;
++		if (ch[slot] == 0) {
++			IOLockUnlock(sp_lock);
++			return -1;
++		}
++	}
++	*(volatile uint32_t *)(ch[slot] + 0x10u) = value;                                    /* WDATA0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(ch[slot] + 0x00u) = (0u << 27) | (reg << 4);                   /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	int rc = -3;
++	for (unsigned i = 0; i < 1000u; ++i) {
++		uint32_t status = *(volatile uint32_t *)(ch[slot] + 0x08u);
++		if (status & 1u) {
++			rc = (status & 0x0eu) ? -4 : 0;
++			break;
++		}
++		delay(1);
++	}
++	IOLockUnlock(sp_lock);
++	if (rc == 0 && (sweet_spmi_read(sid, addr, &back) != 0 || back != value)) {
++		rc = -5;
++	}
++	return rc;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 6218c42..3329c97 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -10,6 +10,8 @@ int sweet_spmi_init(void);
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ /* the QG SDAM's SOC parameters only (0xB646..0xB657), 1..8 bytes; 0 success */
+ int sweet_spmi_write_sdam(unsigned addr, const uint8_t *buf, unsigned n);
++/* the vibrator's and the flashlight's registers only (sweet_spmi.c), one byte, read back; 0 success */
++int sweet_spmi_write_out(unsigned sid, unsigned addr, uint8_t value);
+ /* n = 1..8 bytes of one peripheral in one transaction; same rules */
+ int sweet_spmi_read_n(unsigned sid, unsigned addr, uint8_t *out, unsigned n);
+ #ifdef __cplusplus
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 542d089..843c170 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_camera_init(void);
+ extern void sweet_thermal_init(void);
++extern void sweet_outputs_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_init(void);
+ 
+@@ -666,6 +667,7 @@ sweet_ufs_init(void)
+ 	sweet_gpu_init();
+ 	sweet_camera_init();     /* nothing unless boot-arg sweetcam (bsd/dev/sweet_camera.c) */
+ 	sweet_thermal_init();    /* nothing unless boot-arg sweetthermal (bsd/dev/sweet_thermal.c) */
++	sweet_outputs_init();    /* nothing unless boot-arg sweettorch / sweetvibe (bsd/dev/sweet_outputs.c) */
+ 	return 0;
+ }
+ 

@@ -73,6 +73,42 @@ hakios_wifi_radio_address(unsigned char *address)
 	return 1;
 }
 
+/* Copy a "key=value" boot-arg's value (up to the next space) out of the raw boot command line.
+ * We do NOT use PE_parse_boot_argn for this: it parses an all-digit value as an integer and writes
+ * the number's bytes into the buffer (e.g. wifi_pass=11111111 -> the int 0x00A98AC7, strlen 3),
+ * which silently corrupts a numeric passphrase. Returns the value length (0 if the arg is absent). */
+static unsigned
+wifi_bootarg(const char *key, char *out, unsigned outsz)
+{
+	extern char *PE_boot_args(void);
+	const char *a = PE_boot_args();
+	if (a == NULL || outsz == 0) {
+		return 0;
+	}
+	unsigned klen = (unsigned)strlen(key);
+	for (const char *p = a; *p != '\0'; p++) {
+		if (p != a && p[-1] != ' ') {
+			continue;                       /* only match at a token boundary */
+		}
+		unsigned i = 0;
+		while (i < klen && p[i] == key[i]) {
+			i++;
+		}
+		if (i != klen || p[klen] != '=') {
+			continue;
+		}
+		const char *v = p + klen + 1;
+		unsigned n = 0;
+		while (v[n] != '\0' && v[n] != ' ' && n < outsz - 1) {
+			out[n] = v[n];
+			n++;
+		}
+		out[n] = '\0';
+		return n;
+	}
+	return 0;
+}
+
 int
 hakios_wifi_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length)
 {
@@ -85,17 +121,17 @@ hakios_wifi_network(unsigned char *name, unsigned *name_length, unsigned char *p
 
 	*name_length = 0;
 	*passphrase_length = 0;
-	if (!PE_parse_boot_argn("wifi_ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
+	unsigned sl = wifi_bootarg("wifi_ssid", ssid, sizeof(ssid));
+	if (sl == 0) {
 		return 0;
 	}
-	unsigned sl = (unsigned)strlen(ssid);
 	if (sl > 32) {
 		sl = 32;
 	}
 	memcpy(name, ssid, sl);
 	*name_length = sl;
-	if (PE_parse_boot_argn("wifi_pass", pass, sizeof(pass)) && pass[0] != '\0') {
-		unsigned pl = (unsigned)strlen(pass);
+	unsigned pl = wifi_bootarg("wifi_pass", pass, sizeof(pass));
+	if (pl > 0) {
 		if (pl > 63) {
 			pl = 63;
 		}

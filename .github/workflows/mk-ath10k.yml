@@ -1,0 +1,69 @@
+name: mk-ath10k
+
+# Phase A of the WiFi port: build the ath10k driver object (Linux ath10k on FreeBSD
+# LinuxKPI on our wifi/lx shim) into a single relocatable ath10k.o, exporting only
+# lx_start/lx_stop/lx_transmit/lx_prepare and importing the lx_os_*/qmi seam. Self-contained:
+# needs only wifi-port/ (the shim + the 3 interface headers), not the kernel.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [hackios-gles]
+    paths:
+      - "wifi-port/**"
+      - ".github/workflows/mk-ath10k.yml"
+
+concurrency:
+  group: mk-ath10k-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode + tools
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          brew install ripgrep >/dev/null || brew install ripgrep
+          which rg
+
+      - name: Cache source downloads
+        uses: actions/cache@v4
+        with:
+          path: wifi-port/xnu-deps/build/ath10k/cache
+          key: ath10k-src-v1
+
+      - name: Build ath10k.o
+        env:
+          CC: xcrun -sdk iphoneos clang
+        run: |
+          set -eux
+          export ATH_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export ATH_LD="$(xcrun --sdk iphoneos --find ld)"
+          export ATH_NM="$(xcrun --find nm)"
+          echo "SDK=$ATH_SDK"; echo "LD=$ATH_LD"; echo "NM=$ATH_NM"
+          python3 wifi-port/tools/mk-ath10k.py
+
+      - name: Show compile errors (on failure)
+        if: failure()
+        run: |
+          B=wifi-port/xnu-deps/build/ath10k
+          echo "=== first failing .err files ==="
+          find "$B" -name '*.err' -size +1c 2>/dev/null | head -20 | while read f; do
+            echo "########## $f"; head -40 "$f"; done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ath10k-obj
+          path: |
+            wifi-port/xnu-deps/build/ath10k/out/ath10k.o
+            wifi-port/xnu-deps/build/ath10k/out/exported.txt
+          if-no-files-found: warn
+          retention-days: 7

@@ -314,11 +314,15 @@ get(struct apple80211req *request)
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
 		}
-		if (hakios_is_raphael()) {
-			/* iOS 16.5 IO80211: byte 9 bit 3 selects SAE and passes CIPHER_PWD instead of a WPA2 PMK. */
-			bits[6] |= 1;                 /* protected management frames */
-			bits[9] |= 8;                 /* WPA3 Personal; no FT or enterprise */
-		}
+		/*
+		 * iOS 16.5 IO80211: byte 9 bit 3 selects WPA3-SAE, so the framework hands the ASSOCIATE the
+		 * passphrase the user typed (CIPHER_PASSPHRASE) instead of a pre-computed WPA2 PMK -- which is
+		 * what SAE needs. The WCN3990 + our lx SAE do WPA3-SAE (davinci as well as the raphael
+		 * reference), so advertise it unconditionally; without it iOS treats every network as WPA2 and
+		 * a WPA3 join fails with "SAE needs the original passphrase".
+		 */
+		bits[6] |= 1;                         /* protected management frames (PMF) */
+		bits[9] |= 8;                         /* WPA3 Personal; no FT or enterprise */
 		return give(request, bits, sizeof(bits));
 	}
 	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */

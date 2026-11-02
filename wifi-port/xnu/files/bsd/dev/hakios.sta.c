@@ -24,7 +24,6 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <sys/errno.h>
-#include <sys/hakios.input.h>
 #include <sys/hakios.sta.h>
 #include <sys/systm.h>
 

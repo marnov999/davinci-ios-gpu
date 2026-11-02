@@ -105,13 +105,10 @@ hakios_wifi_driver_file(const char *name, uint64_t *size)
 	return sweet_wifi_read_firmware(name, size);
 }
 
-/* ---- network + station bridges to iOS: Phase D (harmless stubs for now) ------------------------ */
-
-bool hakios_net_attach(const struct hakios_net_link *link)      { (void)link; return false; }
-void hakios_net_input(const uint8_t *frame, size_t length)      { (void)frame; (void)length; }
-void hakios_net_link_state(bool up)                             { (void)up; }
-void hakios_sta_attach(const struct hakios_sta_ops *ops)        { (void)ops; }
-void hakios_sta_lost(int error)                                 { (void)error; }
+/* ---- network + station bridges to iOS now come from hakios.net.c / sta.c / apple80211.c (Phase D).
+ * net.c's hakios_net_init() (which we do not call) references the QEMU virtio net; stub that one
+ * symbol so the port links on davinci. */
+void hakios_virtio_net_init(void) { }
 
 /* ---- orchestration ----------------------------------------------------------------------------- */
 

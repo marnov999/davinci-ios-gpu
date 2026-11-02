@@ -17,12 +17,18 @@ FILES = [
     ('xnu/files/bsd/sys/sweet_wifi.h',  'bsd/sys/sweet_wifi.h'),
     ('xnu/files/bsd/dev/hakios.qmi.c',  'bsd/dev/hakios.qmi.c'),
     ('xnu/files/bsd/dev/hakios.lx.c',   'bsd/dev/hakios.lx.c'),
+    ('xnu/files/bsd/dev/hakios.net.c',  'bsd/dev/hakios.net.c'),
+    ('xnu/files/bsd/dev/hakios.sta.c',  'bsd/dev/hakios.sta.c'),
+    ('xnu/files/bsd/dev/hakios.apple80211.c', 'bsd/dev/hakios.apple80211.c'),
     ('xnu/files/bsd/dev/sweet_wifi.c',  'bsd/dev/sweet_wifi.c'),
 ]
 # bsd/conf/files lines to add (after the sweet_gpu.c anchor), in order
 CONF_ADD = [
     'bsd/dev/hakios.qmi.c\t\t\tstandard',
     'bsd/dev/hakios.lx.c\t\t\tstandard',
+    'bsd/dev/hakios.net.c\t\t\tstandard',
+    'bsd/dev/hakios.sta.c\t\t\tstandard',
+    'bsd/dev/hakios.apple80211.c\t\tstandard',
     'bsd/dev/sweet_wifi.c\t\t\tstandard',
 ]
 

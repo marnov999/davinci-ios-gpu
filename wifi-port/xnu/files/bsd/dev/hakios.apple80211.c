@@ -38,7 +38,6 @@
 #include <sys/kern_event.h>
 #include <sys/kernel.h>
 #include <sys/proc.h>
-#include <sys/hakios.input.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.sta.h>
 #include <sys/sockio.h>

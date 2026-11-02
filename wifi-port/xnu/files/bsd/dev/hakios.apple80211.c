@@ -601,6 +601,32 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 383: {
+		/*
+		 * iOS 16 WPA3/SAE path: once the card advertises WPA3 (CARD_CAPABILITIES byte 9 bit 3), wifid
+		 * drives the join through req_type 383 instead of 20, and will not fall through to 20 while it
+		 * is refused -- so a WPA3 join spins. Its payload begins with the same apple80211_assoc the
+		 * ASSOCIATE (20) uses (SSID, auth, and the typed passphrase as CIPHER_PASSPHRASE); when it does,
+		 * join on it. Otherwise accept it as a no-op so wifid proceeds. (Lengths and kinds only in the
+		 * log; the name and key stay out.)
+		 */
+		struct apple80211_assoc *a;
+		int looks_like_join = 0;
+
+		if (request->req_len >= offsetof(struct apple80211_assoc, rest) &&
+		    (a = kalloc_data(sizeof(*a), Z_WAITOK | Z_ZERO)) != NULL) {
+			if (copyin(request->req_data, a, offsetof(struct apple80211_assoc, rest)) == 0) {
+				snprintf(said, said_size, " (383: %u bytes; as a join: a name of %u bytes, authentication %#x/%#x, "
+				    "a key of %u bytes of kind %u)", request->req_len, a->ssid_length, a->auth_lower, a->auth_upper,
+				    a->key_length, a->key_cipher);
+				looks_like_join = a->ssid_length >= 1 && a->ssid_length <= 32 &&
+				    a->key_cipher == CIPHER_PASSPHRASE && a->key_length >= 8 && a->key_length <= 63;
+			}
+			memset_s(a, sizeof(*a), 0, sizeof(*a));
+			kfree_data(a, sizeof(*a));
+		}
+		return looks_like_join ? set_join(request, said, said_size) : 0;
+	}
 	default:
 		return EOPNOTSUPP;
 	}

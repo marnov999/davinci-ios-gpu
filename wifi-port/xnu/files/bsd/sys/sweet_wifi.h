@@ -24,6 +24,7 @@ bool            sweet_wlan_radio_map(uint64_t physical, uint64_t size, unsigned 
 
 void            hakios_wifi_say(const char *format, ...) __printflike(1, 2);   /* debug log (may be held back) */
 void            hakios_wifi_tell(const char *format, ...) __printflike(1, 2);  /* always logged */
+int             hakios_is_raphael(void);                                       /* 0 on davinci (not the raphael reference device) */
 const uint8_t  *hakios_wifi_driver_file(const char *name, uint64_t *size);     /* firmware by Linux name; NULL = ENOENT */
 int             hakios_wifi_dsp_is_up(void);                                   /* the WLAN DSP/PD is running */
 bool            hakios_wifi_icnss_ready(void);                                 /* modem + wlan_pd + WLFW up (our M3) */

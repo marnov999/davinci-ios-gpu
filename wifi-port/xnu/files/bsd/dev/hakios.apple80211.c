@@ -40,6 +40,7 @@
 #include <sys/proc.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.sta.h>
+#include <sys/sweet_wifi.h>
 #include <sys/sockio.h>
 #include <sys/systm.h>
 

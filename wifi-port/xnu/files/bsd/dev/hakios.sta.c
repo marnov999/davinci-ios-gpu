@@ -25,6 +25,7 @@
 #include <mach/mach_types.h>
 #include <sys/errno.h>
 #include <sys/hakios.sta.h>
+#include <sys/sweet_wifi.h>
 #include <sys/systm.h>
 
 extern void thread_set_thread_name(thread_t thread, const char *name);

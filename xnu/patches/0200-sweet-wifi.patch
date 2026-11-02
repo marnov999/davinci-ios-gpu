@@ -593,7 +593,7 @@
 +#endif
 --- /dev/null
 +++ b/bsd/sys/sweet_wifi.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,47 @@
 +/*
 + * davinci graft seam: what hakios.lx.c (the Linux-compat host glue for ath10k) asks of the
 + * platform. On HackiOS these are answered by their modem orchestration (hakios.wifi.c); here
@@ -620,6 +620,7 @@
 +
 +void            hakios_wifi_say(const char *format, ...) __printflike(1, 2);   /* debug log (may be held back) */
 +void            hakios_wifi_tell(const char *format, ...) __printflike(1, 2);  /* always logged */
++int             hakios_is_raphael(void);                                       /* 0 on davinci (not the raphael reference device) */
 +const uint8_t  *hakios_wifi_driver_file(const char *name, uint64_t *size);     /* firmware by Linux name; NULL = ENOENT */
 +int             hakios_wifi_dsp_is_up(void);                                   /* the WLAN DSP/PD is running */
 +bool            hakios_wifi_icnss_ready(void);                                 /* modem + wlan_pd + WLFW up (our M3) */
@@ -2608,7 +2609,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/hakios.sta.c
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,371 @@
 +/*
 + * Darwin-on-hakios: what stands between the two sides of the station boundary
 + * (sys/hakios.sta.h).
@@ -2636,6 +2637,7 @@
 +#include <mach/mach_types.h>
 +#include <sys/errno.h>
 +#include <sys/hakios.sta.h>
++#include <sys/sweet_wifi.h>
 +#include <sys/systm.h>
 +
 +extern void thread_set_thread_name(thread_t thread, const char *name);
@@ -2981,7 +2983,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/hakios.apple80211.c
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,747 @@
 +/*
 + * Darwin-on-hakios: Apple80211, answered in the kernel.
 + *
@@ -3024,6 +3026,7 @@
 +#include <sys/proc.h>
 +#include <sys/hakios.net.h>
 +#include <sys/hakios.sta.h>
++#include <sys/sweet_wifi.h>
 +#include <sys/sockio.h>
 +#include <sys/systm.h>
 +
@@ -3730,7 +3733,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/sweet_wifi.c
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,140 @@
 +/*
 + * davinci WiFi graft (M5): the platform seam between the Linux-compat ath10k host glue
 + * (hakios.lx.c + the ath10k.o object) and our own modem bring-up in sweet_gpu.c.
@@ -3842,6 +3845,9 @@
 + * net.c's hakios_net_init() (which we do not call) references the QEMU virtio net; stub that one
 + * symbol so the port links on davinci. */
 +void hakios_virtio_net_init(void) { }
++
++/* davinci is not the raphael reference device (apple80211.c / lx.c branch on this). */
++int hakios_is_raphael(void) { return 0; }
 +
 +/* ---- orchestration ----------------------------------------------------------------------------- */
 +

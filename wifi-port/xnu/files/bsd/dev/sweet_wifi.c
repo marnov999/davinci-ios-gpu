@@ -110,6 +110,9 @@ hakios_wifi_driver_file(const char *name, uint64_t *size)
  * symbol so the port links on davinci. */
 void hakios_virtio_net_init(void) { }
 
+/* davinci is not the raphael reference device (apple80211.c / lx.c branch on this). */
+int hakios_is_raphael(void) { return 0; }
+
 /* ---- orchestration ----------------------------------------------------------------------------- */
 
 void

@@ -1,0 +1,96 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 2272503..01eeac5 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -13,12 +13,16 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
++#include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include "../../../bsd/dev/sweet_qg.h"
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" void clock_set_calendar_microtime(unsigned long secs, uint32_t microsecs);
++/* bsd/dev/sweet_thermal.c: a normal power-off from the kernel */
++extern "C" void sweet_power_off(const char *why);
++extern "C" uint64_t mach_continuous_time(void);
+ 
+ /*
+  * The time of day, from the PMIC's RTC (PM6150 RTC_RW at 0x6000: RTC_EN is 0x46 bit 7, the
+@@ -77,6 +81,10 @@ private:
+ 	int fLastMode;
+ 	uint32_t fQGDelay;
+ 	struct sweet_qg_status fQGStatus;
++	uint32_t fGuardPercent;
++	int fGuardStrikes;
++	uint64_t fGuardStartNs, fGuardLastNs;
++	void guard(void);
+ 	void publishQG(void);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+@@ -103,6 +111,9 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = fQG = false;
+ 	fQGDelay = 1000;
++	fGuardPercent = 5;
++	fGuardStrikes = 0;
++	fGuardStartNs = fGuardLastNs = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -342,6 +353,33 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ 	return false;
+ }
+ 
++/*
++ * Low-battery power-off (after HakiOS's drivers/power/hakios.battguard.c): a run nobody watches must not empty
++ * the battery (the phone is not charged under this kernel). With the QG engine only (MIUI's own number, not the
++ * voltage estimate): MIUI's percentage at or below sweetbattery_stop (5; 0: never) with NO charger on the cable,
++ * three looks 10 s apart in a row, not in the first 2 minutes. An unknown reading (outside 0..100) is never a reason.
++ */
++void
++SweetBattery::guard(void)
++{
++	const struct sweet_qg_status *s = &fQGStatus;
++	uint64_t now;
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	if (fGuardPercent == 0 || now - fGuardStartNs < 120ull * NSEC_PER_SEC || now - fGuardLastNs < 10ull * NSEC_PER_SEC) {
++		return;
++	}
++	fGuardLastNs = now;
++	if (s->percent < 0 || s->percent > 100 || s->external || (uint32_t)s->percent > fGuardPercent) {
++		fGuardStrikes = 0;
++		return;
++	}
++	if (++fGuardStrikes == 3) {
++		IOLog("SWEET BATTERY: %d%% (%d mV), no charger, at or below sweetbattery_stop=%u three looks in a row\n",
++		    s->percent, s->mv, fGuardPercent);
++		sweet_power_off("battery low (sweetbattery_stop)");
++	}
++}
++
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+@@ -415,6 +453,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (self->fQGStatus.changed) {
+ 				self->publishQG();
+ 			}
++			self->guard();
+ 			sender->setTimeoutMS(self->fQGDelay);
+ 			return;
+ 		}
+@@ -437,6 +476,11 @@ SweetBattery::start(IOService *provider)
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* MIUI's own algorithm when the QG is readable; else the estimate below */
+ 	fQG = fReal && sweet_qg_start(&fQGStatus) == 0;
++	(void)PE_parse_boot_argn("sweetbattery_stop", &fGuardPercent, sizeof(fGuardPercent));
++	absolutetime_to_nanoseconds(mach_continuous_time(), &fGuardStartNs);
++	if (fQG) {
++		IOLog("SWEET BATTERY: power off at %u%% without a charger%s\n", fGuardPercent, fGuardPercent ? "" : " (never)");
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	if (fQG) {
+ 		publishQG();

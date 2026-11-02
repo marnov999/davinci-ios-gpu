@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,9119 @@
+@@ -0,0 +1,9120 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -8673,6 +8673,7 @@
 +} wsp;
 +static vm_offset_t wsmmu_base;
 +
++extern uint64_t kvtophys(vm_offset_t va);
 +static uint64_t *wradio_table(uint32_t n) { return (uint64_t *)(wsp.tables + 4096u*n); }
 +
 +static uint64_t *

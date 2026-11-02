@@ -75,12 +75,14 @@ jobs:
 
       - name: Build ath10k.o (WiFi driver object)
         env:
-          CC: xcrun -sdk iphoneos clang
+          # the kernel is built for macOS arm64 (XNU_TARGET_OS_OSX), so the driver object must be too
+          CC: xcrun -sdk macosx clang
+          ATH_TARGET: arm64-apple-macos14.0
         run: |
           set -eux
           brew install ripgrep >/dev/null 2>&1 || brew install ripgrep
-          export ATH_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          export ATH_LD="$(xcrun --sdk iphoneos --find ld)"
+          export ATH_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          export ATH_LD="$(xcrun --sdk macosx --find ld)"
           export ATH_NM="$(xcrun --find nm)"
           python3 wifi-port/tools/mk-ath10k.py
           OBJ="$PWD/wifi-port/xnu-deps/build/ath10k/out/ath10k.o"

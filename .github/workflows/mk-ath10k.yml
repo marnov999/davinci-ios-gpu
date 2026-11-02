@@ -41,11 +41,12 @@ jobs:
 
       - name: Build ath10k.o
         env:
-          CC: xcrun -sdk iphoneos clang
+          CC: xcrun -sdk macosx clang
+          ATH_TARGET: arm64-apple-macos14.0
         run: |
           set -eux
-          export ATH_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          export ATH_LD="$(xcrun --sdk iphoneos --find ld)"
+          export ATH_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          export ATH_LD="$(xcrun --sdk macosx --find ld)"
           export ATH_NM="$(xcrun --find nm)"
           echo "SDK=$ATH_SDK"; echo "LD=$ATH_LD"; echo "NM=$ATH_NM"
           python3 wifi-port/tools/mk-ath10k.py

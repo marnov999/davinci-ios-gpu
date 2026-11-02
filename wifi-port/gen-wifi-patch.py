@@ -21,6 +21,7 @@ FILES = [
     ('xnu/files/bsd/dev/hakios.sta.c',  'bsd/dev/hakios.sta.c'),
     ('xnu/files/bsd/dev/hakios.apple80211.c', 'bsd/dev/hakios.apple80211.c'),
     ('xnu/files/bsd/dev/sweet_wifi.c',  'bsd/dev/sweet_wifi.c'),
+    ('xnu/files/iokit/Kernel/hakios.wlan.cpp', 'iokit/Kernel/hakios.wlan.cpp'),
 ]
 # bsd/conf/files lines to add (after the sweet_gpu.c anchor), in order
 CONF_ADD = [
@@ -64,8 +65,25 @@ def conf_hunk():
     return '--- a/bsd/conf/files\n+++ b/bsd/conf/files\n' + \
         f'@@ -{start},{old} +{start},{new} @@\n' + '\n'.join(body) + '\n'
 
+IOKIT_CONF_REF = '/tmp/claude-1000/-home-marnov-xmiphones/690fa516-fb7e-40dd-a391-65727c184559/scratchpad/bt/xnu/iokit/conf/files'
+IOKIT_ANCHOR = 'iokit/bsddev/skywalk/IOSkywalkSupport.cpp'   # add our cpp right after this (last line)
+IOKIT_ADD = ['iokit/Kernel/hakios.wlan.cpp\t\t\toptional iokitcpp']
+
+def iokit_conf_hunk():
+    lines = open(IOKIT_CONF_REF).read().split('\n')
+    if lines and lines[-1] == '':
+        lines = lines[:-1]
+    idx = next(i for i, l in enumerate(lines) if l.startswith(IOKIT_ANCHOR))
+    before = lines[idx - 3:idx + 1]
+    start = idx - 3 + 1
+    old = len(before)
+    new = old + len(IOKIT_ADD)
+    body = [' ' + l for l in before] + ['+' + l for l in IOKIT_ADD]
+    return '--- a/iokit/conf/files\n+++ b/iokit/conf/files\n' + \
+        f'@@ -{start},{old} +{start},{new} @@\n' + '\n'.join(body) + '\n'
+
 def main():
-    parts = [conf_hunk()]
+    parts = [conf_hunk(), iokit_conf_hunk()]
     for src, dest in FILES:
         parts.append(newfile_hunk(src, dest))
     open(OUT, 'w', newline='').write(''.join(parts))

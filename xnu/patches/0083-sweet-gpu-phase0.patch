@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8741 @@
+@@ -0,0 +1,8809 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -8317,8 +8317,30 @@
 +#define WMSA_SIZE           0x180000u
 +#define WVMID_WLAN          0x18u
 +#define WVMID_WLAN_CE       0x19u
++#define WWLFW_WLAN_MODE     0x0022u
++#define WWLFW_WLAN_CFG      0x0023u
 +#define WWLFW_BDF_CHUNK     6144u         /* QMI_WLFW_MAX_DATA_SIZE_V01 */
 +#define WWLFW_BDF_FILE      "bdwlan.bin"  /* davinci board_id 0 (MIUI: "Board id: 0, version 8.0.0.6") */
++
++/* WCN3990 WLAN_CFG tables (ath10k_snoc, verbatim). CE target pipe cfg: pipe_num,dir,nentries,nbytes_max,flags
++ * (dir IN=1 OUT=2 INOUT=3; CE_ATTR_DIS_INTR=8). */
++static const uint32_t wce_tgt[12][5] = {
++	{0,2,32,2048,0},{1,1,32,2048,0},{2,1,64,2048,0},{3,2,32,2048,0},
++	{4,2,256,256,8},{5,2,1024,64,8},{6,3,32,16384,0},{7,4,0,0,8},
++	{8,1,32,2048,0},{9,1,32,2048,0},{10,1,32,2048,0},{11,1,32,2048,0},
++};
++/* service_id, pipe_dir, pipe_num (incl the {0,0,0} terminator ath10k keeps in the array). */
++static const uint32_t wsvc[21][3] = {
++	{0x104,2,3},{0x104,1,2},{0x102,2,3},{0x102,1,2},{0x101,2,3},{0x101,1,2},
++	{0x103,2,3},{0x103,1,2},{0x100,2,3},{0x100,1,2},{0x001,2,0},{0x001,1,2},
++	{0xFE00,2,0},{0xFE00,1,2},{0x300,2,4},{0x300,1,1},{0xFE00,2,5},
++	{0x301,1,9},{0x302,1,10},{0x600,1,11},{0,0,0},
++};
++/* shadow regs: ce_id(u16), reg_offset(u16) -- SRC_WR_IDX 0x3C / DST_WR_IDX 0x40. */
++static const uint16_t wshadow[12][2] = {
++	{0,0x3C},{3,0x3C},{4,0x3C},{5,0x3C},{7,0x3C},
++	{1,0x40},{2,0x40},{7,0x40},{8,0x40},{9,0x40},{10,0x40},{11,0x40},
++};
 +
 +static struct wqrtr_port *wwlfw_port;
 +static uint32_t wwlfw_node, wwlfw_portno;
@@ -8329,6 +8351,7 @@
 +static uint64_t wwlfw_bdf_len, wwlfw_bdf_off;
 +static uint32_t wwlfw_bdf_seg;
 +static uint8_t wwlfw_big[6400];           /* one BDF segment QMI message (max 6182) */
++static bool wwlfw_configured;             /* M4d: WLAN_CFG sent once per FW instance */
 +
 +/* TZ mem-assign the MSA carveout: HLOS -> {MSS_MSA, WLAN[, WLAN_CE if !secure]} rw. Mirrors wrmtfs_assign
 + * (ath10k_qmi_map_msa_permission does exactly this). Returns the SCM result (0 = ok), fills *answer. */
@@ -8404,6 +8427,34 @@
 +	printf("SWEET WIFI: [16] wlfw: BDF seg %u off %llu +%u of %llu%s\n", wwlfw_bdf_seg,
 +	    (unsigned long long)wwlfw_bdf_off, dn, (unsigned long long)wwlfw_bdf_len,
 +	    (wwlfw_bdf_off + dn >= wwlfw_bdf_len) ? " (END)" : "");
++}
++
++/* WLAN_CFG (0x23): the WCN3990 CE/service/shadow tables (ath10k_snoc wlan_enable). tgt_cfg(0x11),
++ * svc_cfg(0x12), shadow_reg(0x13) -- each a u8 count then the array; host_version(0x10)/v2(0x14) omitted. */
++static void
++wwlfw_wlan_cfg(void)
++{
++	uint8_t *b = wwlfw_big;
++	unsigned at, i, j, ln;
++	if (wwlfw_port == NULL) { return; }
++	b[0] = WQMI_REQUEST; b[1] = (uint8_t)(++wwlfw_txn); b[2] = (uint8_t)(wwlfw_txn >> 8);
++	b[3] = (uint8_t)WWLFW_WLAN_CFG; b[4] = (uint8_t)(WWLFW_WLAN_CFG >> 8);
++	at = 7;
++	b[at++] = 0x11; ln = 1u + 12u * 20u; b[at++] = (uint8_t)ln; b[at++] = (uint8_t)(ln >> 8);  /* tgt_cfg */
++	b[at++] = 12;
++	for (i = 0; i < 12u; i++) { for (j = 0; j < 5u; j++) { uint32_t v = wce_tgt[i][j];
++		b[at++] = (uint8_t)v; b[at++] = (uint8_t)(v >> 8); b[at++] = (uint8_t)(v >> 16); b[at++] = (uint8_t)(v >> 24); } }
++	b[at++] = 0x12; ln = 1u + 21u * 12u; b[at++] = (uint8_t)ln; b[at++] = (uint8_t)(ln >> 8);  /* svc_cfg */
++	b[at++] = 21;
++	for (i = 0; i < 21u; i++) { for (j = 0; j < 3u; j++) { uint32_t v = wsvc[i][j];
++		b[at++] = (uint8_t)v; b[at++] = (uint8_t)(v >> 8); b[at++] = (uint8_t)(v >> 16); b[at++] = (uint8_t)(v >> 24); } }
++	b[at++] = 0x13; ln = 1u + 12u * 4u; b[at++] = (uint8_t)ln; b[at++] = (uint8_t)(ln >> 8);   /* shadow_reg */
++	b[at++] = 12;
++	for (i = 0; i < 12u; i++) { uint16_t id = wshadow[i][0], of = wshadow[i][1];
++		b[at++] = (uint8_t)id; b[at++] = (uint8_t)(id >> 8); b[at++] = (uint8_t)of; b[at++] = (uint8_t)(of >> 8); }
++	{ unsigned blen = at - 7u; b[5] = (uint8_t)blen; b[6] = (uint8_t)(blen >> 8); }
++	(void)wqrtr_send(wwlfw_port->number, wwlfw_node, wwlfw_portno, b, at);
++	printf("SWEET WIFI: [16] wlfw: WLAN_CFG sent (12 tgt, 21 svc, 12 shadow), %u B body\n", at - 7u);
 +}
 +
 +static void
@@ -8488,7 +8539,23 @@
 +		return;
 +	}
 +	if (msg == WWLFW_CAL_REPORT) {
-+		if (result == 0) { printf("SWEET WIFI: [16] wlfw: >>>>> CAL_REPORT OK -- M4c DONE (board data + cal in; FW awaits WLAN_MODE) <<<<<\n"); }
++		if (result == 0) {
++			printf("SWEET WIFI: [16] wlfw: >>>>> CAL_REPORT OK -- M4c DONE (board data + cal in) <<<<<\n");
++			if (!wwlfw_configured) { wwlfw_configured = true; wwlfw_wlan_cfg(); }  /* M4d: start the radio */
++		}
++		return;
++	}
++	if (msg == WWLFW_WLAN_CFG) {
++		if (result == 0) {   /* CE/service config accepted -> WLAN_MODE(mission) */
++			uint8_t mo[8]; mo[0] = 0x01; mo[1] = 4; mo[2] = 0; mo[3] = 0; mo[4] = 0; mo[5] = 0; mo[6] = 0;  /* mode = MISSION(0) */
++			printf("SWEET WIFI: [16] wlfw: WLAN_CFG OK -- sending WLAN_MODE(mission)\n");
++			wwlfw_req(WWLFW_WLAN_MODE, mo, 7);
++		} else { printf("SWEET WIFI: [16] wlfw: WLAN_CFG REJECTED (err %u)\n", err); }
++		return;
++	}
++	if (msg == WWLFW_WLAN_MODE) {
++		if (result == 0) { printf("SWEET WIFI: [16] wlfw: >>>>> WLAN_MODE OK -- M4d DONE: radio started, awaiting FW_READY ind <<<<<\n"); }
++		else { printf("SWEET WIFI: [16] wlfw: WLAN_MODE REJECTED (err %u)\n", err); }
 +		return;
 +	}
 +}
@@ -8497,6 +8564,7 @@
 +wwlfw_start(uint32_t node, uint32_t port)
 +{
 +	uint8_t ind[32], hc[8], mi[24]; unsigned at, b;
++	if (wwlfw_started) { return; }   /* run the handshake once per boot (WLFW may re-announce) */
 +	if (wwlfw_port == NULL) { wwlfw_port = wqrtr_open(wwlfw_receive, NULL); }
 +	if (wwlfw_port == NULL) { return; }
 +	wwlfw_node = node; wwlfw_portno = port; wwlfw_started = true;

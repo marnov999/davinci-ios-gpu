@@ -1617,7 +1617,7 @@
 +}
 --- /dev/null
 +++ b/bsd/dev/hakios.lx.c
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,589 @@
 +/*
 + * Darwin-on-hakios: the kernel's side of the Wi-Fi driver's object.
 + *
@@ -1988,25 +1988,43 @@
 +/* ---- the radio's interrupts ------------------------------------------------------------------------------- */
 +
 +/*
-+ * davinci: Apple XNU on this GICv3 hardware delivers no SPI to a driver (our GPU driver polls as
-+ * well), so the radio's CE interrupts are POLLED -- the dispatch thread marks every enabled vector
-+ * pending on a ~1 ms interval and runs ath10k's handler, which drains whatever the CE ring holds
-+ * (NAPI by polling). No gic_v3_spi_*, no MSI.
++ * davinci: the radio's 12 Copy Engine completions arrive as wired GIC SPIs (intid 446..457 =
++ * Linux DT GIC_SPI 414 + 32, edge-triggered). Apple's stock XNU has no interrupt-controller driver
++ * for device SPIs, so the sweet kernel grew a tiny SPI layer (pexpert/arm/pe_fiq.c: sweet_gic_spi_*)
++ * that configures one in the GIC distributor and runs a handler for each that fires. On arrival the
++ * vector is masked and the dispatch thread told; the thread runs ath10k's handler (which drains the
++ * CE ring) and host.c re-enables the vector. This replaced a 1 ms poll of the CE registers that
++ * wedged the whole bus whenever the radio slept (power-save) with its WLAN clocks gated -- a poll
++ * read then hit a dead domain. With real interrupts the radio is touched only when it is awake.
 + */
-+#define LX_VECTORS      32
-+#define LX_IRQ_POLL_US  1000
++extern kern_return_t sweet_gic_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context);
++extern void          sweet_gic_spi_mask(uint32_t intid);
++extern void          sweet_gic_spi_unmask(uint32_t intid);
++extern void          sweet_gic_spi_detach(uint32_t intid);
++extern uint64_t      sweet_gic_spi_count(uint32_t intid);
++
++#define LX_VECTORS       32
++#define LX_CE_SPI_BASE   446u            /* GIC intid of CE vector 0 on davinci (WCN3990) */
 +
 +static struct {
 +	void (*function)(void *);
 +	void *argument;
 +	bool attached;
 +} lx_vector[LX_VECTORS];
-+static uint32_t lx_irq_pending;                 /* vectors marked to run, not yet dealt with */
++static uint32_t lx_irq_first = LX_CE_SPI_BASE;  /* the GIC's number of vector 0 */
++static uint32_t lx_irq_pending;                 /* vectors that have fired, not yet dealt with */
 +static uint32_t lx_irq_running;                 /* the vectors whose function the thread is in */
-+static uint32_t lx_irq_enabled;                 /* vectors the driver has unmasked */
-+static uint64_t lx_irq_counts[LX_VECTORS];      /* times each handler has run */
 +static thread_t lx_irq_thread;
 +static LCK_MTX_DECLARE(lx_irq_lock, &lx_lock_group);
++
++/* interrupt context: mask the vector (it stays masked until its handler has run) and tell the thread. */
++static void
++lx_irq_arrived(__unused void *context, uint32_t intid)
++{
++	sweet_gic_spi_mask(intid);
++	os_atomic_or(&lx_irq_pending, 1u << (intid - lx_irq_first), relaxed);
++	thread_wakeup((event_t)&lx_irq_pending);
++}
 +
 +static void
 +lx_irq_runs(__unused void *parameter, __unused wait_result_t result)
@@ -2015,32 +2033,25 @@
 +		uint32_t pending;
 +
 +		for (;;) {
-+			uint64_t deadline;
-+			clock_interval_to_deadline(LX_IRQ_POLL_US, NSEC_PER_USEC, &deadline);
-+			assert_wait_deadline((event_t)&lx_irq_pending, THREAD_UNINT, deadline);
++			assert_wait((event_t)&lx_irq_pending, THREAD_UNINT);
 +			if ((pending = os_atomic_xchg(&lx_irq_pending, 0, acquire)) != 0) {
 +				clear_wait(current_thread(), THREAD_AWAKENED);
 +				break;
 +			}
 +			thread_block(THREAD_CONTINUE_NULL);
-+			/* woke by a signal or the poll interval: run every enabled vector */
-+			if ((pending = os_atomic_load(&lx_irq_enabled, relaxed)) != 0) {
-+				break;
-+			}
 +		}
 +		for (unsigned v = 0; v < LX_VECTORS; v++) {
 +			if (!(pending & 1u << v)) {
 +				continue;
 +			}
 +			lck_mtx_lock(&lx_irq_lock);
-+			if (!lx_vector[v].attached || !(lx_irq_enabled & 1u << v)) {
++			if (!lx_vector[v].attached) {
 +				lck_mtx_unlock(&lx_irq_lock);
 +				continue;
 +			}
 +			lx_irq_running |= 1u << v;
 +			lck_mtx_unlock(&lx_irq_lock);
 +			lx_vector[v].function(lx_vector[v].argument);
-+			lx_irq_counts[v]++;
 +			lck_mtx_lock(&lx_irq_lock);
 +			lx_irq_running &= ~(1u << v);
 +			lck_mtx_unlock(&lx_irq_lock);
@@ -2052,18 +2063,20 @@
 +int
 +lx_os_irq_msi(__unused unsigned long long *address, __unused unsigned *data)
 +{
-+	return 0;                               /* the CE interrupts are polled, not MSI */
++	return 0;                               /* davinci CE interrupts are wired SPIs, not MSI */
 +}
 +
 +int
 +lx_os_irq_attach(unsigned vector, void (*function)(void *), void *argument)
 +{
++	kern_return_t kr;
++
 +	if (vector >= LX_VECTORS || function == NULL) {
 +		return EINVAL;
 +	}
 +	if (lx_irq_thread == THREAD_NULL) {
-+		hakios_wifi_tell("lx: wifi irq: the radio's %d CE vectors are polled every %u us (no GIC SPI on this XNU)\n",
-+		    LX_VECTORS, LX_IRQ_POLL_US);
++		hakios_wifi_tell("lx: wifi irq: the radio's CE vectors are real GIC SPIs from %u (edge, group 1, routed to this cpu)\n",
++		    lx_irq_first);
 +		if (kernel_thread_start(lx_irq_runs, NULL, &lx_irq_thread) != KERN_SUCCESS) {
 +			lx_irq_thread = THREAD_NULL;
 +			return ENOMEM;
@@ -2075,6 +2088,13 @@
 +	lx_vector[vector].argument = argument;
 +	lx_vector[vector].attached = true;
 +	lck_mtx_unlock(&lx_irq_lock);
++	if ((kr = sweet_gic_spi_attach(lx_irq_first + vector, true, lx_irq_arrived, NULL)) != KERN_SUCCESS) {
++		lck_mtx_lock(&lx_irq_lock);
++		lx_vector[vector].attached = false;
++		lck_mtx_unlock(&lx_irq_lock);
++		return kr == KERN_NAME_EXISTS ? EBUSY : EINVAL;
++	}
++	sweet_gic_spi_mask(lx_irq_first + vector);      /* masked until the driver enables it */
 +	return 0;
 +}
 +
@@ -2082,18 +2102,17 @@
 +lx_os_irq_enable(unsigned vector)
 +{
 +	if (vector < LX_VECTORS && lx_vector[vector].attached) {
-+		os_atomic_or(&lx_irq_enabled, 1u << vector, relaxed);
-+		thread_wakeup((event_t)&lx_irq_pending);
++		sweet_gic_spi_unmask(lx_irq_first + vector);
 +	}
 +}
 +
 +void
 +lx_os_irq_disable(unsigned vector)
 +{
-+	if (vector >= LX_VECTORS) {
++	if (vector >= LX_VECTORS || !lx_vector[vector].attached) {
 +		return;
 +	}
-+	os_atomic_and(&lx_irq_enabled, ~(1u << vector), relaxed);
++	sweet_gic_spi_mask(lx_irq_first + vector);
 +	if (current_thread() == lx_irq_thread) {
 +		return;                         /* from the vector's own function: nothing to wait for */
 +	}
@@ -2107,7 +2126,11 @@
 +void
 +lx_os_irq_detach_all(void)
 +{
-+	os_atomic_store(&lx_irq_enabled, 0, relaxed);
++	for (unsigned v = 0; v < LX_VECTORS; v++) {
++		if (lx_vector[v].attached) {
++			sweet_gic_spi_detach(lx_irq_first + v);
++		}
++	}
 +	lck_mtx_lock(&lx_irq_lock);
 +	for (unsigned v = 0; v < LX_VECTORS; v++) {
 +		lx_vector[v].attached = false;
@@ -2122,7 +2145,7 @@
 +unsigned long long
 +lx_os_irq_count(unsigned vector)
 +{
-+	return vector < LX_VECTORS ? lx_irq_counts[vector] : 0;
++	return vector < LX_VECTORS ? sweet_gic_spi_count(lx_irq_first + vector) : 0;
 +}
 +
 +/* ---- the station (sys/hakios.sta.h) --------------------------------------------------------------------- */

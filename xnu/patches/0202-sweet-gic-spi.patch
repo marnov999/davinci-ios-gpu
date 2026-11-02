@@ -1,0 +1,182 @@
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -3,12 +3,15 @@
+  */
+ 
+ #include <stdint.h>
++#include <stdbool.h>
+ #include <libkern/section_keywords.h>
+ #include <arm64/proc_reg.h>
+ #include <kern/clock.h>
+ #include <mach/mach_time.h>
++#include <mach/kern_return.h>
+ #include <machine/atomic.h>
+ #include <machine/machine_routines.h>
++#include <os/atomic_private.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -222,6 +225,162 @@
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++
++#if defined(SWEET)
++/* ---- SWEET: wired SPI delivery to in-kernel drivers (the WiFi radio's CE completions) ----------
++ * Open-source XNU has no interrupt-controller driver: sleh_irq hands any device interrupt (intid
++ * >= 16 that is not the timer or an IPI) to this processor's cpu_data interrupt_handler -- which
++ * nothing installs, so the interrupt is dropped and drivers would have to poll. Here a driver claims
++ * its SPI: it is configured in the GIC distributor (group 1 NS, edge/level, a deliverable priority,
++ * routed to one processor) and enabled, and its handler runs from sleh_irq for each one that fires.
++ * The first attach installs a single dispatcher as that processor's interrupt_handler and pins every
++ * SPI to that processor. This lets the WiFi glue take real CE interrupts instead of polling the CE
++ * registers every 1 ms (which wedged the bus when the radio's clocks were gated in power-save). */
++
++#define SGIC_IGROUPR(n)    (0x0080 + 4 * (n))
++#define SGIC_ISENABLER(n)  (0x0100 + 4 * (n))
++#define SGIC_ICENABLER(n)  (0x0180 + 4 * (n))
++#define SGIC_ICPENDR(n)    (0x0280 + 4 * (n))
++#define SGIC_ICACTIVER(n)  (0x0380 + 4 * (n))
++#define SGIC_IPRIORITYR(n) (0x0400 + (n))
++#define SGIC_ICFGR(n)      (0x0c00 + 4 * (n))
++#define SGIC_IGRPMODR(n)   (0x0d00 + 4 * (n))
++#define SGIC_IROUTER(n)    (0x6000 + 8 * (n))
++
++#define SGIC_SPI_MIN       32u
++#define SGIC_SPI_MAX       1020u
++#define SGIC_SPI_PRIORITY  0xA0            /* below ICC_PMR_EL1 (0xFF): deliverable, as timer/IPI */
++#define SGIC_SPI_SLOTS     16
++
++static struct sgic_spi {
++	uint32_t intid;                        /* 0 = free slot */
++	void   (*handler)(void *context, uint32_t intid);
++	void    *context;
++	uint64_t count;
++} sgic_spi[SGIC_SPI_SLOTS];
++static bool     sgic_handler_installed;
++static uint64_t sgic_target_mpidr;             /* the processor every SPI is routed to */
++
++/* From sleh_irq (via the processor's interrupt_handler) in interrupt context: run the attached
++ * handler for this intid. Returns true if it was one of ours. */
++bool
++sweet_gic_spi_dispatch(uint32_t intid)
++{
++	for (unsigned i = 0; i < SGIC_SPI_SLOTS; i++) {
++		if (os_atomic_load(&sgic_spi[i].intid, acquire) == intid) {
++			sgic_spi[i].count++;
++			if (sgic_spi[i].handler != NULL) {
++				sgic_spi[i].handler(sgic_spi[i].context, intid);
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++sweet_spi_platform_handler(void *target, void *refCon, void *nub, int source)
++{
++	(void)target; (void)refCon; (void)nub;
++	(void)sweet_gic_spi_dispatch((uint32_t)source);
++}
++
++void
++sweet_gic_spi_mask(uint32_t intid)
++{
++	if (gicd_base != 0 && intid >= SGIC_SPI_MIN && intid < SGIC_SPI_MAX) {
++		gicd_write32(SGIC_ICENABLER(intid / 32), 1u << (intid % 32));
++	}
++}
++
++void
++sweet_gic_spi_unmask(uint32_t intid)
++{
++	if (gicd_base != 0 && intid >= SGIC_SPI_MIN && intid < SGIC_SPI_MAX) {
++		gicd_write32(SGIC_ISENABLER(intid / 32), 1u << (intid % 32));
++	}
++}
++
++kern_return_t
++sweet_gic_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint32_t intid), void *context)
++{
++	struct sgic_spi *slot = NULL;
++	uint32_t config;
++
++	if (gicd_base == 0 || intid < SGIC_SPI_MIN || intid >= SGIC_SPI_MAX || handler == NULL) {
++		return KERN_INVALID_ARGUMENT;
++	}
++	for (unsigned i = 0; i < SGIC_SPI_SLOTS; i++) {
++		if (sgic_spi[i].intid == intid) {
++			return KERN_NAME_EXISTS;
++		}
++		if (slot == NULL && sgic_spi[i].intid == 0) {
++			slot = &sgic_spi[i];
++		}
++	}
++	if (slot == NULL) {
++		return KERN_RESOURCE_SHORTAGE;
++	}
++
++	/* Install the dispatcher on this processor the first time, and remember it so every SPI is
++	 * routed here (interrupts off pins us to this processor while we read its MPIDR + install). */
++	if (!sgic_handler_installed) {
++		boolean_t istate = ml_set_interrupts_enabled(FALSE);
++		sgic_target_mpidr = __builtin_arm_rsr64("MPIDR_EL1");
++		ml_install_interrupt_handler(NULL, 0, NULL, (IOInterruptHandler)sweet_spi_platform_handler, NULL);
++		sgic_handler_installed = true;
++		(void)ml_set_interrupts_enabled(istate);
++	}
++
++	slot->handler = handler;
++	slot->context = context;
++	slot->count = 0;
++	os_atomic_store(&slot->intid, intid, release);
++
++	sweet_gic_spi_mask(intid);
++	gicd_write32(SGIC_ICPENDR(intid / 32), 1u << (intid % 32));
++	gicd_write32(SGIC_ICACTIVER(intid / 32), 1u << (intid % 32));
++	gicd_write32(SGIC_IGROUPR(intid / 32), gicd_read32(SGIC_IGROUPR(intid / 32)) | 1u << (intid % 32));
++	gicd_write32(SGIC_IGRPMODR(intid / 32), gicd_read32(SGIC_IGRPMODR(intid / 32)) & ~(1u << (intid % 32)));
++	*(volatile uint8_t *)(gicd_base + SGIC_IPRIORITYR(intid)) = SGIC_SPI_PRIORITY;
++	config = gicd_read32(SGIC_ICFGR(intid / 16)) & ~(3u << (intid % 16 * 2));
++	gicd_write32(SGIC_ICFGR(intid / 16), config | (edge ? 2u : 0u) << (intid % 16 * 2));
++	/* GICD_IROUTER: Aff3 in [39:32], Aff2.Aff1.Aff0 in [23:0]; bit 31 (any processor) left clear. */
++	*(volatile uint64_t *)(gicd_base + SGIC_IROUTER(intid)) =
++	    (sgic_target_mpidr & 0xff00000000ull) | (sgic_target_mpidr & 0xffffff);
++	while (gicd_read32(GICD_CTLR) & GICD_CTLR_RWP) {
++		;
++	}
++	sweet_gic_spi_unmask(intid);
++	return KERN_SUCCESS;
++}
++
++void
++sweet_gic_spi_detach(uint32_t intid)
++{
++	sweet_gic_spi_mask(intid);
++	if (gicd_base != 0 && intid >= SGIC_SPI_MIN && intid < SGIC_SPI_MAX) {
++		gicd_write32(SGIC_ICPENDR(intid / 32), 1u << (intid % 32));
++	}
++	for (unsigned i = 0; i < SGIC_SPI_SLOTS; i++) {
++		if (sgic_spi[i].intid == intid) {
++			sgic_spi[i].handler = NULL;
++			os_atomic_store(&sgic_spi[i].intid, 0, release);
++		}
++	}
++}
++
++uint64_t
++sweet_gic_spi_count(uint32_t intid)
++{
++	for (unsigned i = 0; i < SGIC_SPI_SLOTS; i++) {
++		if (sgic_spi[i].intid == intid) {
++			return sgic_spi[i].count;
++		}
++	}
++	return 0;
++}
++#endif /* SWEET */
+ #else
+ void
+ pe_init_fiq()

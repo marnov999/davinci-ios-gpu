@@ -11,8 +11,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/cdefs.h>
+#include <sys/hakios.qrtr.h>
 
 __BEGIN_DECLS
+
+/* Provided by sweet_gpu.c (which owns the modem + QRTR): the bridge the glue is wired to. */
+int             sweet_wifi_radio_powered(void);                                /* our modem + wlan_pd + WLFW are up */
+const uint8_t  *sweet_wifi_read_firmware(const char *name, uint64_t *size);    /* firmware from WFW_DIR (wfw_read) */
+const struct hakios_qrtr_ops *sweet_wifi_qrtr_ops(void);                        /* our wqrtr wrapped for the QMI engine */
 
 void            hakios_wifi_say(const char *format, ...) __printflike(1, 2);   /* debug log (may be held back) */
 void            hakios_wifi_tell(const char *format, ...) __printflike(1, 2);  /* always logged */

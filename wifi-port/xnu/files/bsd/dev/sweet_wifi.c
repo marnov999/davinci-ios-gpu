@@ -95,17 +95,15 @@ hakios_wifi_radio_map(uint64_t physical, unsigned long size, unsigned long long 
 	return true;
 }
 
-/* ---- modem state: wired to sweet_gpu.c in a later phase ---------------------------------------- */
+/* ---- modem state: wired to sweet_gpu.c (our M1-M3 bring-up + firmware store) ------------------- */
 
-int  hakios_wifi_dsp_is_up(void)   { return 0; }   /* B1: not yet wired -> driver stays down */
-bool hakios_wifi_icnss_ready(void) { return false; }
+int  hakios_wifi_dsp_is_up(void)   { return sweet_wifi_radio_powered(); }
+bool hakios_wifi_icnss_ready(void) { return sweet_wifi_radio_powered() != 0; }
 
 const uint8_t *
 hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
-	(void)name;
-	*size = 0;
-	return NULL;   /* B1: firmware fetch wired to wfw_read in a later phase */
+	return sweet_wifi_read_firmware(name, size);
 }
 
 /* ---- network + station bridges to iOS: Phase D (harmless stubs for now) ------------------------ */
@@ -121,9 +119,23 @@ void hakios_sta_lost(int error)                                 { (void)error; }
 void
 sweet_wifi_driver_up(void)
 {
-	if (!hakios_wifi_icnss_ready()) {
-		hakios_wifi_tell("SWEET WIFI: [lx] radio not powered yet -- ath10k not started (B1)\n");
+	static bool once;
+	int ret;
+
+	if (once) {
 		return;
 	}
-	/* B1c: hakios_qmi_set_transport(sweet_wifi_qrtr_ops()); hakios_lx_prepare(); hakios_lx_start(); */
+	if (!hakios_wifi_icnss_ready()) {
+		hakios_wifi_tell("SWEET WIFI: [lx] radio not powered yet -- ath10k not started\n");
+		return;
+	}
+	once = true;
+	hakios_qmi_set_transport(sweet_wifi_qrtr_ops());   /* run the QMI engine over our wqrtr */
+	hakios_wifi_tell("SWEET WIFI: [lx] radio powered -- bringing ath10k up\n");
+	if ((ret = hakios_lx_prepare()) != 0) {
+		hakios_wifi_tell("SWEET WIFI: [lx] lx_prepare failed (%d)\n", ret);
+		return;
+	}
+	ret = hakios_lx_start();
+	hakios_wifi_tell("SWEET WIFI: [lx] lx_start returned %d%s\n", ret, ret == 0 ? " -- ath10k UP" : "");
 }

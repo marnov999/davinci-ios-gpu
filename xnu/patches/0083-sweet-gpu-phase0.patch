@@ -28,7 +28,7 @@
 
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,8811 @@
+@@ -0,0 +1,8903 @@
 +/*
 + * SWEET Adreno 618 (davinci / SM7150 / sdmmagpie) bring-up - Phase 0 / 0.5.
 + * Call once after the scheduler is running; all work runs on one thread.
@@ -7215,6 +7215,10 @@
 + * reply HELLO; each NEW_SERVER is logged as the service list (WLFW/wlan ~svc 0x27/39 = Wi-Fi). */
 +#define QRTR_US_NODE      1u
 +#define QRTR_CONTROL      0xfffffffeu
++#include <sys/sweet_wifi.h>   /* the ath10k graft: wrap our QRTR as the QMI engine's transport (B1c) */
++static bool wath_mode;        /* boot-arg wifi_ath=1: hand WLFW to the real ath10k driver, not our wwlfw */
++static bool wath_powered;     /* our modem + wlan_pd + WLFW are up -> ath10k may start */
++
 +enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DEL_SERVER = 5, QRTR_RESUME_TX = 7, QRTR_NEW_LOOKUP = 10 };
 +struct wqrtr_header { uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port; };
 +struct wqrtr_control { uint32_t command, words[4]; };
@@ -7269,7 +7273,10 @@
 +
 +/* ---- M3: QRTR server side -- local ports + announced servers (port of hakios qrtr_open/announce) --- */
 +typedef void (*wqrtr_recv_t)(void *ctx, uint32_t node, uint32_t from_port, const void *data, uint32_t len);
-+struct wqrtr_port { uint32_t number; wqrtr_recv_t receive; void *context; };
++struct wqrtr_port { uint32_t number; wqrtr_recv_t receive; void *context;
++	hakios_qrtr_server_t server;   /* the QMI engine's server-announce callback (ath10k lookup); NULL otherwise */
++	uint32_t lk_service; bool lk_active;   /* the service it asked lookup() about */
++	hakios_qrtr_receive_t hrecv; void *hctx; };   /* ath10k's receive (size_t length) + its context, via wath_recv_shim */
 +static struct wqrtr_port wqrtr_ports[16];
 +static struct { uint32_t service, instance, port; } wour_servers[4];
 +static uint32_t wqrtr_next_port = 0x4000u;
@@ -7399,6 +7406,16 @@
 +		printf("SWEET WIFI: [11] qrtr: >>> SERVICE %u (%#x) version %u instance %u at node %u port %u%s\n",
 +		    c.words[0], c.words[0], c.words[1] & 0xffu, c.words[1] >> 8, c.words[2], c.words[3],
 +		    c.words[0] == 0x45u || c.words[0] == 69u ? "   <<< WLFW = Wi-Fi!" : "");
++		{  /* deliver to any port that asked lookup() about this service (the ath10k QMI client) */
++			unsigned pi;
++			for (pi = 0; pi < 16u; pi++) {
++				if (wqrtr_ports[pi].number != 0u && wqrtr_ports[pi].lk_active && wqrtr_ports[pi].server != NULL &&
++				    wqrtr_ports[pi].lk_service == c.words[0]) {
++					wqrtr_ports[pi].server(wqrtr_ports[pi].hctx, true, c.words[0], c.words[1] & 0xffu,
++					    c.words[1] >> 8, c.words[2], c.words[3]);
++				}
++			}
++		}
 +		break;
 +	}
 +	case QRTR_NEW_LOOKUP: {
@@ -7414,6 +7431,16 @@
 +	}
 +	case QRTR_DEL_SERVER:
 +	case QRTR_BYE:
++		if (c.command == QRTR_DEL_SERVER) {
++			unsigned pi;
++			for (pi = 0; pi < 16u; pi++) {
++				if (wqrtr_ports[pi].number != 0u && wqrtr_ports[pi].lk_active && wqrtr_ports[pi].server != NULL &&
++				    wqrtr_ports[pi].lk_service == c.words[0]) {
++					wqrtr_ports[pi].server(wqrtr_ports[pi].hctx, false, c.words[0], c.words[1] & 0xffu,
++					    c.words[1] >> 8, c.words[2], c.words[3]);
++				}
++			}
++		}
 +		printf("SWEET WIFI: [11] qrtr: a service is gone (cmd %u, node %u port %u)\n", c.command, c.words[2], c.words[3]);
 +		break;
 +	default:
@@ -7480,7 +7507,8 @@
 +							wlfw_at = t;
 +							printf("SWEET WIFI: [14] >>>>> WLFW (service 39, Wi-Fi firmware) IS UP after %d ms -- wlan_pd started! node %u port %u <<<<<\n",
 +							    t * 10, wqrtr_servers[i].node, wqrtr_servers[i].port);
-+							if (wifi_level >= 16 && !wwlfw_started) { wwlfw_start(wqrtr_servers[i].node, wqrtr_servers[i].port); }
++							if (wath_mode) { wath_powered = true; sweet_wifi_driver_up(); }   /* real ath10k over our QRTR */
++							else if (wifi_level >= 16 && !wwlfw_started) { wwlfw_start(wqrtr_servers[i].node, wqrtr_servers[i].port); }
 +							break;
 +						}
 +					}
@@ -8594,6 +8622,68 @@
 +	wwlfw_req(WWLFW_MSA_INFO, mi, at);
 +}
 +
++/* ---- the ath10k graft (B1c): our wqrtr wrapped as the QMI engine's transport (hakios_qrtr_ops),
++ * plus the bridge sweet_wifi.c calls. Lets real upstream ath10k run the WLFW handshake + the CE
++ * datapath over our modem + QRTR when booted with wifi_ath=1. ---- */
++/* QRTR dispatch calls receive with a uint32_t length; ath10k's expects size_t. Shim across it (the
++ * port is the context, so ath10k's real receive + context ride in the port). */
++static void
++wath_recv_shim(void *ctx, uint32_t node, uint32_t from_port, const void *data, uint32_t len)
++{
++	struct wqrtr_port *p = ctx;
++	if (p != NULL && p->hrecv != NULL) { p->hrecv(p->hctx, node, from_port, data, (size_t)len); }
++}
++
++static struct hakios_qrtr_port *
++wath_open(hakios_qrtr_receive_t receive, hakios_qrtr_server_t server, void *context)
++{
++	struct wqrtr_port *p = wqrtr_open(wath_recv_shim, NULL);
++	if (p == NULL) { return NULL; }
++	p->hrecv = receive; p->hctx = context; p->context = p; p->server = server;
++	return (struct hakios_qrtr_port *)p;
++}
++
++static int
++wath_send(struct hakios_qrtr_port *port, uint32_t node, uint32_t to_port, const void *data, size_t length)
++{
++	struct wqrtr_port *p = (struct wqrtr_port *)port;
++	if (p == NULL || length > 8192u) { return -1; }
++	return wqrtr_send(p->number, node, to_port, data, (uint32_t)length);
++}
++
++static int
++wath_lookup(struct hakios_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
++{
++	struct wqrtr_port *p = (struct wqrtr_port *)port;
++	struct wqrtr_control q = { QRTR_NEW_LOOKUP, { service, 0, 0, 0 } };
++	unsigned i;
++	(void)version; (void)instance;
++	if (p == NULL) { return -1; }
++	p->lk_service = service; p->lk_active = true;
++	(void)wqrtr_out_packet(QRTR_NEW_LOOKUP, QRTR_CONTROL, wqrtr_peer, QRTR_CONTROL, &q, (uint32_t)sizeof(q));
++	for (i = 0; i < 64u; i++) {   /* replay the servers we already heard */
++		if (wqrtr_servers[i].there && wqrtr_servers[i].service == service && p->server != NULL) {
++			p->server(p->hctx, true, service, wqrtr_servers[i].instance & 0xffu,
++			    wqrtr_servers[i].instance >> 8, wqrtr_servers[i].node, wqrtr_servers[i].port);
++		}
++	}
++	return 0;
++}
++
++static void
++wath_close(struct hakios_qrtr_port *port)
++{
++	wqrtr_close((struct wqrtr_port *)port);
++}
++
++static const struct hakios_qrtr_ops wath_qrtr_ops = {
++	.open = wath_open, .send = wath_send, .lookup = wath_lookup, .close = wath_close,
++};
++
++const struct hakios_qrtr_ops *sweet_wifi_qrtr_ops(void) { return &wath_qrtr_ops; }
++int sweet_wifi_radio_powered(void) { return wath_powered ? 1 : 0; }
++const uint8_t *sweet_wifi_read_firmware(const char *name, uint64_t *size) { return wfw_read(name, size); }
++
 +static void
 +wrmtfs_start(void)
 +{
@@ -8727,7 +8817,9 @@
 +	{
 +		uint32_t w = 0;
 +		if (PE_parse_boot_argn("sweetwifi", &w, sizeof(w)) && w >= 1u) {
++			uint32_t a = 0;
 +			wifi_level = (int)w;
++			wath_mode = PE_parse_boot_argn("wifi_ath", &a, sizeof(a)) && a != 0;   /* hand WLFW to real ath10k */
 +			wifi_survey();
 +			if (w >= 2u) {        /* sweetwifi=2: the first write -- open the AOP QMP channel */
 +				(void)wifi_mailbox_open();

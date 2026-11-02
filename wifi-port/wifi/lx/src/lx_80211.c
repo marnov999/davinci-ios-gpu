@@ -1714,7 +1714,6 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	unsigned long long began;
 	unsigned group_cipher = 0, length;
 	int ret, error = 0, answer = ANSWER_NONE;
-	struct hakios_sta_join local_join;
 
 	if (name_length == 0 || name_length > sizeof(radio->want)) {
 		return (EINVAL);
@@ -1770,24 +1769,6 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
 	}
 	obstacle = protection(target, &group_cipher, &radio->sae, &radio->h2e);
-	/* iOS hands a WPA3-SAE network a pre-computed PMK (key kind 6), but SAE derives its own key from
-	 * the text passphrase, which iOS does not pass -- so a Settings join to a WPA3 network stalls on
-	 * the password screen ("SAE needs the original passphrase"). When a passphrase was baked for this
-	 * exact SSID (boot-arg wifi_pass), use it. Skipped when iOS does supply a passphrase. */
-	if (radio->sae && what->passphrase_length == 0) {
-		uint8_t baked_name[33];
-		unsigned baked_name_length = sizeof(baked_name), baked_pass_length = sizeof(local_join.passphrase);
-
-		local_join = *what;
-		if (lx_os_network(baked_name, &baked_name_length, local_join.passphrase, &baked_pass_length) &&
-		    baked_name_length == name_length && memcmp(baked_name, name, name_length) == 0 &&
-		    baked_pass_length >= 8 && baked_pass_length <= 63) {
-			local_join.passphrase_length = (uint8_t)baked_pass_length;
-			local_join.security = HAKIOS_STA_WPA3_SAE;
-			what = &local_join;
-			lx_tell("lx: SAE: iOS gave no passphrase; using the baked wifi_pass (%u bytes) for this network\n", baked_pass_length);
-		}
-	}
 	if (!obstacle && what->security == HAKIOS_STA_WPA3_SAE && !radio->sae) obstacle = "the requested SAE AKM is not offered";
 	if (!obstacle && radio->sae && (!what->passphrase_length || what->passphrase_length > 63)) obstacle = "SAE needs the original passphrase";
 	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "

@@ -76,11 +76,35 @@ hakios_wifi_radio_address(unsigned char *address)
 int
 hakios_wifi_network(unsigned char *name, unsigned *name_length, unsigned char *passphrase, unsigned *passphrase_length)
 {
-	/* The SSID/passphrase come from iOS Settings via apple80211 (Phase D); none is baked in. */
-	(void)name; (void)passphrase;
+	/* A baked network for a direct driver-driven join (wifi_join=1), bypassing wifid/apple80211:
+	 * boot-args wifi_ssid=<name> and wifi_pass=<passphrase> (omit wifi_pass for an open network).
+	 * The normal iOS path (Settings via apple80211) carries its own SSID/passphrase and does not use
+	 * this. Returns 1 when a network is baked, 0 otherwise (then lx_station_join is a no-op). */
+	char ssid[33] = {0};        /* 802.11 SSID is at most 32 bytes */
+	char pass[65] = {0};        /* WPA passphrase is 8..63 bytes */
+
 	*name_length = 0;
 	*passphrase_length = 0;
-	return 0;
+	if (!PE_parse_boot_argn("wifi_ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
+		return 0;
+	}
+	unsigned sl = (unsigned)strlen(ssid);
+	if (sl > 32) {
+		sl = 32;
+	}
+	memcpy(name, ssid, sl);
+	*name_length = sl;
+	if (PE_parse_boot_argn("wifi_pass", pass, sizeof(pass)) && pass[0] != '\0') {
+		unsigned pl = (unsigned)strlen(pass);
+		if (pl > 63) {
+			pl = 63;
+		}
+		memcpy(passphrase, pass, pl);
+		*passphrase_length = pl;
+	}
+	hakios_wifi_tell("SWEET WIFI: [lx] baked network \"%s\" (%u-byte key) from boot-args -- direct join\n",
+	    ssid, *passphrase_length);
+	return 1;
 }
 
 /* ---- the radio's DMA memory through the WLAN SMMU ---------------------------------------------- */

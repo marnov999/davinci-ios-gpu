@@ -235,6 +235,8 @@ extern void ath10k_snoc_host_unregister(void);
 int lx_prepare(void) { return lx_pool_init(); }
 int lx_start(void)
 {
+	extern unsigned int ath10k_debug_mask;
+	ath10k_debug_mask = 0x0030043e;   /* BOOT|WMI|HTC|HTT|MAC|BMI|SNOC|QMI: trace bring-up to find the hang */
 	ath10k_frame_mode = ATH10K_HW_TXRX_ETHERNET;
 	int error = lx_base_init();
 	if (!error) error = lx_pool_init();

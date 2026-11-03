@@ -8,6 +8,7 @@
 #include <linux/interrupt.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/jiffies.h>
 #include <linux/clk.h>
 #include <linux/regulator/consumer.h>
 #include <linux/pwrseq/consumer.h>
@@ -163,14 +164,32 @@ static void irq_detach(void)
 static struct { struct napi_struct *napi; struct work_struct work; struct workqueue_struct *queue; bool enabled, rerun; } poller;
 static void napi_work(struct work_struct *work)
 {
+	static unsigned long perf_polls, perf_pkts, perf_mark;
+
 	for (;;) {
 		lx_os_lock(); bool enabled = poller.enabled; poller.rerun = false; lx_os_unlock();
 		int done = enabled ? poller.napi->poll(poller.napi, 64) : 0;
+		if (done > 0) { perf_polls++; perf_pkts += (unsigned long)done; }
 		lx_os_lock();
 		bool again = poller.enabled && (done >= 64 || poller.rerun);
 		if (!again) clear_bit(NAPI_STATE_SCHED, &poller.napi->state);
 		lx_os_unlock();
 		if (!again) break;
+	}
+	/*
+	 * Datapath throughput probe for the WiFi-speed work: one line every ~2 s while there is RX work
+	 * (jiffies are milliseconds in this shim). napi polls, RX indications, and indications-per-poll
+	 * tell apart batch-latency-bound (many polls, ~1 ind/poll => the interrupt->thread->workqueue hops
+	 * dominate) from per-packet-cost-bound. Pair with the "en0 so far N bytes" counter for Mbps.
+	 */
+	if (perf_mark == 0) {
+		perf_mark = jiffies;
+	}
+	if (perf_polls != 0 && (long)(jiffies - perf_mark) >= 2000) {
+		lx_tell("lx: PERF datapath: %lu napi polls, %lu rx-ind (%lu/poll) in %lu ms\n",
+		    perf_polls, perf_pkts, perf_pkts / perf_polls, (unsigned long)(jiffies - perf_mark));
+		perf_polls = perf_pkts = 0;
+		perf_mark = jiffies;
 	}
 }
 void linuxkpi_netif_napi_add(struct net_device *dev, struct napi_struct *napi, int (*poll)(struct napi_struct *, int))

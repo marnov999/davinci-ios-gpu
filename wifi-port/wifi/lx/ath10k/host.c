@@ -300,6 +300,20 @@ int lx_start(void)
 	for (unsigned ms = 0; ms < 20000 && !test_bit(ATH10K_SNOC_FLAG_REGISTERED, &ath10k_snoc_priv(ar)->flags); ms++) lx_pause_ms(1);
 	flush_work(&ar->register_work);
 	if (!ar->hw->wiphy->bands[NL80211_BAND_2GHZ]) return ENODEV;
+	/*
+	 * The RX A-MPDU reorder window (max_rx_aggregation_subframes) came up 0 here, which caps how many
+	 * frames may be in flight in a block-ack session -> tiny aggregates -> ~8 Mbps. Give it the HT
+	 * default (64) so the AP can pack large A-MPDUs; wifi_rxagg=N overrides.
+	 */
+	{
+		unsigned want = lx_os_option("wifi_rxagg");
+		if (want == 0) { want = 64; }
+		if (want > 255) { want = 255; }
+		if (ar->hw->max_rx_aggregation_subframes < want) {
+			lx_tell("lx: RX A-MPDU reorder window: %u -> %u subframes\n", ar->hw->max_rx_aggregation_subframes, want);
+			ar->hw->max_rx_aggregation_subframes = (uint8_t)want;
+		}
+	}
 	ready = true;
 	if (lx_os_option("wifi_scan")) error = lx_station_scan();
 	if (!error && lx_os_option("wifi_join")) error = lx_station_join();

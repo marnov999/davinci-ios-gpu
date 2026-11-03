@@ -936,22 +936,30 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	 * aggregation would point the finger at our own ring handling instead. (jiffies are ms.)
 	 */
 	{
-		static unsigned long rp_frames, rp_ampdu, rp_mark;
+		static unsigned long rp_frames, rp_ampdu, rp_aggs, rp_mark;
 		static unsigned rp_enc, rp_bw, rp_mcs, rp_nss;
+		static uint32_t rp_lastref;
+		static bool rp_haveref;
 
 		rp_frames++;
 		if (status->flag & RX_FLAG_AMPDU_DETAILS) {
 			rp_ampdu++;
+			/* count distinct A-MPDUs by their reference number -> frames/A-MPDU = how big the AP packs them */
+			if (!rp_haveref || status->ampdu_reference != rp_lastref) {
+				rp_aggs++;
+				rp_lastref = status->ampdu_reference;
+				rp_haveref = true;
+			}
 		}
 		rp_enc = status->encoding; rp_bw = status->bw; rp_mcs = status->rate_idx; rp_nss = status->nss;
 		if (rp_mark == 0) {
 			rp_mark = jiffies;
 		}
 		if (rp_frames != 0 && (long)(jiffies - rp_mark) >= 2000) {
-			lx_tell("lx: RXPHY: %lu frames, %lu in A-MPDU (%lu%%), last enc=%u (0leg/1ht/2vht/3he) bw=%u mcs=%u nss=%u in %lu ms\n",
-			    rp_frames, rp_ampdu, rp_ampdu * 100 / rp_frames, rp_enc, rp_bw, rp_mcs, rp_nss,
-			    (unsigned long)(jiffies - rp_mark));
-			rp_frames = rp_ampdu = 0; rp_mark = jiffies;
+			lx_tell("lx: RXPHY: %lu frames, %lu in A-MPDU (%lu%%) in %lu aggs (%lu frames/agg), last enc=%u bw=%u mcs=%u nss=%u in %lu ms\n",
+			    rp_frames, rp_ampdu, rp_ampdu * 100 / rp_frames, rp_aggs, rp_aggs ? rp_ampdu / rp_aggs : 0,
+			    rp_enc, rp_bw, rp_mcs, rp_nss, (unsigned long)(jiffies - rp_mark));
+			rp_frames = rp_ampdu = rp_aggs = 0; rp_mark = jiffies;
 		}
 	}
 

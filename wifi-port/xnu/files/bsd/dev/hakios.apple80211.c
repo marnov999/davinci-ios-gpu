@@ -34,6 +34,7 @@
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
+#include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/kern_event.h>
 #include <sys/kernel.h>
@@ -465,6 +466,27 @@ get(struct apple80211req *request)
 
 /* ---- set ---------------------------------------------------------------------------------------------- */
 
+/*
+ * Boot-arg wifi_scanhold (default 1): while a network is joined (or being joined), do not honour a
+ * scan request by tuning the radio off the home channel. wifid scans every few seconds for the
+ * Settings list and for roaming; each real scan takes this radio off-channel for seconds, which
+ * collapses throughput and spikes latency during a download, and can disrupt the 4-way handshake.
+ * Held scans return at once and SCAN_RESULT serves what the last scan heard. =0 restores the old
+ * always-scan behaviour (for an A/B of the effect).
+ */
+static bool
+scan_hold(void)
+{
+	static int cached = -1;
+
+	if (cached < 0) {
+		uint32_t value = 1;
+		PE_parse_boot_argn("wifi_scanhold", &value, sizeof(value));
+		cached = value != 0;
+	}
+	return cached != 0;
+}
+
 static int
 set_scan(const struct apple80211req *request, char *said, size_t said_size)
 {
@@ -507,10 +529,25 @@ set_scan(const struct apple80211req *request, char *said, size_t said_size)
 	if (asked->channel_count != 0 && asked->channel_count <= 64 && what->frequency_count == 0) {
 		error = EINVAL;                 /* (nothing of what is asked for is a channel of this radio's) */
 	} else {
+		struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+
 		lck_mtx_lock(&apple80211_lock);
 		result_next = 0;
 		lck_mtx_unlock(&apple80211_lock);
-		error = hakios_sta_ask_scan(what);
+		if (state != NULL) {
+			hakios_sta_state(state);
+		}
+		if (scan_hold() && state != NULL && (state->phase == HAKIOS_STA_JOINED || state->phase == HAKIOS_STA_JOINING)) {
+			/* stay on the home channel; SCAN_RESULT serves what the last scan heard */
+			snprintf(said + strlen(said), said_size - strlen(said), " [held on channel: %s]",
+			    state->phase == HAKIOS_STA_JOINED ? "joined" : "joining");
+			error = 0;
+		} else {
+			error = hakios_sta_ask_scan(what);
+		}
+		if (state != NULL) {
+			kfree_data(state, sizeof(*state));
+		}
 	}
 out:
 	if (asked != NULL) {

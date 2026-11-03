@@ -650,6 +650,36 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 		struct apple80211_assoc *a;
 		int looks_like_join = 0;
 
+		/*
+		 * One-shot: dump the raw 383 blob so its real layout (where the SSID "." and the passphrase
+		 * live) can be read -- on WPA3 auto-join wifid drives the join through 383 only (never set 20),
+		 * and the apple80211_assoc parse below comes out garbage, so we never start SAE and it spins.
+		 */
+		{
+			static int dumped;
+			if (!dumped && request->req_len <= 4200) {
+				uint8_t *blob = kalloc_data(request->req_len, Z_WAITOK | Z_ZERO);
+				if (blob != NULL) {
+					if (copyin(request->req_data, blob, request->req_len) == 0) {
+						dumped = 1;
+						for (uint32_t off = 0; off < request->req_len; off += 32) {
+							char line[160]; int p = 0;
+							p += snprintf(line + p, sizeof(line) - p, "383@%4u:", off);
+							for (uint32_t i = off; i < off + 32 && i < request->req_len; i++) {
+								p += snprintf(line + p, sizeof(line) - p, "%02x", blob[i]);
+							}
+							p += snprintf(line + p, sizeof(line) - p, " |");
+							for (uint32_t i = off; i < off + 32 && i < request->req_len; i++) {
+								p += snprintf(line + p, sizeof(line) - p, "%c", blob[i] >= 0x20 && blob[i] < 0x7f ? blob[i] : '.');
+							}
+							printf("%s\n", line);
+						}
+					}
+					kfree_data(blob, request->req_len);
+				}
+			}
+		}
+
 		if (request->req_len >= offsetof(struct apple80211_assoc, rest) &&
 		    (a = kalloc_data(sizeof(*a), Z_WAITOK | Z_ZERO)) != NULL) {
 			if (copyin(request->req_data, a, offsetof(struct apple80211_assoc, rest)) == 0) {

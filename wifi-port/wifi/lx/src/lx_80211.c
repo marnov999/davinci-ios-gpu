@@ -1431,9 +1431,30 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 		*at++ = 45;
 		*at++ = 26;
 		bzero(at, 26);
-		at[0] = (uint8_t)cap;
-		at[1] = (uint8_t)(cap >> 8);
-		at[2] = (uint8_t)(band->ht_cap.ampdu_factor | band->ht_cap.ampdu_density << 2);
+		/*
+		 * The A-MPDU length factor we advertise is the cap on how large an aggregate the access
+		 * point may send us: 2^(13+factor)-1 bytes (0=8 KB ~5 full frames, 3=64 KB ~42). A small
+		 * factor here is what pins the download near 8 Mbps on a link that can do far more (MIUI on
+		 * the same radio/AP gets ~46). Advertise at least 3 so the AP can send big aggregates; the
+		 * ath10k firmware receives 64 KB A-MPDUs fine. (boot-arg wifi_ampdu overrides the floor.)
+		 */
+		{
+			static bool said;
+			unsigned want = lx_os_option("wifi_ampdu");
+			uint8_t factor = band->ht_cap.ampdu_factor;
+
+			if (want == 0) { want = 3; }		/* default floor */
+			if (want > 3) { want = 3; }
+			if (factor < want) { factor = (uint8_t)want; }
+			at[0] = (uint8_t)cap;
+			at[1] = (uint8_t)(cap >> 8);
+			at[2] = (uint8_t)(factor | band->ht_cap.ampdu_density << 2);
+			if (!said) {
+				said = true;
+				lx_tell("lx: HT A-MPDU: advertising factor %u (driver's was %u), density %u, hw rx-agg window %u subframes\n",
+				    factor, band->ht_cap.ampdu_factor, band->ht_cap.ampdu_density, radio->hw.max_rx_aggregation_subframes);
+			}
+		}
 		memcpy(at + 3, &band->ht_cap.mcs, sizeof(band->ht_cap.mcs));
 		at += 26;
 	}

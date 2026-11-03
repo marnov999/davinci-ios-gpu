@@ -1484,18 +1484,28 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 		{
 			static bool said;
 			unsigned want = lx_os_option("wifi_ampdu");
+			unsigned dwant = lx_os_option("wifi_density");
 			uint8_t factor = band->ht_cap.ampdu_factor;
+			uint8_t density = band->ht_cap.ampdu_density;
 
-			if (want == 0) { want = 3; }		/* default floor */
+			if (want == 0) { want = 3; }		/* default floor: 64 KB A-MPDU */
 			if (want > 3) { want = 3; }
 			if (factor < want) { factor = (uint8_t)want; }
+			/*
+			 * MPDU density = the min inter-MPDU spacing we require the AP to leave in an aggregate.
+			 * ath10k advertised 6 (8 us) here; MIUI's qca_cld3 on the SAME radio advertises 4 (2 us)
+			 * and gets ~46 Mbps vs our ~9. A looser (smaller) density lets the AP pack tighter/larger
+			 * A-MPDUs. Advertise 4 by default (wifi_density=N to override; 0 keeps the default 4).
+			 */
+			if (dwant == 0) { dwant = 4; }
+			if (density > dwant) { density = (uint8_t)dwant; }
 			at[0] = (uint8_t)cap;
 			at[1] = (uint8_t)(cap >> 8);
-			at[2] = (uint8_t)(factor | band->ht_cap.ampdu_density << 2);
+			at[2] = (uint8_t)(factor | density << 2);
 			if (!said) {
 				said = true;
-				lx_tell("lx: HT A-MPDU: advertising factor %u (driver's was %u), density %u, hw rx-agg window %u subframes\n",
-				    factor, band->ht_cap.ampdu_factor, band->ht_cap.ampdu_density, radio->hw.max_rx_aggregation_subframes);
+				lx_tell("lx: HT A-MPDU: advertising factor %u (was %u), density %u (was %u), hw rx-agg window %u subframes\n",
+				    factor, band->ht_cap.ampdu_factor, density, band->ht_cap.ampdu_density, radio->hw.max_rx_aggregation_subframes);
 			}
 		}
 		memcpy(at + 3, &band->ht_cap.mcs, sizeof(band->ht_cap.mcs));

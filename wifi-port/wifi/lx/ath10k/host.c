@@ -285,6 +285,60 @@ int lx_qmi_send_request(struct qmi_handle *h, struct sockaddr_qrtr *sq, struct q
     const struct qmi_elem_info *ei, const void *data) { return qmi_send_request(h, sq, tx, id, size, ei, data); }
 extern int ath10k_snoc_host_register(void);
 extern void ath10k_snoc_host_unregister(void);
+
+/* ---- firmware-statistics dump: airtime occupancy, PHY errors, retries, peer PHY rate ------------
+ *
+ * The WiFi-speed work needs to tell apart three causes of the ~8 Mbit/s ceiling: airtime the firmware
+ * never gets to use (host/TCP starving it -> low rx-cycle %), airtime it wastes (retries, a low MCS,
+ * or a channel already busy with other networks -> high rx/busy % and/or many PHY errors), or neither.
+ * ath10k already parses the firmware STATS event into ar->debug.fw_stats whenever one arrives; this
+ * asks for one about every 2 s and prints the pdev cycle counters as deltas plus each peer's reported
+ * rate. It runs on its own workqueue because ath10k_debug_fw_stats_request() sleeps up to 1 s waiting
+ * for the event, which must not sit on the ordered napi queue and stall RX. wifi_fwstats turns it on.
+ * (The header has a no-op stub unless CONFIG_ATH10K_DEBUGFS, which this build does not set, so declare
+ * the real symbol from debug.c directly.)
+ */
+extern int ath10k_debug_fw_stats_request(struct ath10k *ar);
+static struct ath10k *fwstats_ar;
+static struct delayed_work fwstats_work;
+static struct workqueue_struct *fwstats_queue;
+
+static void fwstats_fn(struct work_struct *work)
+{
+	struct ath10k *ar = fwstats_ar;
+	struct ath10k_fw_stats_pdev *pdev;
+	struct ath10k_fw_stats_peer *peer;
+	static u32 was_rx, was_tx, was_busy, was_cycle, was_phyerr;
+	int ret;
+
+	if (ar == NULL) { return; }
+	mutex_lock(&ar->conf_mutex);
+	ret = ath10k_debug_fw_stats_request(ar);
+	if (ret != 0) {
+		mutex_unlock(&ar->conf_mutex);
+		lx_tell("lx: FWSTATS: request failed (%d)\n", ret);
+		linux_queue_delayed_work_on(0, fwstats_queue, &fwstats_work, 2000);
+		return;
+	}
+	list_for_each_entry(pdev, &ar->debug.fw_stats.pdevs, list) {
+		u32 rx = pdev->rx_frame_count, tx = pdev->tx_frame_count, busy = pdev->rx_clear_count;
+		u32 cyc = pdev->cycle_count, pe = pdev->phy_err_count, dc = cyc - was_cycle;
+		lx_tell("lx: FWSTATS pdev: cycle+%u rx+%u(%u%%) tx+%u(%u%%) busy+%u(%u%%) phyerr+%u ackbad=%u ackfail=%d xretry=%u nf=%d\n",
+		    dc, rx - was_rx, dc ? (u32)((u64)(rx - was_rx) * 100 / dc) : 0,
+		    tx - was_tx, dc ? (u32)((u64)(tx - was_tx) * 100 / dc) : 0,
+		    busy - was_busy, dc ? (u32)((u64)(busy - was_busy) * 100 / dc) : 0,
+		    pe - was_phyerr, pdev->ack_rx_bad, pdev->mpdus_ack_failed, pdev->pdev_cont_xretry,
+		    pdev->ch_noise_floor);
+		was_rx = rx; was_tx = tx; was_busy = busy; was_cycle = cyc; was_phyerr = pe;
+	}
+	list_for_each_entry(peer, &ar->debug.fw_stats.peers, list) {
+		lx_tell("lx: FWSTATS peer: rssi=%u tx_rate=%u rx_rate=%u rx_dur=%llu\n",
+		    peer->peer_rssi, peer->peer_tx_rate, peer->peer_rx_rate, (unsigned long long)peer->rx_duration);
+	}
+	mutex_unlock(&ar->conf_mutex);
+	linux_queue_delayed_work_on(0, fwstats_queue, &fwstats_work, 2000);
+}
+
 int lx_prepare(void) { return lx_pool_init(); }
 int lx_start(void)
 {
@@ -318,6 +372,16 @@ int lx_start(void)
 	if (lx_os_option("wifi_scan")) error = lx_station_scan();
 	if (!error && lx_os_option("wifi_join")) error = lx_station_join();
 	if (!error && lx_os_option("wifi_keep")) error = lx_station_offer();
+	if (lx_os_option("wifi_fwstats")) {
+		fwstats_ar = ar;
+		init_completion(&ar->debug.fw_stats_complete);	/* defensive: created zeroed, so valid even if unset */
+		if (!fwstats_queue) { fwstats_queue = alloc_ordered_workqueue("ath10k-fwstats", 0); }
+		linux_init_delayed_work(&fwstats_work, fwstats_fn);
+		if (fwstats_queue) {
+			linux_queue_delayed_work_on(0, fwstats_queue, &fwstats_work, 2000);
+			lx_tell("lx: FWSTATS: firmware-stats dump armed (every ~2 s)\n");
+		}
+	}
 	return error;
 }
 void lx_stop(void)

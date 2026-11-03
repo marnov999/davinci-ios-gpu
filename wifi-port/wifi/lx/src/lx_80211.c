@@ -24,6 +24,7 @@
  * The name of the network to join and its passphrase are never said, only their lengths.
  */
 #include <linux/kernel.h>
+#include <linux/jiffies.h>
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -927,6 +928,32 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 {
 	struct lx_radio *radio = radio_of(hw);
 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
+
+	/*
+	 * RX PHY probe for the speed work: is the firmware giving us aggregated, high-rate frames? enc
+	 * (0 legacy, 1 HT, 2 VHT, 3 HE), bw (0=20 1=40 2=80 MHz), mcs, nss, and how many frames carried
+	 * A-MPDU details. Legacy/MCS-0/0% A-MPDU would explain ~8 Mbps on a -35 dBm HT link; good rate +
+	 * aggregation would point the finger at our own ring handling instead. (jiffies are ms.)
+	 */
+	{
+		static unsigned long rp_frames, rp_ampdu, rp_mark;
+		static unsigned rp_enc, rp_bw, rp_mcs, rp_nss;
+
+		rp_frames++;
+		if (status->flag & RX_FLAG_AMPDU_DETAILS) {
+			rp_ampdu++;
+		}
+		rp_enc = status->encoding; rp_bw = status->bw; rp_mcs = status->rate_idx; rp_nss = status->nss;
+		if (rp_mark == 0) {
+			rp_mark = jiffies;
+		}
+		if (rp_frames != 0 && (long)(jiffies - rp_mark) >= 2000) {
+			lx_tell("lx: RXPHY: %lu frames, %lu in A-MPDU (%lu%%), last enc=%u (0leg/1ht/2vht/3he) bw=%u mcs=%u nss=%u in %lu ms\n",
+			    rp_frames, rp_ampdu, rp_ampdu * 100 / rp_frames, rp_enc, rp_bw, rp_mcs, rp_nss,
+			    (unsigned long)(jiffies - rp_mark));
+			rp_frames = rp_ampdu = 0; rp_mark = jiffies;
+		}
+	}
 
 	radio->frames++;
 	if (status->flag & RX_FLAG_8023) {

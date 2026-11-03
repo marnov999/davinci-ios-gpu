@@ -296,15 +296,31 @@ bus_write32(struct ath11k_base *ab, u32 offset, u32 value)
  */
 #define DATA_BUDGET	64
 
+/*
+ * How long (in 1 ms polls) to keep looking quickly after the last frame moved, before backing off to
+ * the 100 ms idle pause. The data-path group interrupts do not fire on this chip (WCN3990 has only
+ * the 12 CE GIC SPIs; the 18 ext-group vectors map to GIC numbers that do not exist), so these rings
+ * are serviced ONLY from this poll -- the poll IS the datapath, not a fallback. At 100 ms the poll
+ * adds up to 100 ms of latency to every batch of received frames and every outgoing ACK, which
+ * inflates the TCP round-trip to hundreds of ms and pins throughput near 8 Mbps even though the link
+ * (HT, MCS 6-7, ~98% aggregated) sits ~90% idle. Polling at 1 ms while traffic flows keeps the
+ * latency low and lets TCP fill the pipe; the credit window lets it fall back to 100 ms when idle so
+ * it does not spin for nothing. Off with boot-arg wifi_pollfast=0 (old 100 ms behaviour).
+ */
+#define WIFI_FAST_POLLS 300
+
 static void
 bus_looks(void *argument)
 {
 	struct ath11k_base *ab = argument;
 	unsigned long long said = lx_os_nanoseconds();
+	bool fastpoll = lx_os_option("wifi_pollfast") != 0;
+	unsigned fast = 0;
 
 	bus.looks = true;
 	while (bus.looking) {
 		bool more = false;
+		int got = 0;
 
 		if (lx_os_nanoseconds() - said > 300000000000ull) {	/* every five minutes: how the station and memory stand */
 			said = lx_os_nanoseconds();
@@ -325,14 +341,23 @@ bus_looks(void *argument)
 			int done = ath11k_dp_service_srng(ab, &ab->ext_irq_grp[i], DATA_BUDGET);
 
 			more |= done >= DATA_BUDGET;
+			got += done > 0;
 			bus.late += bus.irq && done > 0;
 		}
 		lx_os_net_flush();
 		if (bus.irq) {
 			mutex_unlock(&bus.service);
 		}
+		if (fastpoll && got != 0) {
+			fast = WIFI_FAST_POLLS;		/* stay responsive for a while after any activity */
+		}
 		if (!more) {
-			lx_pause_ms(bus.irq ? 100 : 1);
+			if (fast != 0) {
+				fast--;
+				lx_pause_ms(1);
+			} else {
+				lx_pause_ms(bus.irq ? 100 : 1);
+			}
 		}
 	}
 	bus.looks = false;

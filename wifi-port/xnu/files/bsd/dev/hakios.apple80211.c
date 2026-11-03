@@ -657,24 +657,26 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 		 */
 		{
 			static int dumped;
-			if (!dumped && request->req_len <= 4200) {
+			if (!dumped && request->req_len >= 8 && request->req_len <= 8192) {
+				uint32_t want = request->req_len < 512 ? request->req_len : 512;
 				uint8_t *blob = kalloc_data(request->req_len, Z_WAITOK | Z_ZERO);
-				if (blob != NULL) {
-					if (copyin(request->req_data, blob, request->req_len) == 0) {
-						dumped = 1;
-						for (uint32_t off = 0; off < request->req_len; off += 32) {
-							char line[160]; int p = 0;
-							p += snprintf(line + p, sizeof(line) - p, "383@%4u:", off);
-							for (uint32_t i = off; i < off + 32 && i < request->req_len; i++) {
-								p += snprintf(line + p, sizeof(line) - p, "%02x", blob[i]);
-							}
-							p += snprintf(line + p, sizeof(line) - p, " |");
-							for (uint32_t i = off; i < off + 32 && i < request->req_len; i++) {
-								p += snprintf(line + p, sizeof(line) - p, "%c", blob[i] >= 0x20 && blob[i] < 0x7f ? blob[i] : '.');
-							}
-							printf("%s\n", line);
-						}
+				int cerr = blob != NULL ? copyin(request->req_data, blob, request->req_len) : -1;
+
+				dumped = 1;
+				printf("apple80211: 383 dump: req_len=%u copyin=%d (first %u bytes below)\n", request->req_len, cerr, want);
+				for (uint32_t off = 0; blob != NULL && cerr == 0 && off < want; off += 32) {
+					char line[160]; int p = 0;
+					p += snprintf(line + p, sizeof(line) - p, "383@%4u:", off);
+					for (uint32_t i = off; i < off + 32 && i < want; i++) {
+						p += snprintf(line + p, sizeof(line) - p, "%02x", blob[i]);
 					}
+					p += snprintf(line + p, sizeof(line) - p, " |");
+					for (uint32_t i = off; i < off + 32 && i < want; i++) {
+						p += snprintf(line + p, sizeof(line) - p, "%c", blob[i] >= 0x20 && blob[i] < 0x7f ? blob[i] : '.');
+					}
+					printf("%s\n", line);
+				}
+				if (blob != NULL) {
 					kfree_data(blob, request->req_len);
 				}
 			}

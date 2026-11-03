@@ -133,10 +133,34 @@ static void managed_free(void)
 }
 
 static struct { irq_handler_t call; void *arg; unsigned irq; bool enabled; } irqs[12];
+/*
+ * Boot-arg wifi_inline (default 1): drain the napi poll on the interrupt thread in irq_run, right
+ * after the CE handler returns, instead of bouncing it to the "ath10k-napi" workqueue. The RX path
+ * was CE-interrupt -> wifi-irq thread -> queue_work -> workqueue thread -> poll; that second thread
+ * hop and the single ordered workqueue add latency to every batch of received frames, which inflates
+ * the TCP RTT. Draining in irq_run removes the hop (and keeps the poll outside the CE handler's
+ * locks, so it is safe). =0 keeps the old workqueue path for an A/B.
+ */
+static int napi_inline = -1;
+static unsigned long napi_sched_count;
+static struct { struct napi_struct *napi; struct work_struct work; struct workqueue_struct *queue; bool enabled, rerun, in_poll; } poller;
+static void napi_work(struct work_struct *work);
 static void irq_run(void *arg)
 {
 	unsigned n = (uintptr_t)arg;
+	if (napi_inline < 0) {
+		napi_inline = lx_os_option("wifi_inline") != 0;
+	}
 	if (irqs[n].enabled) irqs[n].call(irqs[n].irq, irqs[n].arg);
+	/*
+	 * The CE handler just scheduled the napi poll. Run it here, on the interrupt thread, now that the
+	 * handler has returned and dropped its locks -- instead of waking the "ath10k-napi" workqueue
+	 * thread for it. That removes a thread hop from the RX path. The in_poll guard in napi_work keeps
+	 * this and the (still-queued) workqueue run from overlapping.
+	 */
+	if (napi_inline && poller.napi != NULL && poller.enabled && test_bit(NAPI_STATE_SCHED, &poller.napi->state)) {
+		napi_work(&poller.work);
+	}
 	if (irqs[n].enabled) lx_os_irq_enable(n);
 }
 int lkpi_request_irq(struct device *dev, unsigned irq, irq_handler_t call, irq_handler_t thread,
@@ -161,18 +185,21 @@ void lkpi_free_irq(unsigned irq, void *arg)
 static void irq_detach(void)
 { lx_os_irq_detach_all(); memset(irqs, 0, sizeof(irqs)); }
 
-static struct { struct napi_struct *napi; struct work_struct work; struct workqueue_struct *queue; bool enabled, rerun; } poller;
 static void napi_work(struct work_struct *work)
 {
 	static unsigned long perf_polls, perf_pkts, perf_mark;
 
+	lx_os_lock();
+	if (poller.in_poll) { lx_os_unlock(); return; }	/* already draining on another thread: it will see rerun */
+	poller.in_poll = true;
+	lx_os_unlock();
 	for (;;) {
 		lx_os_lock(); bool enabled = poller.enabled; poller.rerun = false; lx_os_unlock();
 		int done = enabled ? poller.napi->poll(poller.napi, 64) : 0;
 		if (done > 0) { perf_polls++; perf_pkts += (unsigned long)done; }
 		lx_os_lock();
 		bool again = poller.enabled && (done >= 64 || poller.rerun);
-		if (!again) clear_bit(NAPI_STATE_SCHED, &poller.napi->state);
+		if (!again) { clear_bit(NAPI_STATE_SCHED, &poller.napi->state); poller.in_poll = false; }
 		lx_os_unlock();
 		if (!again) break;
 	}
@@ -186,9 +213,10 @@ static void napi_work(struct work_struct *work)
 		perf_mark = jiffies;
 	}
 	if (perf_polls != 0 && (long)(jiffies - perf_mark) >= 2000) {
-		lx_tell("lx: PERF datapath: %lu napi polls, %lu rx-ind (%lu/poll) in %lu ms\n",
-		    perf_polls, perf_pkts, perf_pkts / perf_polls, (unsigned long)(jiffies - perf_mark));
-		perf_polls = perf_pkts = 0;
+		lx_tell("lx: PERF datapath: %lu napi polls, %lu rx-ind (%lu/poll), %lu napi-sched (%s) in %lu ms\n",
+		    perf_polls, perf_pkts, perf_pkts / perf_polls, napi_sched_count, napi_inline > 0 ? "inline" : "workq",
+		    (unsigned long)(jiffies - perf_mark));
+		perf_polls = perf_pkts = 0; napi_sched_count = 0;
 		perf_mark = jiffies;
 	}
 }
@@ -203,7 +231,13 @@ bool linuxkpi_napi_schedule(struct napi_struct *napi)
 	lx_os_lock();
 	if (!poller.enabled) { lx_os_unlock(); return false; }
 	poller.rerun = true; set_bit(NAPI_STATE_SCHED, &napi->state);
+	napi_sched_count++;
 	lx_os_unlock();
+	/*
+	 * Always queue the work as a safety net. With wifi_inline, irq_run drains the poll on the irq
+	 * thread right after the CE handler returns, so this queued run usually finds nothing left to do
+	 * (the in_poll guard serialises them); it only matters when napi is scheduled off the irq path.
+	 */
 	return queue_work(poller.queue, &poller.work);
 }
 bool linuxkpi_napi_complete(struct napi_struct *napi) { return true; }

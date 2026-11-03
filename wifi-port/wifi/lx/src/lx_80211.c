@@ -488,15 +488,47 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
 {
 }
 
+/*
+ * TX-latency trace: frame_send() stamps each outgoing frame's submit time in a FIFO; each completion
+ * pops it and measures submit->done. If our TCP ACKs take many ms to get on the air, that inflates
+ * the round-trip and throttles the download (the symptom: 7 Mbps / ~380 ms here vs MIUI 46/80 on the
+ * same radio). "inflight" is submitted-minus-completed. jiffies are ms.
+ */
+static struct { unsigned long t[512]; unsigned head, tail; unsigned long sum, max, n, mark; } txp;
+static void
+tx_done(void)
+{
+	if (txp.tail != txp.head) {
+		unsigned long lat = jiffies - txp.t[txp.tail & 511];
+
+		txp.tail++;
+		txp.sum += lat;
+		txp.n++;
+		if (lat > txp.max) {
+			txp.max = lat;
+		}
+	}
+	if (txp.mark == 0) {
+		txp.mark = jiffies;
+	}
+	if (txp.n != 0 && (long)(jiffies - txp.mark) >= 2000) {
+		lx_tell("lx: TXLAT: %lu done, avg %lu ms, max %lu ms, inflight %u in %lu ms\n",
+		    txp.n, txp.sum / txp.n, txp.max, txp.head - txp.tail, (unsigned long)(jiffies - txp.mark));
+		txp.sum = txp.n = txp.max = 0; txp.mark = jiffies;
+	}
+}
+
 void
 linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
 {
+	tx_done();
 	dev_kfree_skb_any(skb);
 }
 
 void
 linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
 {
+	tx_done();
 	if (status->skb != NULL) {
 		dev_kfree_skb_any(status->skb);
 	}
@@ -505,6 +537,7 @@ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_st
 void
 linuxkpi_ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb, int status)
 {
+	tx_done();
 	dev_kfree_skb_any(skb);
 }
 
@@ -720,6 +753,8 @@ frame_send(struct lx_radio *radio, struct sk_buff *skb)
 		IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
 	}
 
+	txp.t[txp.head & 511] = jiffies;	/* TX-latency trace: stamp submit time */
+	txp.head++;
 	radio->ops->tx(&radio->hw, &control, skb);
 }
 

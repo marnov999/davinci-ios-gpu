@@ -1,5 +1,22 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+### >>> WiFi THROUGHPUT handoff 2026-11-04 (davinci Mi 9T; read for the active WiFi-speed work) <<<
+Goal: iOS WiFi throughput == MIUI (46 Mbit/s) on davinci; currently ~8 Mbit/s on the same AP. Full
+diagnosis log is in Claude memory `davinci-wifi-bringup.md`. KEY new finding: the PERF-datapath probe
+(host.c napi_work) is BIMODAL -- RX bursts to ~51 Mbit/s (8600 rx-ind/2s, 36/poll) then collapses, 456 ms
+bufferbloat, en0 reports `dropped: 0 in`. So the RX path is capable; it's a peak-vs-average collapse
+(TCP/bufferbloat or our glue), NOT a steady small-aggregate cap. Ruled out: ring refill deadlock, skb-pool
+exhaustion, skb pinning, dead refill timer, PHY/MCS (MCS7), host-advertised HT caps.
+JUST BUILT (commit b90d72d, CI run 41735826203): a firmware-stats dump in wifi-port/wifi/lx/ath10k/host.c,
+boot-arg **wifi_fwstats**, printing `lx: FWSTATS pdev:` airtime %/phyerr/retries + `peer:` rates. Done
+WITHOUT CONFIG_ATH10K_DEBUGFS (struct ath10k has no `debug` member in this build): a workqueue sends
+ath10k_wmi_request_stats(), and patch wifi-port/wifi/lx/ath10k/patches/fwstats-route-event.patch routes
+the WMI STATS reply to lx_fwstats_event() (registered in tools/mk-ath10k.py). NEXT (device was charging):
+boot the new kernel + `wifi_fwstats`, run a speedtest, read the FWSTATS lines -- LOW rx-cycle % => host/TCP
+starves the link (attack bufferbloat/TCP); HIGH rx/busy % + retries/low rate => wasted airtime/rate-control.
+davinci serial 800f46c3 (NEVER touch raphael 53d545e6). Autonomous connect+speedtest loop via screencap/
+hidtouch tools in devtools/work/ios-sweet/../../../davinci-ios/gpu/userland/metal/ (see memory file).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

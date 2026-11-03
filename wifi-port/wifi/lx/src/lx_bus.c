@@ -316,6 +316,21 @@ bus_looks(void *argument)
 	unsigned long long said = lx_os_nanoseconds();
 	bool fastpoll = lx_os_option("wifi_pollfast") != 0;
 	unsigned fast = 0;
+	/* RINGPROF: which DP group/ring type carries the work -- to explain the ~36 ring-events per
+	 * delivered data frame seen at 8 Mbps. Logged once (the masks) + every ~2 s (per-group done). */
+	static unsigned long gp_done[ATH11K_EXT_IRQ_GRP_NUM_MAX], gp_mark;
+	static bool gp_masks_said;
+
+	if (!gp_masks_said) {
+		const struct ath11k_hw_ring_mask *m = ab->hw_params.ring_mask;
+
+		gp_masks_said = true;
+		for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+			lx_tell("lx: RINGMASK g%u: tx=%#x rx=%#x rx_err=%#x wbm_rel=%#x reo_status=%#x rxdma2host=%#x host2rxdma=%#x mon=%#x\n",
+			    i, m->tx[i], m->rx[i], m->rx_err[i], m->rx_wbm_rel[i], m->reo_status[i], m->rxdma2host[i],
+			    m->host2rxdma[i], m->rx_mon_status[i]);
+		}
+	}
 
 	bus.looks = true;
 	while (bus.looking) {
@@ -342,6 +357,9 @@ bus_looks(void *argument)
 
 			more |= done >= DATA_BUDGET;
 			got += done > 0;
+			if (done > 0) {
+				gp_done[i] += (unsigned long)done;
+			}
 			bus.late += bus.irq && done > 0;
 		}
 		lx_os_net_flush();
@@ -358,6 +376,22 @@ bus_looks(void *argument)
 			} else {
 				lx_pause_ms(bus.irq ? 100 : 1);
 			}
+		}
+		if (gp_mark == 0) {
+			gp_mark = jiffies;
+		}
+		if ((long)(jiffies - gp_mark) >= 2000) {
+			char line[320] = "";
+
+			for (unsigned i = 0; i < ATH11K_EXT_IRQ_GRP_NUM_MAX; i++) {
+				if (gp_done[i] != 0) {
+					snprintf(line + strlen(line), sizeof(line) - strlen(line), " g%u=%lu", i, gp_done[i]);
+					gp_done[i] = 0;
+				}
+			}
+			lx_tell("lx: RINGPROF: per-group ring-entries done in %lu ms:%s\n",
+			    (unsigned long)(jiffies - gp_mark), line[0] ? line : " none");
+			gp_mark = jiffies;
 		}
 	}
 	bus.looks = false;

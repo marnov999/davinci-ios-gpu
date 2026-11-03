@@ -20,6 +20,8 @@
 #include <lx_os.h>
 #include "lx.h"
 #include "core.h"
+#include "wmi.h"
+#include "wmi-ops.h"
 #include "snoc.h"
 
 static struct platform_device phone;
@@ -291,36 +293,48 @@ extern void ath10k_snoc_host_unregister(void);
  * The WiFi-speed work needs to tell apart three causes of the ~8 Mbit/s ceiling: airtime the firmware
  * never gets to use (host/TCP starving it -> low rx-cycle %), airtime it wastes (retries, a low MCS,
  * or a channel already busy with other networks -> high rx/busy % and/or many PHY errors), or neither.
- * ath10k already parses the firmware STATS event into ar->debug.fw_stats whenever one arrives; this
- * asks for one about every 2 s and prints the pdev cycle counters as deltas plus each peer's reported
- * rate. It runs on its own workqueue because ath10k_debug_fw_stats_request() sleeps up to 1 s waiting
- * for the event, which must not sit on the ordered napi queue and stall RX. wifi_fwstats turns it on.
- * (The header has a no-op stub unless CONFIG_ATH10K_DEBUGFS, which this build does not set, so declare
- * the real symbol from debug.c directly.)
+ *
+ * ath10k's fw-stats path lives behind CONFIG_ATH10K_DEBUGFS (debugfs files, the ar->debug member, the
+ * STATS-event parser) which this build does not enable, so do it directly: a workqueue asks the fw for
+ * a stats report about every 2 s with ath10k_wmi_request_stats() (just sends a WMI command, no wait),
+ * and a tiny patch to ath10k_wmi_event_update_stats() routes the reply here instead of to the DEBUGFS
+ * no-op stub. We pull it into a local ath10k_fw_stats, print the pdev cycle counters as deltas plus
+ * each peer's reported rate, then free the lists. wifi_fwstats turns it on. The request_stats sender
+ * runs off the ordered napi queue (its WMI send can block on credits) so it never stalls RX.
  */
-extern int ath10k_debug_fw_stats_request(struct ath10k *ar);
 static struct ath10k *fwstats_ar;
 static struct delayed_work fwstats_work;
 static struct workqueue_struct *fwstats_queue;
 
-static void fwstats_fn(struct work_struct *work)
+static void fwstats_free(struct ath10k_fw_stats *s)
 {
-	struct ath10k *ar = fwstats_ar;
+	struct ath10k_fw_stats_pdev *p, *pt;
+	struct ath10k_fw_stats_vdev *v, *vt;
+	struct ath10k_fw_stats_peer *e, *et;
+
+	list_for_each_entry_safe(p, pt, &s->pdevs, list) { list_del(&p->list); kfree(p); }
+	list_for_each_entry_safe(v, vt, &s->vdevs, list) { list_del(&v->list); kfree(v); }
+	list_for_each_entry_safe(e, et, &s->peers, list) { list_del(&e->list); kfree(e); }
+	list_for_each_entry_safe(e, et, &s->peers_extd, list) { list_del(&e->list); kfree(e); }
+}
+
+/* Called from the patched ath10k_wmi_event_update_stats() on the RX/event thread: parse + print. */
+void lx_fwstats_event(struct ath10k *ar, struct sk_buff *skb)
+{
+	static u32 was_rx, was_tx, was_busy, was_cycle, was_phyerr;
+	struct ath10k_fw_stats stats;
 	struct ath10k_fw_stats_pdev *pdev;
 	struct ath10k_fw_stats_peer *peer;
-	static u32 was_rx, was_tx, was_busy, was_cycle, was_phyerr;
 	int ret;
 
-	if (ar == NULL) { return; }
-	mutex_lock(&ar->conf_mutex);
-	ret = ath10k_debug_fw_stats_request(ar);
-	if (ret != 0) {
-		mutex_unlock(&ar->conf_mutex);
-		lx_tell("lx: FWSTATS: request failed (%d)\n", ret);
-		linux_queue_delayed_work_on(0, fwstats_queue, &fwstats_work, 2000);
-		return;
-	}
-	list_for_each_entry(pdev, &ar->debug.fw_stats.pdevs, list) {
+	if (!lx_os_option("wifi_fwstats")) { return; }
+	INIT_LIST_HEAD(&stats.pdevs);
+	INIT_LIST_HEAD(&stats.vdevs);
+	INIT_LIST_HEAD(&stats.peers);
+	INIT_LIST_HEAD(&stats.peers_extd);
+	ret = ath10k_wmi_pull_fw_stats(ar, skb, &stats);
+	if (ret != 0) { lx_tell("lx: FWSTATS: pull failed (%d)\n", ret); return; }
+	list_for_each_entry(pdev, &stats.pdevs, list) {
 		u32 rx = pdev->rx_frame_count, tx = pdev->tx_frame_count, busy = pdev->rx_clear_count;
 		u32 cyc = pdev->cycle_count, pe = pdev->phy_err_count, dc = cyc - was_cycle;
 		lx_tell("lx: FWSTATS pdev: cycle+%u rx+%u(%u%%) tx+%u(%u%%) busy+%u(%u%%) phyerr+%u ackbad=%u ackfail=%d xretry=%u nf=%d\n",
@@ -331,11 +345,19 @@ static void fwstats_fn(struct work_struct *work)
 		    pdev->ch_noise_floor);
 		was_rx = rx; was_tx = tx; was_busy = busy; was_cycle = cyc; was_phyerr = pe;
 	}
-	list_for_each_entry(peer, &ar->debug.fw_stats.peers, list) {
+	list_for_each_entry(peer, &stats.peers, list) {
 		lx_tell("lx: FWSTATS peer: rssi=%u tx_rate=%u rx_rate=%u rx_dur=%llu\n",
 		    peer->peer_rssi, peer->peer_tx_rate, peer->peer_rx_rate, (unsigned long long)peer->rx_duration);
 	}
-	mutex_unlock(&ar->conf_mutex);
+	fwstats_free(&stats);
+}
+
+static void fwstats_fn(struct work_struct *work)
+{
+	if (fwstats_ar != NULL) {
+		int ret = ath10k_wmi_request_stats(fwstats_ar, fwstats_ar->fw_stats_req_mask);
+		if (ret != 0) { lx_tell("lx: FWSTATS: request_stats failed (%d)\n", ret); }
+	}
 	linux_queue_delayed_work_on(0, fwstats_queue, &fwstats_work, 2000);
 }
 
@@ -374,12 +396,11 @@ int lx_start(void)
 	if (!error && lx_os_option("wifi_keep")) error = lx_station_offer();
 	if (lx_os_option("wifi_fwstats")) {
 		fwstats_ar = ar;
-		init_completion(&ar->debug.fw_stats_complete);	/* defensive: created zeroed, so valid even if unset */
 		if (!fwstats_queue) { fwstats_queue = alloc_ordered_workqueue("ath10k-fwstats", 0); }
 		linux_init_delayed_work(&fwstats_work, fwstats_fn);
 		if (fwstats_queue) {
 			linux_queue_delayed_work_on(0, fwstats_queue, &fwstats_work, 2000);
-			lx_tell("lx: FWSTATS: firmware-stats dump armed (every ~2 s)\n");
+			lx_tell("lx: FWSTATS: firmware-stats dump armed (req mask %#x, every ~2 s)\n", ar->fw_stats_req_mask);
 		}
 	}
 	return error;

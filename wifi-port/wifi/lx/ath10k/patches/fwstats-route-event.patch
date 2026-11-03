@@ -1,0 +1,12 @@
+--- a/ath10k/wmi.c
++++ b/ath10k/wmi.c
+@@ -3443,6 +3443,9 @@
+ {
+ 	ath10k_dbg(ar, ATH10K_DBG_WMI, "WMI_UPDATE_STATS_EVENTID\n");
+ 	ath10k_debug_fw_stats_process(ar, skb);
++	/* davinci WiFi-speed: route the fw STATS reply to the lx dumper (CONFIG_ATH10K_DEBUGFS is off,
++	 * so ath10k_debug_fw_stats_process() above is a no-op stub here). */
++	{ void lx_fwstats_event(struct ath10k *ar, struct sk_buff *skb); lx_fwstats_event(ar, skb); }
+ }
+ 
+ static int

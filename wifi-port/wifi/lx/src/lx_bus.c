@@ -31,6 +31,7 @@
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/skbuff.h>
+#include <linux/jiffies.h>
 
 #include "core.h"
 #include "ce.h"
@@ -326,6 +327,7 @@ bus_looks(void *argument)
 			more |= done >= DATA_BUDGET;
 			bus.late += bus.irq && done > 0;
 		}
+		lx_os_net_flush();
 		if (bus.irq) {
 			mutex_unlock(&bus.service);
 		}
@@ -396,6 +398,7 @@ irq_ce(void *argument)
 
 	mutex_lock(&bus.service);
 	ath11k_ce_per_engine_service(pipe->ab, pipe->pipe_num);
+	lx_os_net_flush();
 	mutex_unlock(&bus.service);
 	lx_os_irq_enable(bus.ce_vector[pipe->pipe_num]);
 }
@@ -406,14 +409,36 @@ irq_group(void *argument)
 {
 	struct ath11k_ext_irq_grp *group = argument;
 	int done;
+	/*
+	 * Datapath profile for the WiFi-speed work (one line a second while RX runs). done/irq near the
+	 * budget with many iters/irq means the ring fills faster than we drain -- the receive path (one
+	 * ifnet_input per frame, unless wifi_batch=1) is the ceiling; a small done/irq with one iter means
+	 * we are waiting on the interrupt or the firmware, not on our own work. (jiffies are milliseconds.)
+	 */
+	static unsigned long pf_irqs, pf_iters, pf_done, pf_mark;
 
 	mutex_lock(&bus.service);
 	do {
 		done = bus.data ? ath11k_dp_service_srng(group->ab, group, DATA_BUDGET) : 0;
+		if (done > 0) {
+			pf_done += (unsigned long)done;
+		}
+		pf_iters++;
 	} while (done >= DATA_BUDGET);
+	lx_os_net_flush();
 	mutex_unlock(&bus.service);
 	if (bus.data) {
 		lx_os_irq_enable(bus.group_vector[group->grp_id]);
+	}
+	pf_irqs++;
+	if (pf_mark == 0) {
+		pf_mark = jiffies;
+	}
+	if (pf_irqs != 0 && (long)(jiffies - pf_mark) >= 1000) {
+		lx_tell("lx: RXPROF: %lu group-irqs, %lu srng-iters, %lu rx-done (%lu done/irq, %lu iters/irq) in %lu ms\n",
+		    pf_irqs, pf_iters, pf_done, pf_done / pf_irqs, pf_iters / pf_irqs, (unsigned long)(jiffies - pf_mark));
+		pf_irqs = pf_iters = pf_done = 0;
+		pf_mark = jiffies;
 	}
 }
 

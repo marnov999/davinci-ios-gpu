@@ -365,6 +365,14 @@ lx_os_net_input(const unsigned char *frame, unsigned long length)
 	}
 }
 
+void
+lx_os_net_flush(void)
+{
+	if (lx_link_attached) {
+		hakios_net_flush();
+	}
+}
+
 /* ---- the radio's interrupts ------------------------------------------------------------------------------- */
 
 /*

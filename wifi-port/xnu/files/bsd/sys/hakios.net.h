@@ -54,6 +54,9 @@ bool hakios_net_attach(const struct hakios_net_link *link);
 /* A frame has arrived (on en0 / on en<unit>). Copied; the buffer is the caller's again on return. */
 void hakios_net_input(const uint8_t *frame, size_t length);
 void hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length);
+/* With boot-arg wifi_batch=1, input_unit chains frames; flush hands the chain up in one ifnet_input (a no-op otherwise / when empty). */
+void hakios_net_flush(void);
+void hakios_net_flush_unit(unsigned unit);
 /* Frames can pass now / can no longer pass (on en0 / on en<unit>). */
 void hakios_net_link_state(bool up);
 void hakios_net_link_state_unit(unsigned unit, bool up);

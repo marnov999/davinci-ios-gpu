@@ -49,6 +49,14 @@ struct net_if {
 	struct {
 		uint64_t sent, received, sent_bytes, received_bytes, dropped_out, dropped_in;
 	} count;
+	/*
+	 * RX batching (boot-arg wifi_batch=1): a drain of the radio's ring hands many frames up in one
+	 * ifnet_input() call instead of one per frame, which is what caps a software interface's receive
+	 * throughput on XNU. The chain is built here while a drain runs and flushed at its end; only the
+	 * one thread that is draining (the radio's, under its own lock) touches it, so it needs no lock.
+	 */
+	mbuf_t          batch_head, batch_tail;
+	uint32_t        batch_packets, batch_bytes;
 };
 static struct net_if net_ifs[HAKIOS_NET_UNITS];
 
@@ -73,6 +81,8 @@ net_if_unit(unsigned unit)
  */
 #define NAMES_MAX       3000
 static uint32_t net_trace, net_names;
+/* Boot-arg wifi_batch=1: hand received frames to the stack in chains, one ifnet_input() per ring drain. */
+static uint32_t net_batch;
 
 static void
 trace_frame(const char *way, const uint8_t *frame, size_t length, size_t whole)
@@ -197,7 +207,46 @@ hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length)
 	bpf_tap_in(n->ifp, DLT_EN10MB, packet, header, ETHER_HDR_LEN);
 	n->count.received++;
 	n->count.received_bytes += length;
+	if (net_batch && unit == 0) {
+		/* Chain it; the drain's flush hands the whole chain up at once. (en0/radio only: it is the
+		 * one whose driver flushes at the end of a drain; en1/modem has no such point, so it stays
+		 * one ifnet_input per frame.) */
+		mbuf_setnextpkt(packet, NULL);
+		if (n->batch_tail != NULL) {
+			mbuf_setnextpkt(n->batch_tail, packet);
+		} else {
+			n->batch_head = packet;
+		}
+		n->batch_tail = packet;
+		n->batch_packets++;
+		n->batch_bytes += (uint32_t)length;
+		return;
+	}
 	ifnet_input(n->ifp, packet, &stats);
+}
+
+/* Hand up everything chained since the last flush (on unit `unit`) as one ifnet_input() call. */
+void
+hakios_net_flush_unit(unsigned unit)
+{
+	struct net_if *n = net_if_unit(unit);
+	struct ifnet_stat_increment_param stats;
+	mbuf_t head;
+
+	if (n == NULL || n->batch_head == NULL) {
+		return;
+	}
+	head = n->batch_head;
+	stats = (struct ifnet_stat_increment_param){ .packets_in = n->batch_packets, .bytes_in = n->batch_bytes };
+	n->batch_head = n->batch_tail = NULL;
+	n->batch_packets = n->batch_bytes = 0;
+	ifnet_input(n->ifp, head, &stats);
+}
+
+void
+hakios_net_flush(void)
+{
+	hakios_net_flush_unit(0);
 }
 
 void
@@ -424,5 +473,6 @@ hakios_net_init(void)
 {
 	PE_parse_boot_argn("net_trace", &net_trace, sizeof(net_trace));
 	PE_parse_boot_argn("net_names", &net_names, sizeof(net_names));
+	PE_parse_boot_argn("wifi_batch", &net_batch, sizeof(net_batch));
 	hakios_virtio_net_init();
 }

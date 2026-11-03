@@ -69,6 +69,7 @@ int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *pa
 void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
 void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
 void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
+void	 lx_os_net_flush(void);					/* hand the frames batched this drain to the stack as one chain */
 
 /*
  * ---- the radio's interrupts (wifi_irq=1). The radio raises one by writing a number to an address

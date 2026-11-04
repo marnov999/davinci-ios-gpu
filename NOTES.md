@@ -11,9 +11,24 @@ JUST BUILT (commit b90d72d, CI run 41735826203): a firmware-stats dump in wifi-p
 boot-arg **wifi_fwstats**, printing `lx: FWSTATS pdev:` airtime %/phyerr/retries + `peer:` rates. Done
 WITHOUT CONFIG_ATH10K_DEBUGFS (struct ath10k has no `debug` member in this build): a workqueue sends
 ath10k_wmi_request_stats(), and patch wifi-port/wifi/lx/ath10k/patches/fwstats-route-event.patch routes
-the WMI STATS reply to lx_fwstats_event() (registered in tools/mk-ath10k.py). NEXT (device was charging):
-boot the new kernel + `wifi_fwstats`, run a speedtest, read the FWSTATS lines -- LOW rx-cycle % => host/TCP
-starves the link (attack bufferbloat/TCP); HIGH rx/busy % + retries/low rate => wasted airtime/rate-control.
+the WMI STATS reply to lx_fwstats_event() (registered in tools/mk-ath10k.py).
+LATEST BUILD (commit c25ed29, CI run 41762513895, dispatched 2026-11-04 while device charging): adds a
+one-shot `lx: RXREORDER:` log at lx_start printing RX_FULL_REORDER(svc)/in_ord_rx/rxagg/htt-ring size+fill/
+PEER_STATS(svc). This tells, in the SAME boot as wifi_fwstats, whether the firmware's offload RX reorder is
+active -- the crux of the small-A-MPDU theory. Image to rebuild from this kernel: davinci-ios-shim-wifi68
+boot-args + wifi_fwstats=1 (already includes wifi_inline=1). (Previous staged image davinci-ios-shim-wifi68.img
+was built from b90d72d, which LACKS the RXREORDER line -- rebuild with the c25ed29 kernel once CI finishes.)
+OFFLINE ANALYSIS THIS SESSION (no device): ruled out the HTT refill cap (ATH10K_HTT_MAX_NUM_REFILL=100 +
+5ms resched) as the burst/collapse cause -- WCN3990 ring is 2047-deep (rx_ring_fill_level=FILL_LEVEL_DUAL_MAC),
+so capped refill can't starve the fw in normal bursts. Confirmed TLV fw has NO host ADDBA (gen_addba_* not
+implemented in wmi-tlv.c) => firmware OWNS the RX BA window; host can't drive it directly. So the two live
+root candidates are: (A) firmware RX aggregation/BA window too small (in_ord_rx or offload-reorder off) =>
+wasted airtime, fix = force RX_FULL_REORDER / bigger BA window (MIUI qca_cld3 gReorderOffloadSupported=1);
+(B) TCP/bufferbloat equilibrium at 456ms RTT with an IDLE channel => fix TCP-side (en0 rwnd). The
+RXREORDER+FWSTATS boot picks A vs B. Both fixes are firmware/TCP-side (efficient, no host spin -- matches the
+"CPU must behave like MIUI" constraint). NEXT (device returns): boot c25ed29 kernel + wifi_fwstats=1, connect
+"." + speedtest, read `lx: RXREORDER` + `lx: FWSTATS pdev:` lines. LOW rx-cycle % => path B; HIGH busy% +
+retries/low rate or in_ord_rx=0 => path A.
 davinci serial 800f46c3 (NEVER touch raphael 53d545e6). Autonomous connect+speedtest loop via screencap/
 hidtouch tools in devtools/work/ios-sweet/../../../davinci-ios/gpu/userland/metal/ (see memory file).
 

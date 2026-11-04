@@ -390,6 +390,21 @@ int lx_start(void)
 			ar->hw->max_rx_aggregation_subframes = (uint8_t)want;
 		}
 	}
+	/*
+	 * One-shot RX-reorder diagnostic. MIUI's qca_cld3 runs the SAME WCN3990 firmware with
+	 * gReorderOffloadSupported=1 (firmware does BA reorder + big AP->us A-MPDUs); mainline ath10k
+	 * only enables offload reorder when the firmware advertises WMI_SERVICE_RX_FULL_REORDER, which
+	 * also flips htt.rx_ring.in_ord_rx. With ETHERNET decap our mac80211 ADDBA never fires, so the
+	 * firmware owns the RX BA window entirely. Log whether offload reorder is actually active:
+	 * in_ord_rx=1 => firmware reorders (expect large aggregates possible); in_ord_rx=0 => the small
+	 * default window is the throughput cap and the fix must force RX_FULL_REORDER / a bigger BA window.
+	 */
+	lx_tell("lx: RXREORDER: RX_FULL_REORDER(svc)=%d in_ord_rx=%d rxagg=%u htt_ring size=%d fill=%d PEER_STATS(svc)=%d\n",
+		test_bit(WMI_SERVICE_RX_FULL_REORDER, ar->wmi.svc_map) ? 1 : 0,
+		ar->htt.rx_ring.in_ord_rx ? 1 : 0,
+		ar->hw->max_rx_aggregation_subframes,
+		ar->htt.rx_ring.size, ar->htt.rx_ring.fill_level,
+		test_bit(WMI_SERVICE_PEER_STATS, ar->wmi.svc_map) ? 1 : 0);
 	ready = true;
 	if (lx_os_option("wifi_scan")) error = lx_station_scan();
 	if (!error && lx_os_option("wifi_join")) error = lx_station_join();

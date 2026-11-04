@@ -15,9 +15,10 @@ the WMI STATS reply to lx_fwstats_event() (registered in tools/mk-ath10k.py).
 LATEST BUILD (commit c25ed29, CI run 41762513895, dispatched 2026-11-04 while device charging): adds a
 one-shot `lx: RXREORDER:` log at lx_start printing RX_FULL_REORDER(svc)/in_ord_rx/rxagg/htt-ring size+fill/
 PEER_STATS(svc). This tells, in the SAME boot as wifi_fwstats, whether the firmware's offload RX reorder is
-active -- the crux of the small-A-MPDU theory. Image to rebuild from this kernel: davinci-ios-shim-wifi68
-boot-args + wifi_fwstats=1 (already includes wifi_inline=1). (Previous staged image davinci-ios-shim-wifi68.img
-was built from b90d72d, which LACKS the RXREORDER line -- rebuild with the c25ed29 kernel once CI finishes.)
+active -- the crux of the small-A-MPDU theory. IMAGE BUILT + READY: /home/marnov/xmiphones/davinci-ios-shim-wifi68b.img
+(kernel c25ed29, boot-args sweetwifi=16 wifi_ath=1 wifi_keep=1 wifi_scan=1 wifi_inline=1 wifi_ampdu=3
+wifi_density=4 wifi_rxagg=64 wifi_fwstats=1; RXREORDER+FWSTATS strings verified embedded). Just `fastboot boot`
+it on davinci. (The older davinci-ios-shim-wifi68.img from b90d72d LACKS the RXREORDER line -- use wifi68b.)
 OFFLINE ANALYSIS THIS SESSION (no device): ruled out the HTT refill cap (ATH10K_HTT_MAX_NUM_REFILL=100 +
 5ms resched) as the burst/collapse cause -- WCN3990 ring is 2047-deep (rx_ring_fill_level=FILL_LEVEL_DUAL_MAC),
 so capped refill can't starve the fw in normal bursts. Confirmed TLV fw has NO host ADDBA (gen_addba_* not

@@ -130,7 +130,8 @@ def driver_build():
                                'linux-7.0.14/drivers/net/wireless/ath/dfs_pattern_detector.h',
                                'linux-7.0.14/drivers/net/wireless/ath/spectral_common.h',
                                'linux-7.0.14/drivers/net/wireless/ath/ath.h'],
-                   [W / 'ath10k/patches/icnss-bootstrap.patch', W / 'ath10k/patches/fwstats-route-event.patch'])
+                   [W / 'ath10k/patches/icnss-bootstrap.patch', W / 'ath10k/patches/fwstats-route-event.patch',
+                    W / 'ath10k/patches/force-in-ord-rx.patch'])
     objdir = B / 'obj'; objdir.mkdir(exist_ok=True)
     flags = shlex.split(os.environ.get('CC', 'clang')) + ['-target', TARGET, '-mkernel',
         '-mgeneral-regs-only', '-fno-builtin', '-fno-common', '-ffreestanding', '-fno-strict-aliasing',

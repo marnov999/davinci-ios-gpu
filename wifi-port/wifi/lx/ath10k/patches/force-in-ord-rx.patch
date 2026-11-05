@@ -1,0 +1,14 @@
+--- a/ath10k/core.c
++++ b/ath10k/core.c
+@@ -3079,6 +3079,11 @@
+ 	 */
+ 	ar->htt.rx_ring.in_ord_rx = !!(test_bit(WMI_SERVICE_RX_FULL_REORDER,
+ 						ar->wmi.svc_map));
++	/* davinci WiFi-speed: svc_map is still empty here (service_ready arrives ~48 lines below), so the
++	 * assignment above is always 0 on a cold WCN3990 boot even though the fw advertises RX_FULL_REORDER.
++	 * Force Full-RX-Reorder offload on so the fw builds large AP->us A-MPDUs (MIUI parity). boot-arg
++	 * wifi_noinord=1 reverts. Toggle lives in wifi/lx/ath10k/host.c (lx_want_inord). */
++	{ extern bool lx_want_inord; if (lx_want_inord) ar->htt.rx_ring.in_ord_rx = true; }
+ 
+ 	status = ath10k_htt_rx_alloc(&ar->htt);
+ 	if (status) {

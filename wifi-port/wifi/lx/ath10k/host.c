@@ -306,6 +306,19 @@ static struct ath10k *fwstats_ar;
 static struct delayed_work fwstats_work;
 static struct workqueue_struct *fwstats_queue;
 
+/*
+ * THROUGHPUT FIX: enable firmware Full-RX-Reorder offload (in_ord_rx).
+ * ath10k_core_start() latches ar->htt.rx_ring.in_ord_rx from the WMI service map ~48 lines BEFORE the
+ * firmware's service_ready event populates that map (core.c: the assignment is at htt_rx_alloc time,
+ * wait_for_service_ready comes later), so on a cold WCN3990 boot in_ord_rx is ALWAYS 0 even though the
+ * fw advertises RX_FULL_REORDER. in_ord_rx=0 => legacy per-MPDU RX with a tiny default reorder window
+ * => small AP->us A-MPDUs => ~8 Mbit/s. MIUI's qca_cld3 runs the same fw with reorder offload ON
+ * (gReorderOffloadSupported=1) and gets 46 Mbit/s. lx_want_inord (set from boot-arg wifi_noinord before
+ * the driver registers, so the core.c patch can read it at assignment time) forces in_ord_rx on;
+ * wifi_noinord=1 reverts to stock behaviour for A/B.
+ */
+bool lx_want_inord = true;
+
 static void fwstats_free(struct ath10k_fw_stats *s)
 {
 	struct ath10k_fw_stats_pdev *p, *pt;
@@ -367,6 +380,8 @@ int lx_start(void)
 	extern unsigned int ath10k_debug_mask;
 	ath10k_debug_mask = 0x0;   /* quiet: the heavy trace floods the 1ms-poll USB console and destabilizes boot */
 	ath10k_frame_mode = ATH10K_HW_TXRX_ETHERNET;
+	/* Decide in_ord_rx BEFORE registering (core_start runs inside the register path and latches it). */
+	lx_want_inord = (lx_os_option("wifi_noinord") == 0);
 	int error = lx_base_init();
 	if (!error) error = lx_pool_init();
 	if (!error && !poller.queue && !(poller.queue = alloc_ordered_workqueue("ath10k-napi", 0))) error = ENOMEM;

@@ -1471,6 +1471,15 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 		uint16_t cap = (uint16_t)(band->ht_cap.cap & (radio->width > 20 ? 0xffff : ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
 		    IEEE80211_HT_CAP_SGI_40)));
 
+		/*
+		 * davinci WiFi-speed: ath10k_get_ht_cap() never sets MAX_AMSDU, so we advertise the small
+		 * 3839-byte A-MSDU limit and the AP sends ~1 MSDU per MPDU. The downlink runs ~1 frame/PPDU
+		 * on this AP (~1.7x airtime overhead, 17 Mbit where MIUI gets 46), so let the AP pack the
+		 * larger 7935-byte A-MSDU to cut per-PPDU overhead. (boot-arg wifi_noamsdu=1 reverts for A/B.)
+		 */
+		if (lx_os_option("wifi_noamsdu") == 0)
+			cap |= IEEE80211_HT_CAP_MAX_AMSDU;
+
 		*at++ = 45;
 		*at++ = 26;
 		bzero(at, 26);
